@@ -124,6 +124,12 @@ class AnthropicProvider:
         # Initialize client with optional beta headers and base_url
         self.client = AsyncAnthropic(api_key=api_key, base_url=base_url, default_headers=default_headers)
 
+        # Track tool call IDs that have been repaired with synthetic results.
+        # This prevents infinite loops when the same missing tool results are
+        # detected repeatedly across LLM iterations (since synthetic results
+        # are injected into request.messages but not persisted to message store).
+        self._repaired_tool_ids: set[str] = set()
+
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
         return ProviderInfo(
@@ -261,7 +267,11 @@ class AnthropicProvider:
             elif msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id:
                 tool_results.add(msg.tool_call_id)
 
-        return [(call_id, name, args) for call_id, (name, args) in tool_calls.items() if call_id not in tool_results]
+        return [
+            (call_id, name, args)
+            for call_id, (name, args) in tool_calls.items()
+            if call_id not in tool_results and call_id not in self._repaired_tool_ids
+        ]
 
     def _create_synthetic_result(self, call_id: str, tool_name: str) -> Message:
         """Create synthetic error result for missing tool response.
@@ -306,10 +316,11 @@ class AnthropicProvider:
                 f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
             )
 
-            # Inject synthetic results
+            # Inject synthetic results and track repaired IDs to prevent infinite loops
             for call_id, tool_name, _ in missing:
                 synthetic = self._create_synthetic_result(call_id, tool_name)
                 request.messages.append(synthetic)
+                self._repaired_tool_ids.add(call_id)
 
             # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
