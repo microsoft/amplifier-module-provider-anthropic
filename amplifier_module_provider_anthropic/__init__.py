@@ -1018,13 +1018,25 @@ class AnthropicProvider:
         are skipped to avoid API errors.
         """
         # First pass: collect all valid tool_use_ids from assistant messages
+        # CRITICAL: Check BOTH formats - tool_calls array AND content blocks
         valid_tool_use_ids: set[str] = set()
         for msg in messages:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg.get("tool_calls", []):
-                    tc_id = tc.get("id") or tc.get("tool_call_id")
-                    if tc_id:
-                        valid_tool_use_ids.add(tc_id)
+            if msg.get("role") == "assistant":
+                # Check tool_calls array (standard format)
+                if msg.get("tool_calls"):
+                    for tc in msg.get("tool_calls", []):
+                        tc_id = tc.get("id") or tc.get("tool_call_id")
+                        if tc_id:
+                            valid_tool_use_ids.add(tc_id)
+                # Check content blocks (Anthropic format - tool_use in content array)
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") in ("tool_use", "tool_call"):
+                                tc_id = block.get("id")
+                                if tc_id:
+                                    valid_tool_use_ids.add(tc_id)
 
         anthropic_messages = []
         i = 0
