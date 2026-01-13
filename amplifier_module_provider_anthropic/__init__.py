@@ -15,7 +15,6 @@ import os
 import random
 import time
 from typing import Any
-from typing import Optional
 
 from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
@@ -89,7 +88,10 @@ class AnthropicProvider:
     api_label = "Anthropic"
 
     def __init__(
-        self, api_key: str | None = None, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
+        self,
+        api_key: str | None = None,
+        config: dict[str, Any] | None = None,
+        coordinator: ModuleCoordinator | None = None,
     ):
         """
         Initialize Anthropic provider.
@@ -110,23 +112,42 @@ class AnthropicProvider:
         self.max_tokens = self.config.get("max_tokens", 64000)
         self.temperature = self.config.get("temperature", 0.7)
         self.priority = self.config.get("priority", 100)  # Store priority for selection
-        self.debug = self.config.get("debug", False)  # Enable full request/response logging
-        self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
-        self.debug_truncate_length = self.config.get("debug_truncate_length", 180)  # Max string length in debug logs
-        self.timeout = self.config.get("timeout", 300.0)  # API timeout in seconds (default 5 minutes)
-        
+        self.debug = self.config.get(
+            "debug", False
+        )  # Enable full request/response logging
+        self.raw_debug = self.config.get(
+            "raw_debug", False
+        )  # Enable ultra-verbose raw API I/O logging
+        self.debug_truncate_length = self.config.get(
+            "debug_truncate_length", 180
+        )  # Max string length in debug logs
+        self.timeout = self.config.get(
+            "timeout", 300.0
+        )  # API timeout in seconds (default 5 minutes)
+
         # Rate limit retry configuration
         # We handle retries ourselves (SDK max_retries=0) to properly honor retry-after headers
         # and use longer backoffs that help with org-wide rate limit pressure
-        self.max_retries = self.config.get("max_retries", 5)  # Total retry attempts before failing
-        self.retry_jitter = self.config.get("retry_jitter", True)  # Add ±20% randomness to delays
-        self.max_retry_delay = self.config.get("max_retry_delay", 60.0)  # Cap individual wait at 60s
-        self.min_retry_delay = self.config.get("min_retry_delay", 1.0)  # Minimum delay if no retry-after header
-        
+        self.max_retries = self.config.get(
+            "max_retries", 5
+        )  # Total retry attempts before failing
+        self.retry_jitter = self.config.get(
+            "retry_jitter", True
+        )  # Add ±20% randomness to delays
+        self.max_retry_delay = self.config.get(
+            "max_retry_delay", 60.0
+        )  # Cap individual wait at 60s
+        self.min_retry_delay = self.config.get(
+            "min_retry_delay", 1.0
+        )  # Minimum delay if no retry-after header
+
         # Use streaming API by default to support large context windows (Anthropic requires streaming
         # for operations that may take > 10 minutes, e.g. with 300k+ token contexts)
         self.use_streaming = self.config.get("use_streaming", True)
-        self.filtered = self.config.get("filtered", True)  # Filter to curated model list by default
+        self.filtered = self.config.get(
+            "filtered", True
+        )  # Filter to curated model list by default
+        self.enable_prompt_caching = self.config.get("enable_prompt_caching", True)
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
         self._base_url = self.config.get("base_url")
@@ -142,7 +163,9 @@ class AnthropicProvider:
             if "context-1m-2025-08-07" not in existing_beta:
                 existing_beta.append("context-1m-2025-08-07")
             self.config["beta_headers"] = existing_beta
-            logger.info("[PROVIDER] 1M context window enabled via enable_1m_context config")
+            logger.info(
+                "[PROVIDER] 1M context window enabled via enable_1m_context config"
+            )
 
         # Beta headers support for enabling experimental features
         # Store as instance variable so we can merge with per-request headers later
@@ -151,7 +174,11 @@ class AnthropicProvider:
         self._default_headers: dict[str, str] | None = None
         if beta_headers_config:
             # Normalize to list (supports string or list of strings)
-            self._beta_headers = [beta_headers_config] if isinstance(beta_headers_config, str) else list(beta_headers_config)
+            self._beta_headers = (
+                [beta_headers_config]
+                if isinstance(beta_headers_config, str)
+                else list(beta_headers_config)
+            )
             # Build anthropic-beta header value (comma-separated)
             beta_header_value = ",".join(self._beta_headers)
             self._default_headers = {"anthropic-beta": beta_header_value}
@@ -191,7 +218,9 @@ class AnthropicProvider:
                 "max_tokens": 4096,
                 "temperature": 0.7,
                 "timeout": 300.0,
-                "context_window": 1000000 if self.config.get("enable_1m_context") else 200000,
+                "context_window": 1000000
+                if self.config.get("enable_1m_context")
+                else 200000,
                 "max_output_tokens": 64000,
             },
             config_fields=[
@@ -219,7 +248,17 @@ class AnthropicProvider:
                     required=False,
                     default="true",
                     requires_model=True,  # Shown after model selection
-                    show_when={"default_model": "contains:sonnet"},  # Only show for Sonnet models
+                    show_when={
+                        "default_model": "contains:sonnet"
+                    },  # Only show for Sonnet models
+                ),
+                ConfigField(
+                    id="enable_prompt_caching",
+                    display_name="Prompt Caching",
+                    field_type="boolean",
+                    prompt="Enable prompt caching? (Reduces cost by 90% on cached tokens)",
+                    required=False,
+                    default="true",
                 ),
             ],
         )
@@ -253,7 +292,9 @@ class AnthropicProvider:
             model_id_lower = model_id.lower()
             for family in families:
                 if family in model_id_lower:
-                    families[family].append((model_id, display_name, str(getattr(model, "created_at", ""))))
+                    families[family].append(
+                        (model_id, display_name, str(getattr(model, "created_at", "")))
+                    )
                     break
 
         result: list[ModelInfo] = []
@@ -309,11 +350,15 @@ class AnthropicProvider:
             max_length = self.debug_truncate_length
 
         # Type guard: max_length is guaranteed to be int after this point
-        assert max_length is not None, "max_length should never be None after initialization"
+        assert max_length is not None, (
+            "max_length should never be None after initialization"
+        )
 
         if isinstance(obj, str):
             if len(obj) > max_length:
-                return obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
+                return (
+                    obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
+                )
             return obj
         if isinstance(obj, dict):
             return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
@@ -321,7 +366,9 @@ class AnthropicProvider:
             return [self._truncate_values(item, max_length) for item in obj]
         return obj  # Numbers, booleans, None pass through unchanged
 
-    def _find_missing_tool_results(self, messages: list[Message]) -> list[tuple[int, str, str, dict]]:
+    def _find_missing_tool_results(
+        self, messages: list[Message]
+    ) -> list[tuple[int, str, str, dict]]:
         """Find tool calls without matching results.
 
         Scans conversation for assistant tool calls and validates each has
@@ -346,7 +393,9 @@ class AnthropicProvider:
                         tool_calls[block.id] = (idx, block.name, block.input)
 
             # Check tool messages for tool_call_id
-            elif msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id:
+            elif (
+                msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id
+            ):
                 tool_results.add(msg.tool_call_id)
 
         # Exclude IDs that have already been repaired to prevent infinite loops
@@ -430,30 +479,33 @@ class AnthropicProvider:
                         "provider": self.name,
                         "repair_count": len(missing),
                         "repairs": [
-                            {"tool_call_id": call_id, "tool_name": tool_name} for _, call_id, tool_name, _ in missing
+                            {"tool_call_id": call_id, "tool_name": tool_name}
+                            for _, call_id, tool_name, _ in missing
                         ],
                     },
                 )
 
         return await self._complete_chat_request(request, **kwargs)
 
-    def _extract_rate_limit_headers(self, headers: dict[str, str] | Any) -> dict[str, Any]:
+    def _extract_rate_limit_headers(
+        self, headers: dict[str, str] | Any
+    ) -> dict[str, Any]:
         """Extract rate limit information from response headers.
-        
+
         Anthropic returns rate limit headers on every response:
         - anthropic-ratelimit-requests-limit/remaining/reset
         - anthropic-ratelimit-tokens-limit/remaining/reset
         - retry-after (on 429 errors)
-        
+
         Args:
             headers: Response headers (dict-like object)
-            
+
         Returns:
             Dict with rate limit info, or empty dict if headers unavailable
         """
         if not headers:
             return {}
-        
+
         # Helper to safely get header values
         def get_int(key: str) -> int | None:
             val = headers.get(key)
@@ -463,9 +515,9 @@ class AnthropicProvider:
                 except (ValueError, TypeError):
                     pass
             return None
-        
+
         info: dict[str, Any] = {}
-        
+
         # Request limits
         requests_remaining = get_int("anthropic-ratelimit-requests-remaining")
         requests_limit = get_int("anthropic-ratelimit-requests-limit")
@@ -473,7 +525,7 @@ class AnthropicProvider:
             info["requests_remaining"] = requests_remaining
         if requests_limit is not None:
             info["requests_limit"] = requests_limit
-        
+
         # Token limits
         tokens_remaining = get_int("anthropic-ratelimit-tokens-remaining")
         tokens_limit = get_int("anthropic-ratelimit-tokens-limit")
@@ -481,58 +533,58 @@ class AnthropicProvider:
             info["tokens_remaining"] = tokens_remaining
         if tokens_limit is not None:
             info["tokens_limit"] = tokens_limit
-        
+
         # Retry-after (typically only on 429)
         if retry_after := headers.get("retry-after"):
             try:
                 info["retry_after_seconds"] = float(retry_after)
             except (ValueError, TypeError):
                 pass
-        
+
         return info
 
     def _parse_rate_limit_info(self, error: RateLimitError) -> dict[str, Any]:
         """Extract rate limit details from RateLimitError.
-        
+
         The SDK provides headers via error.response.headers when available.
         """
         info: dict[str, Any] = {
             "retry_after_seconds": None,
             "rate_limit_type": None,
         }
-        
+
         # RateLimitError may have response with headers
         if hasattr(error, "response") and error.response:
             headers = getattr(error.response, "headers", {})
-            
+
             # Parse retry-after (seconds as float)
             if retry_after := headers.get("retry-after"):
                 try:
                     info["retry_after_seconds"] = float(retry_after)
                 except (ValueError, TypeError):
                     pass
-            
+
             # Determine limit type from remaining tokens
             tokens_remaining = headers.get("anthropic-ratelimit-tokens-remaining")
             requests_remaining = headers.get("anthropic-ratelimit-requests-remaining")
-            
+
             if tokens_remaining == "0":
                 info["rate_limit_type"] = "tokens"
             elif requests_remaining == "0":
                 info["rate_limit_type"] = "requests"
-        
+
         return info
 
     def _calculate_retry_delay(self, retry_after: float | None, attempt: int) -> float:
         """Calculate delay before next retry attempt.
-        
+
         Uses retry-after header if available, otherwise exponential backoff.
         Applies jitter if enabled to spread load across time.
-        
+
         Args:
             retry_after: Seconds from retry-after header (may be None)
             attempt: Current attempt number (1-based)
-            
+
         Returns:
             Delay in seconds before next retry
         """
@@ -542,18 +594,50 @@ class AnthropicProvider:
         else:
             # Exponential backoff: 1s, 2s, 4s, 8s, 16s, ...
             delay = self.min_retry_delay * (2 ** (attempt - 1))
-        
+
         # Cap at max_retry_delay
         delay = min(delay, self.max_retry_delay)
-        
+
         # Apply jitter (±20%) to spread load and avoid thundering herd
         if self.retry_jitter:
             jitter_factor = random.uniform(0.8, 1.2)
             delay = delay * jitter_factor
-        
+
         return delay
 
-    async def _complete_chat_request(self, request: ChatRequest, **kwargs) -> ChatResponse:
+    def _format_system_with_cache(
+        self, system_msgs: list[Message]
+    ) -> list[dict[str, Any]] | None:
+        """Format system messages as content block array with cache_control.
+
+        Anthropic requires system as array of content blocks for caching.
+        Cache breakpoint goes on the LAST block.
+
+        Returns:
+            List of content blocks, or None if no system messages
+        """
+        if not system_msgs:
+            return None
+
+        # Combine into single text (preserves current behavior)
+        combined = "\n\n".join(
+            m.content if isinstance(m.content, str) else "" for m in system_msgs
+        )
+
+        if not combined:
+            return None
+
+        block: dict[str, Any] = {"type": "text", "text": combined}
+
+        # Add cache_control if enabled
+        if self.enable_prompt_caching:
+            block["cache_control"] = {"type": "ephemeral"}
+
+        return [block]
+
+    async def _complete_chat_request(
+        self, request: ChatRequest, **kwargs
+    ) -> ChatResponse:
         """Handle ChatRequest format with developer message conversion.
 
         Args:
@@ -563,24 +647,28 @@ class AnthropicProvider:
         Returns:
             ChatResponse with content blocks
         """
-        logger.debug(f"Received ChatRequest with {len(request.messages)} messages (debug={self.debug})")
+        logger.debug(
+            f"Received ChatRequest with {len(request.messages)} messages (debug={self.debug})"
+        )
 
         # Separate messages by role
         system_msgs = [m for m in request.messages if m.role == "system"]
         developer_msgs = [m for m in request.messages if m.role == "developer"]
-        conversation = [m for m in request.messages if m.role in ("user", "assistant", "tool")]
+        conversation = [
+            m for m in request.messages if m.role in ("user", "assistant", "tool")
+        ]
 
         logger.debug(
             f"Separated: {len(system_msgs)} system, {len(developer_msgs)} developer, {len(conversation)} conversation"
         )
 
-        # Combine system messages
-        system = (
-            "\n\n".join(m.content if isinstance(m.content, str) else "" for m in system_msgs) if system_msgs else None
-        )
+        # Format system messages as content block array (required for caching)
+        system_blocks = self._format_system_with_cache(system_msgs)
 
-        if system:
-            logger.info(f"[PROVIDER] Combined system message length: {len(system)}")
+        if system_blocks:
+            logger.info(
+                f"[PROVIDER] System message length: {len(system_blocks[0]['text'])} chars (caching={'cache_control' in system_blocks[0]})"
+            )
         else:
             logger.info("[PROVIDER] No system messages")
 
@@ -589,35 +677,48 @@ class AnthropicProvider:
         for i, dev_msg in enumerate(developer_msgs):
             content = dev_msg.content if isinstance(dev_msg.content, str) else ""
             content_preview = content[:100] + ("..." if len(content) > 100 else "")
-            logger.info(f"[PROVIDER] Converting developer message {i + 1}/{len(developer_msgs)}: length={len(content)}")
+            logger.info(
+                f"[PROVIDER] Converting developer message {i + 1}/{len(developer_msgs)}: length={len(content)}"
+            )
             logger.debug(f"[PROVIDER] Developer message preview: {content_preview}")
             wrapped = f"<context_file>\n{content}\n</context_file>"
             context_user_msgs.append({"role": "user", "content": wrapped})
 
-        logger.info(f"[PROVIDER] Created {len(context_user_msgs)} XML-wrapped context messages")
+        logger.info(
+            f"[PROVIDER] Created {len(context_user_msgs)} XML-wrapped context messages"
+        )
 
         # Convert conversation messages
-        conversation_msgs = self._convert_messages([m.model_dump() for m in conversation])
-        logger.info(f"[PROVIDER] Converted {len(conversation_msgs)} conversation messages")
+        conversation_msgs = self._convert_messages(
+            [m.model_dump() for m in conversation]
+        )
+        logger.info(
+            f"[PROVIDER] Converted {len(conversation_msgs)} conversation messages"
+        )
 
         # Combine: context THEN conversation
         all_messages = context_user_msgs + conversation_msgs
+        # Apply cache control to last message for incremental context caching
+        all_messages = self._apply_message_cache_control(all_messages)
         logger.info(f"[PROVIDER] Final message count for API: {len(all_messages)}")
 
         # Prepare request parameters
         params = {
             "model": kwargs.get("model", self.default_model),
             "messages": all_messages,
-            "max_tokens": request.max_output_tokens or kwargs.get("max_tokens", self.max_tokens),
-            "temperature": request.temperature or kwargs.get("temperature", self.temperature),
+            "max_tokens": request.max_output_tokens
+            or kwargs.get("max_tokens", self.max_tokens),
+            "temperature": request.temperature
+            or kwargs.get("temperature", self.temperature),
         }
 
-        if system:
-            params["system"] = system
+        if system_blocks:
+            params["system"] = system_blocks
 
         # Add tools if provided
         if request.tools:
-            params["tools"] = self._convert_tools_from_request(request.tools)
+            tools = self._convert_tools_from_request(request.tools)
+            params["tools"] = self._apply_tool_cache_control(tools)
             # Add tool_choice if specified
             if tool_choice := kwargs.get("tool_choice"):
                 params["tool_choice"] = tool_choice
@@ -627,8 +728,14 @@ class AnthropicProvider:
         thinking_budget = None
         interleaved_thinking_enabled = False
         if thinking_enabled:
-            budget_tokens = kwargs.get("thinking_budget_tokens") or self.config.get("thinking_budget_tokens") or 32000
-            buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get("thinking_budget_buffer", 4096)
+            budget_tokens = (
+                kwargs.get("thinking_budget_tokens")
+                or self.config.get("thinking_budget_tokens")
+                or 32000
+            )
+            buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
+                "thinking_budget_buffer", 4096
+            )
 
             thinking_budget = budget_tokens
             params["thinking"] = {
@@ -656,10 +763,14 @@ class AnthropicProvider:
             # in params will override the client's default_headers for the same key,
             # so we need to include ALL beta headers in the combined value.
             interleaved_thinking_enabled = True
-            combined_beta_headers = list(self._beta_headers)  # Start with configured headers
+            combined_beta_headers = list(
+                self._beta_headers
+            )  # Start with configured headers
             if "interleaved-thinking-2025-05-14" not in combined_beta_headers:
                 combined_beta_headers.append("interleaved-thinking-2025-05-14")
-            params["extra_headers"] = {"anthropic-beta": ",".join(combined_beta_headers)}
+            params["extra_headers"] = {
+                "anthropic-beta": ",".join(combined_beta_headers)
+            }
 
             logger.info(
                 "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=1.0, max_tokens=%s, interleaved=%s)",
@@ -674,7 +785,7 @@ class AnthropicProvider:
             params["stop_sequences"] = stop_sequences
 
         logger.info(
-            f"[PROVIDER] Anthropic API call - model: {params['model']}, messages: {len(params['messages'])}, system: {bool(system)}, tools: {len(params.get('tools', []))}, thinking: {thinking_enabled}"
+            f"[PROVIDER] Anthropic API call - model: {params['model']}, messages: {len(params['messages'])}, system: {bool(system_blocks)}, tools: {len(params.get('tools', []))}, thinking: {thinking_enabled}"
         )
 
         # Emit llm:request event
@@ -686,7 +797,7 @@ class AnthropicProvider:
                     "provider": "anthropic",
                     "model": params["model"],
                     "message_count": len(params["messages"]),
-                    "has_system": bool(system),
+                    "has_system": bool(system_blocks),
                     "thinking_enabled": thinking_enabled,
                     "thinking_budget": thinking_budget,
                     "interleaved_thinking": interleaved_thinking_enabled,
@@ -721,8 +832,10 @@ class AnthropicProvider:
         # We handle retries ourselves (SDK max_retries=0) to properly honor
         # retry-after headers with jitter and longer backoffs
         last_rate_limit_error: RateLimitError | None = None
-        
-        for attempt in range(1, self.max_retries + 2):  # +2 because range is exclusive and attempt 1 is initial try
+
+        for attempt in range(
+            1, self.max_retries + 2
+        ):  # +2 because range is exclusive and attempt 1 is initial try
             try:
                 # Use streaming API to support large context windows (Anthropic requires streaming
                 # for operations that may take > 10 minutes)
@@ -733,33 +846,37 @@ class AnthropicProvider:
                             response = await stream.get_final_message()
                             # Capture rate limit headers from stream response
                             if hasattr(stream, "response") and stream.response:
-                                rate_limit_info = self._extract_rate_limit_headers(stream.response.headers)
+                                rate_limit_info = self._extract_rate_limit_headers(
+                                    stream.response.headers
+                                )
                 else:
                     # Use with_raw_response to access headers
                     raw_response = await asyncio.wait_for(
-                        self.client.messages.with_raw_response.create(**params), 
-                        timeout=self.timeout
+                        self.client.messages.with_raw_response.create(**params),
+                        timeout=self.timeout,
                     )
                     response = raw_response.parse()
-                    rate_limit_info = self._extract_rate_limit_headers(raw_response.headers)
-                
+                    rate_limit_info = self._extract_rate_limit_headers(
+                        raw_response.headers
+                    )
+
                 # Success - break out of retry loop
                 break
-                
+
             except RateLimitError as e:
                 last_rate_limit_error = e
                 rate_info = self._parse_rate_limit_info(e)
                 retry_after = rate_info["retry_after_seconds"]
-                
+
                 # Check if we have retries remaining
                 if attempt <= self.max_retries:
                     delay = self._calculate_retry_delay(retry_after, attempt)
-                    
+
                     logger.info(
                         f"[PROVIDER] Rate limited (attempt {attempt}/{self.max_retries + 1}). "
                         f"Waiting {delay:.1f}s before retry..."
                     )
-                    
+
                     # Emit retry event for observability
                     if self.coordinator and hasattr(self.coordinator, "hooks"):
                         await self.coordinator.hooks.emit(
@@ -774,33 +891,35 @@ class AnthropicProvider:
                                 "rate_limit_type": rate_info["rate_limit_type"],
                             },
                         )
-                    
+
                     # Wait before retry
                     await asyncio.sleep(delay)
                     continue
-                
+
                 # No retries remaining - will be handled after loop
                 break
-        
+
         else:
             # This else belongs to the for loop - executes if loop completed without break
             # This shouldn't happen given our logic, but handle it gracefully
             pass
-        
+
         # Check if we exited due to rate limit exhaustion
         if last_rate_limit_error is not None and attempt > self.max_retries:
             elapsed_ms = int((time.time() - start_time) * 1000)
             rate_info = self._parse_rate_limit_info(last_rate_limit_error)
             retry_after = rate_info["retry_after_seconds"]
-            
+
             # Build clean, actionable error message
-            error_msg = f"Rate limited by Anthropic API after {self.max_retries} retries."
+            error_msg = (
+                f"Rate limited by Anthropic API after {self.max_retries} retries."
+            )
             if retry_after:
                 error_msg += f" (retry-after: {retry_after}s)"
-            
+
             # Note: We don't log here - the error message will be displayed by the CLI
             # when it catches the exception. Logging would cause duplicate output.
-            
+
             # Emit rate limit exhausted event for observability
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
@@ -814,7 +933,7 @@ class AnthropicProvider:
                         "rate_limit_type": rate_info["rate_limit_type"],
                     },
                 )
-                
+
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
@@ -825,24 +944,30 @@ class AnthropicProvider:
                         "error": error_msg,
                     },
                 )
-            
+
             # Raise with clean message (original exception as cause for debugging)
             raise RuntimeError(error_msg) from last_rate_limit_error
-        
+
         # If we get here, request succeeded - continue with response handling
         try:
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             logger.info("[PROVIDER] Received response from Anthropic API")
             logger.debug(f"[PROVIDER] Response type: {response.model}")
-            
+
             # Log rate limit status if available
             if rate_limit_info:
                 tokens_remaining = rate_limit_info.get("tokens_remaining")
                 tokens_limit = rate_limit_info.get("tokens_limit")
                 if tokens_remaining is not None and tokens_limit is not None:
-                    pct_used = ((tokens_limit - tokens_remaining) / tokens_limit) * 100 if tokens_limit > 0 else 0
-                    logger.debug(f"[PROVIDER] Rate limit: {tokens_remaining:,}/{tokens_limit:,} tokens remaining ({pct_used:.1f}% used)")
+                    pct_used = (
+                        ((tokens_limit - tokens_remaining) / tokens_limit) * 100
+                        if tokens_limit > 0
+                        else 0
+                    )
+                    logger.debug(
+                        f"[PROVIDER] Rate limit: {tokens_remaining:,}/{tokens_limit:,} tokens remaining ({pct_used:.1f}% used)"
+                    )
 
             # Emit llm:response event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -853,6 +978,18 @@ class AnthropicProvider:
                     "usage": {
                         "input": response.usage.input_tokens,
                         "output": response.usage.output_tokens,
+                        **(
+                            {"cache_read": response.usage.cache_read_input_tokens}
+                            if hasattr(response.usage, "cache_read_input_tokens")
+                            and response.usage.cache_read_input_tokens
+                            else {}
+                        ),
+                        **(
+                            {"cache_write": response.usage.cache_creation_input_tokens}
+                            if hasattr(response.usage, "cache_creation_input_tokens")
+                            and response.usage.cache_creation_input_tokens
+                            else {}
+                        ),
                     },
                     "status": "ok",
                     "duration_ms": elapsed_ms,
@@ -860,7 +997,7 @@ class AnthropicProvider:
                 # Add rate limit info if available
                 if rate_limit_info:
                     response_event["rate_limits"] = rate_limit_info
-                
+
                 await self.coordinator.hooks.emit("llm:response", response_event)
 
                 # DEBUG level: Full response with truncated values (if debug enabled)
@@ -961,7 +1098,9 @@ class AnthropicProvider:
             valid_calls.append(tc)
 
         if len(valid_calls) < len(response.tool_calls):
-            logger.info(f"Filtered {len(response.tool_calls) - len(valid_calls)} tool calls with empty arguments")
+            logger.info(
+                f"Filtered {len(response.tool_calls) - len(valid_calls)} tool calls with empty arguments"
+            )
 
         return valid_calls
 
@@ -1077,7 +1216,9 @@ class AnthropicProvider:
                         }
                     )
                 elif skipped_count > 0:
-                    logger.warning(f"All {skipped_count} consecutive tool_results were orphaned and skipped")
+                    logger.warning(
+                        f"All {skipped_count} consecutive tool_results were orphaned and skipped"
+                    )
                 continue  # i already advanced in while loop
             if role == "assistant":
                 # Assistant messages - check for tool calls or thinking blocks
@@ -1089,7 +1230,9 @@ class AnthropicProvider:
                     has_thinking = "thinking_block" in msg and msg["thinking_block"]
                     if has_thinking:
                         # Clean thinking block (remove visibility field not accepted by API)
-                        cleaned_thinking = self._clean_content_block(msg["thinking_block"])
+                        cleaned_thinking = self._clean_content_block(
+                            msg["thinking_block"]
+                        )
                         content_blocks.append(cleaned_thinking)
 
                     # Add text content if present, BUT skip when we have thinking + tool_calls
@@ -1100,10 +1243,24 @@ class AnthropicProvider:
                         if isinstance(content, list):
                             # Content is a list of blocks - extract text blocks only
                             for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    content_blocks.append({"type": "text", "text": block.get("text", "")})
-                                elif not isinstance(block, dict) and hasattr(block, "type") and block.type == "text":
-                                    content_blocks.append({"type": "text", "text": getattr(block, "text", "")})
+                                if (
+                                    isinstance(block, dict)
+                                    and block.get("type") == "text"
+                                ):
+                                    content_blocks.append(
+                                        {"type": "text", "text": block.get("text", "")}
+                                    )
+                                elif (
+                                    not isinstance(block, dict)
+                                    and hasattr(block, "type")
+                                    and block.type == "text"
+                                ):
+                                    content_blocks.append(
+                                        {
+                                            "type": "text",
+                                            "text": getattr(block, "text", ""),
+                                        }
+                                    )
                         else:
                             # Content is a simple string
                             content_blocks.append({"type": "text", "text": content})
@@ -1119,7 +1276,9 @@ class AnthropicProvider:
                             }
                         )
 
-                    anthropic_messages.append({"role": "assistant", "content": content_blocks})
+                    anthropic_messages.append(
+                        {"role": "assistant", "content": content_blocks}
+                    )
                 elif "thinking_block" in msg and msg["thinking_block"]:
                     # Assistant message with thinking block
                     # Clean thinking block (remove visibility field not accepted by API)
@@ -1129,23 +1288,45 @@ class AnthropicProvider:
                         if isinstance(content, list):
                             # Content is a list of blocks - extract text blocks only
                             for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    content_blocks.append({"type": "text", "text": block.get("text", "")})
-                                elif not isinstance(block, dict) and hasattr(block, "type") and block.type == "text":
-                                    content_blocks.append({"type": "text", "text": getattr(block, "text", "")})
+                                if (
+                                    isinstance(block, dict)
+                                    and block.get("type") == "text"
+                                ):
+                                    content_blocks.append(
+                                        {"type": "text", "text": block.get("text", "")}
+                                    )
+                                elif (
+                                    not isinstance(block, dict)
+                                    and hasattr(block, "type")
+                                    and block.type == "text"
+                                ):
+                                    content_blocks.append(
+                                        {
+                                            "type": "text",
+                                            "text": getattr(block, "text", ""),
+                                        }
+                                    )
                         else:
                             # Content is a simple string
                             content_blocks.append({"type": "text", "text": content})
-                    anthropic_messages.append({"role": "assistant", "content": content_blocks})
+                    anthropic_messages.append(
+                        {"role": "assistant", "content": content_blocks}
+                    )
                 else:
                     # Regular assistant message - may have structured content blocks
                     if isinstance(content, list):
                         # Content is a list of blocks - clean each block
-                        cleaned_blocks = [self._clean_content_block(block) for block in content]
-                        anthropic_messages.append({"role": "assistant", "content": cleaned_blocks})
+                        cleaned_blocks = [
+                            self._clean_content_block(block) for block in content
+                        ]
+                        anthropic_messages.append(
+                            {"role": "assistant", "content": cleaned_blocks}
+                        )
                     else:
                         # Content is a simple string
-                        anthropic_messages.append({"role": "assistant", "content": content})
+                        anthropic_messages.append(
+                            {"role": "assistant", "content": content}
+                        )
                 i += 1
             elif role == "developer":
                 # Developer messages -> XML-wrapped user messages (context files)
@@ -1160,24 +1341,34 @@ class AnthropicProvider:
                         if isinstance(block, dict):
                             block_type = block.get("type")
                             if block_type == "text":
-                                content_blocks.append({"type": "text", "text": block.get("text", "")})
+                                content_blocks.append(
+                                    {"type": "text", "text": block.get("text", "")}
+                                )
                             elif block_type == "image":
                                 # Convert ImageBlock to Anthropic image format
                                 source = block.get("source", {})
                                 if source.get("type") == "base64":
-                                    content_blocks.append({
-                                        "type": "image",
-                                        "source": {
-                                            "type": "base64",
-                                            "media_type": source.get("media_type", "image/jpeg"),
-                                            "data": source.get("data")
+                                    content_blocks.append(
+                                        {
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": source.get(
+                                                    "media_type", "image/jpeg"
+                                                ),
+                                                "data": source.get("data"),
+                                            },
                                         }
-                                    })
+                                    )
                                 else:
-                                    logger.warning(f"Unsupported image source type: {source.get('type')}")
-                    
+                                    logger.warning(
+                                        f"Unsupported image source type: {source.get('type')}"
+                                    )
+
                     if content_blocks:
-                        anthropic_messages.append({"role": "user", "content": content_blocks})
+                        anthropic_messages.append(
+                            {"role": "user", "content": content_blocks}
+                        )
                 else:
                     # Simple string content
                     anthropic_messages.append({"role": "user", "content": content})
@@ -1204,6 +1395,63 @@ class AnthropicProvider:
                 }
             )
         return anthropic_tools
+
+    def _apply_tool_cache_control(
+        self, tools: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Add cache_control to the last tool definition.
+
+        Per Anthropic spec: cache breakpoint on last tool creates
+        checkpoint for entire tool list.
+
+        Args:
+            tools: List of Anthropic-formatted tool definitions
+
+        Returns:
+            Same list with cache_control on last tool (if caching enabled)
+        """
+        if not tools or not self.enable_prompt_caching:
+            return tools
+
+        # Add cache_control to last tool
+        tools[-1]["cache_control"] = {"type": "ephemeral"}
+        return tools
+
+    def _apply_message_cache_control(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Add cache_control to last content block of last message.
+
+        Per Anthropic spec: this creates a checkpoint at the end of
+        conversation history, caching the full context.
+
+        Args:
+            messages: Anthropic-formatted message list
+
+        Returns:
+            Same list with cache_control on last message's last block
+        """
+        if not messages or not self.enable_prompt_caching:
+            return messages
+
+        last_msg = messages[-1]
+        content = last_msg.get("content")
+
+        # Handle different content formats
+        if isinstance(content, list) and content:
+            # Array of content blocks - mark last block
+            content[-1]["cache_control"] = {"type": "ephemeral"}
+        elif isinstance(content, str):
+            # String content - convert to block array with cache marker
+            last_msg["content"] = [
+                {
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+
+        return messages
 
     def _convert_to_chat_response(self, response: Any) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
@@ -1241,15 +1489,40 @@ class AnthropicProvider:
                 event_blocks.append(ThinkingContent(text=block.thinking))
                 # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
             elif block.type == "tool_use":
-                content_blocks.append(ToolCallBlock(id=block.id, name=block.name, input=block.input))
-                tool_calls.append(ToolCall(id=block.id, name=block.name, arguments=block.input))
-                event_blocks.append(ToolCallContent(id=block.id, name=block.name, arguments=block.input))
+                content_blocks.append(
+                    ToolCallBlock(id=block.id, name=block.name, input=block.input)
+                )
+                tool_calls.append(
+                    ToolCall(id=block.id, name=block.name, arguments=block.input)
+                )
+                event_blocks.append(
+                    ToolCallContent(id=block.id, name=block.name, arguments=block.input)
+                )
 
-        usage = Usage(
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            total_tokens=response.usage.input_tokens + response.usage.output_tokens,
-        )
+        # Build usage dict with cache metrics if available
+        usage_kwargs: dict[str, Any] = {
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+            "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
+        }
+
+        # Add cache metrics if available (Anthropic includes these when caching is active)
+        if (
+            hasattr(response.usage, "cache_creation_input_tokens")
+            and response.usage.cache_creation_input_tokens
+        ):
+            usage_kwargs["cache_creation_input_tokens"] = (
+                response.usage.cache_creation_input_tokens
+            )
+        if (
+            hasattr(response.usage, "cache_read_input_tokens")
+            and response.usage.cache_read_input_tokens
+        ):
+            usage_kwargs["cache_read_input_tokens"] = (
+                response.usage.cache_read_input_tokens
+            )
+
+        usage = Usage(**usage_kwargs)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
