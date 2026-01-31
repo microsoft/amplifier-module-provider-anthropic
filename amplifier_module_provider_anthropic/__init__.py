@@ -178,7 +178,10 @@ class AnthropicProvider:
         )  # Enable native web search tool
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
-        self._base_url = self.config.get("base_url")
+        # Fall back to ANTHROPIC_BASE_URL env var for ollama launch support
+        self._base_url = self.config.get("base_url") or os.environ.get(
+            "ANTHROPIC_BASE_URL"
+        )
 
         # Handle enable_1m_context from init wizard - translate to beta_headers
         # This bridges the config field (enable_1m_context boolean) to the actual
