@@ -251,6 +251,7 @@ class AnthropicProvider:
                 "timeout": 300.0,
                 "context_window": 1000000
                 if self.config.get("enable_1m_context")
+                and any(f in self.default_model.lower() for f in ("sonnet", "opus"))
                 else 200000,
                 "max_output_tokens": 128000
                 if self._model_family == "opus"
