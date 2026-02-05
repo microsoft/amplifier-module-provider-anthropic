@@ -282,6 +282,9 @@ class AnthropicProvider:
                     required=False,
                     default="true",
                     requires_model=True,  # Shown after model selection
+                    show_when={
+                        "default_model": "not_contains:haiku"
+                    },  # Hide for Haiku (doesn't support 1M)
                 ),
                 ConfigField(
                     id="enable_prompt_caching",
