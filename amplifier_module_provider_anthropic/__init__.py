@@ -134,7 +134,10 @@ class AnthropicProvider:
         self.config = config or {}
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "claude-sonnet-4-5")
-        self.max_tokens = self.config.get("max_tokens", 64000)
+        self._model_family = self._detect_family(self.default_model)
+        # Opus supports 128K output tokens; Sonnet/Haiku support 64K
+        default_max_tokens = 128000 if self._model_family == "opus" else 64000
+        self.max_tokens = self.config.get("max_tokens", default_max_tokens)
         self.temperature = self.config.get("temperature", 0.7)
         self.priority = self.config.get("priority", 100)  # Store priority for selection
         self.debug = self.config.get(
@@ -249,7 +252,9 @@ class AnthropicProvider:
                 "context_window": 1000000
                 if self.config.get("enable_1m_context")
                 else 200000,
-                "max_output_tokens": 64000,
+                "max_output_tokens": 128000
+                if self._model_family == "opus"
+                else 64000,
             },
             config_fields=[
                 ConfigField(
@@ -345,14 +350,17 @@ class AnthropicProvider:
                 else:
                     capabilities = ["tools", "thinking", "streaming", "json_mode"]
 
+                # Opus supports 128K output tokens; Sonnet/Haiku support 64K
+                max_output = 128000 if family == "opus" else 64000
+
                 result.append(
                     ModelInfo(
                         id=model_id,
                         display_name=display_name,
-                        context_window=200000,  # All Claude models have 200K context
-                        max_output_tokens=64000,  # All current Claude models support 64K output
+                        context_window=200000,  # All Claude models have 200K base context
+                        max_output_tokens=max_output,
                         capabilities=capabilities,
-                        defaults={"temperature": 0.7, "max_tokens": 64000},
+                        defaults={"temperature": 0.7, "max_tokens": max_output},
                     )
                 )
 
@@ -360,6 +368,15 @@ class AnthropicProvider:
         result.sort(key=lambda m: m.display_name.lower())
 
         return result
+
+    @staticmethod
+    def _detect_family(model_id: str) -> str:
+        """Detect the Claude model family from a model ID string."""
+        model_lower = model_id.lower()
+        for family in ("opus", "sonnet", "haiku"):
+            if family in model_lower:
+                return family
+        return "sonnet"  # Default to sonnet for unknown models
 
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
@@ -743,10 +760,12 @@ class AnthropicProvider:
         thinking_budget = None
         interleaved_thinking_enabled = False
         if thinking_enabled:
+            # Opus has 128K output capacity → larger default thinking budget
+            default_budget = 64000 if self._model_family == "opus" else 32000
             budget_tokens = (
                 kwargs.get("thinking_budget_tokens")
                 or self.config.get("thinking_budget_tokens")
-                or 32000
+                or default_budget
             )
             buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
                 "thinking_budget_buffer", 4096
