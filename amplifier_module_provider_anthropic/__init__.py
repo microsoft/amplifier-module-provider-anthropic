@@ -277,13 +277,10 @@ class AnthropicProvider:
                     id="enable_1m_context",
                     display_name="1M Context Window",
                     field_type="boolean",
-                    prompt="Enable 1M token context window? (Sonnet 4/4.5 only, sets beta header)",
+                    prompt="Enable 1M token context window? (Sonnet and Opus models, beta)",
                     required=False,
                     default="true",
                     requires_model=True,  # Shown after model selection
-                    show_when={
-                        "default_model": "contains:sonnet"
-                    },  # Only show for Sonnet models
                 ),
                 ConfigField(
                     id="enable_prompt_caching",
@@ -350,6 +347,13 @@ class AnthropicProvider:
                 else:
                     capabilities = ["tools", "thinking", "streaming", "json_mode"]
 
+                # Context window: 1M when enabled for families that support it
+                has_1m = self.config.get("enable_1m_context") and family in (
+                    "sonnet",
+                    "opus",
+                )
+                context_window = 1000000 if has_1m else 200000
+
                 # Opus supports 128K output tokens; Sonnet/Haiku support 64K
                 max_output = 128000 if family == "opus" else 64000
 
@@ -357,7 +361,7 @@ class AnthropicProvider:
                     ModelInfo(
                         id=model_id,
                         display_name=display_name,
-                        context_window=200000,  # All Claude models have 200K base context
+                        context_window=context_window,
                         max_output_tokens=max_output,
                         capabilities=capabilities,
                         defaults={"temperature": 0.7, "max_tokens": max_output},
