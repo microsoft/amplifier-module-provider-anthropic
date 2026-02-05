@@ -753,8 +753,12 @@ class AnthropicProvider:
             )
 
             thinking_budget = budget_tokens
+            thinking_type = (
+                kwargs.get("thinking_type")
+                or self.config.get("thinking_type", "adaptive")
+            )
             params["thinking"] = {
-                "type": "enabled",
+                "type": thinking_type,
                 "budget_tokens": budget_tokens,
             }
 
