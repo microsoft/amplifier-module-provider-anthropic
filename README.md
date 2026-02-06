@@ -30,7 +30,7 @@ Provides access to Anthropic's Claude models (Claude 4 series: Sonnet, Opus, Hai
 ## Supported Models
 
 - `claude-sonnet-4-5` - Claude Sonnet 4.5 (recommended, default)
-- `claude-opus-4-1` - Claude Opus 4.1 (most capable)
+- `claude-opus-4-6` - Claude Opus 4.6 (most capable)
 - `claude-haiku-4-5` - Claude Haiku 4.5 (fastest, cheapest)
 
 ## Configuration
