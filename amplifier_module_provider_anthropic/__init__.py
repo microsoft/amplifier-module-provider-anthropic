@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import time
 from typing import Any
 
@@ -52,11 +53,24 @@ logger = logging.getLogger(__name__)
 BETA_HEADER_1M_CONTEXT = "context-1m-2025-08-07"
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
 
-# 1M context version requirements: (family, min_major, min_minor)
-_1M_MINIMUM_VERSIONS: dict[str, tuple[int, int]] = {
-    "opus": (4, 6),  # Opus 4.6+
-    "sonnet": (4, 5),  # Sonnet 4.5+
-}
+
+@dataclass(frozen=True)
+class ModelCapabilities:
+    """Per-model capability matrix — single source of truth.
+
+    Every model-specific decision in the provider (context window size,
+    thinking mode, output capacity, etc.) should be derived from this
+    dataclass rather than scattered if/else checks.
+    """
+
+    family: str
+    max_output_tokens: int = 64000
+    base_context_window: int = 200000
+    supports_1m: bool = False
+    supports_thinking: bool = False
+    supports_adaptive_thinking: bool = False
+    default_thinking_budget: int = 0
+    capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
 
 
 class AnthropicChatResponse(ChatResponse):
@@ -144,10 +158,10 @@ class AnthropicProvider:
         self.config = config or {}
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "claude-sonnet-4-5")
-        self._model_family = self._detect_family(self.default_model)
-        # Opus supports 128K output tokens; Sonnet/Haiku support 64K
-        default_max_tokens = 128000 if self._model_family == "opus" else 64000
-        self.max_tokens = self.config.get("max_tokens", default_max_tokens)
+        self._default_caps = self._get_capabilities(self.default_model)
+        self.max_tokens = self.config.get(
+            "max_tokens", self._default_caps.max_output_tokens
+        )
         self.temperature = self.config.get("temperature", 0.7)
         self.priority = self.config.get("priority", 100)  # Store priority for selection
         self.debug = self.config.get(
@@ -253,7 +267,7 @@ class AnthropicProvider:
             id="anthropic",
             display_name="Anthropic",
             credential_env_vars=["ANTHROPIC_API_KEY"],
-            capabilities=["streaming", "tools", "thinking", "batch"],
+            capabilities=list(self._default_caps.capability_tags),
             defaults={
                 "model": self.default_model,
                 "max_tokens": 4096,
@@ -261,9 +275,9 @@ class AnthropicProvider:
                 "timeout": 300.0,
                 "context_window": 1000000
                 if self.config.get("enable_1m_context")
-                and self._supports_1m(self.default_model)
-                else 200000,
-                "max_output_tokens": 128000 if self._model_family == "opus" else 64000,
+                and self._default_caps.supports_1m
+                else self._default_caps.base_context_window,
+                "max_output_tokens": self._default_caps.max_output_tokens,
             },
             config_fields=[
                 ConfigField(
@@ -352,30 +366,22 @@ class AnthropicProvider:
             models_to_include = [models[0]] if self.filtered else models
 
             for model_id, display_name, _ in models_to_include:
-                # Determine capabilities based on family
-                # Haiku is optimized for speed; Opus and Sonnet support extended thinking
-                if family == "haiku":
-                    capabilities = ["tools", "streaming", "json_mode", "fast"]
-                else:
-                    capabilities = ["tools", "thinking", "streaming", "json_mode"]
+                caps = self._get_capabilities(model_id)
 
-                # Context window: 1M when enabled for models that support it
-                has_1m = self.config.get("enable_1m_context") and self._supports_1m(
-                    model_id
-                )
-                context_window = 1000000 if has_1m else 200000
-
-                # Opus supports 128K output tokens; Sonnet/Haiku support 64K
-                max_output = 128000 if family == "opus" else 64000
+                has_1m = self.config.get("enable_1m_context") and caps.supports_1m
+                context_window = 1000000 if has_1m else caps.base_context_window
 
                 result.append(
                     ModelInfo(
                         id=model_id,
                         display_name=display_name,
                         context_window=context_window,
-                        max_output_tokens=max_output,
-                        capabilities=capabilities,
-                        defaults={"temperature": 0.7, "max_tokens": max_output},
+                        max_output_tokens=caps.max_output_tokens,
+                        capabilities=list(caps.capability_tags),
+                        defaults={
+                            "temperature": 0.7,
+                            "max_tokens": caps.max_output_tokens,
+                        },
                     )
                 )
 
@@ -401,8 +407,6 @@ class AnthropicProvider:
         Returns ``(0, 0)`` when the version cannot be determined — callers
         should treat unknown versions conservatively.
         """
-        import re
-
         # Look for family-MAJOR-MINOR in the model id
         pattern = rf"{family}-(\d+)-(\d+)"
         match = re.search(pattern, model_id.lower())
@@ -411,21 +415,54 @@ class AnthropicProvider:
         return (0, 0)
 
     @classmethod
-    def _supports_1m(cls, model_id: str) -> bool:
-        """Check whether a model supports the 1M context window beta.
+    def _get_capabilities(cls, model_id: str) -> ModelCapabilities:
+        """Return the capability matrix for *model_id*.
 
-        Currently supported on Opus 4.6+ and Sonnet 4.5+.
+        Version requirements
+        --------------------
+        * **Opus 4.6+** — 1M context, adaptive thinking, 128K output
+        * **Sonnet 4.5+** — 1M context, extended thinking, 64K output
+        * **Haiku** — fast inference, no thinking, no 1M
+
+        When the version cannot be parsed from the model ID we assume the
+        *latest* capabilities for that family so newly released models work
+        out-of-the-box.
         """
         family = cls._detect_family(model_id)
-        min_version = _1M_MINIMUM_VERSIONS.get(family)
-        if min_version is None:
-            return False  # Family not eligible (e.g. Haiku)
         major, minor = cls._detect_version(model_id, family)
-        if (major, minor) == (0, 0):
-            # Unknown version — allow if the family is generally eligible
-            # so new model IDs that don't match the pattern still work.
-            return True
-        return (major, minor) >= min_version
+        version_known = (major, minor) != (0, 0)
+
+        if family == "opus":
+            is_46_plus = not version_known or (major, minor) >= (4, 6)
+            return ModelCapabilities(
+                family="opus",
+                max_output_tokens=128000,
+                supports_1m=is_46_plus,
+                supports_thinking=True,
+                supports_adaptive_thinking=is_46_plus,
+                default_thinking_budget=64000,
+                capability_tags=("tools", "thinking", "streaming", "json_mode"),
+            )
+
+        if family == "sonnet":
+            is_45_plus = not version_known or (major, minor) >= (4, 5)
+            return ModelCapabilities(
+                family="sonnet",
+                supports_1m=is_45_plus,
+                supports_thinking=True,
+                supports_adaptive_thinking=False,
+                default_thinking_budget=32000,
+                capability_tags=("tools", "thinking", "streaming", "json_mode"),
+            )
+
+        if family == "haiku":
+            return ModelCapabilities(
+                family="haiku",
+                capability_tags=("tools", "streaming", "json_mode", "fast"),
+            )
+
+        # Unknown family — conservative defaults
+        return ModelCapabilities(family=family)
 
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
@@ -809,17 +846,14 @@ class AnthropicProvider:
         thinking_budget = None
         interleaved_thinking_enabled = False
         if thinking_enabled:
-            # Detect family from the actual model being used in this request,
-            # not just the instance-level default (handles per-request overrides).
-            request_model = params["model"]
-            request_family = self._detect_family(request_model)
+            # Resolve capabilities for the actual model in this request
+            # (may differ from instance default when callers pass model=...).
+            request_caps = self._get_capabilities(params["model"])
 
-            # Opus has 128K output capacity → larger default thinking budget
-            default_budget = 64000 if request_family == "opus" else 32000
             budget_tokens = (
                 kwargs.get("thinking_budget_tokens")
                 or self.config.get("thinking_budget_tokens")
-                or default_budget
+                or request_caps.default_thinking_budget
             )
             buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
                 "thinking_budget_buffer", 4096
@@ -830,12 +864,11 @@ class AnthropicProvider:
                 "thinking_type", "adaptive"
             )
 
-            # Adaptive thinking (Opus 4.6 only): model controls its own budget.
-            # The API schema is a discriminated union — "adaptive" accepts NO
-            # extra fields (budget_tokens is forbidden).  For non-Opus models
-            # that don't support adaptive, fall back to "enabled" with an
-            # explicit budget.
-            if thinking_type == "adaptive" and request_family == "opus":
+            # Adaptive thinking: model controls its own budget.  The API schema
+            # is a discriminated union — "adaptive" accepts NO extra fields
+            # (budget_tokens is forbidden).  Fall back to "enabled" with an
+            # explicit budget when the model doesn't support adaptive.
+            if thinking_type == "adaptive" and request_caps.supports_adaptive_thinking:
                 params["thinking"] = {"type": "adaptive"}
             else:
                 # "enabled" mode (all thinking-capable models): explicit budget
