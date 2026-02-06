@@ -48,6 +48,16 @@ from anthropic import RateLimitError
 
 logger = logging.getLogger(__name__)
 
+# Beta header constants — single source of truth for experimental feature headers
+BETA_HEADER_1M_CONTEXT = "context-1m-2025-08-07"
+BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
+
+# 1M context version requirements: (family, min_major, min_minor)
+_1M_MINIMUM_VERSIONS: dict[str, tuple[int, int]] = {
+    "opus": (4, 6),  # Opus 4.6+
+    "sonnet": (4, 5),  # Sonnet 4.5+
+}
+
 
 class AnthropicChatResponse(ChatResponse):
     """ChatResponse with additional fields for streaming UI compatibility."""
@@ -191,8 +201,8 @@ class AnthropicProvider:
             existing_beta = self.config.get("beta_headers", [])
             if isinstance(existing_beta, str):
                 existing_beta = [existing_beta] if existing_beta else []
-            if "context-1m-2025-08-07" not in existing_beta:
-                existing_beta.append("context-1m-2025-08-07")
+            if BETA_HEADER_1M_CONTEXT not in existing_beta:
+                existing_beta.append(BETA_HEADER_1M_CONTEXT)
             self.config["beta_headers"] = existing_beta
             logger.info(
                 "[PROVIDER] 1M context window enabled via enable_1m_context config"
@@ -245,13 +255,13 @@ class AnthropicProvider:
             credential_env_vars=["ANTHROPIC_API_KEY"],
             capabilities=["streaming", "tools", "thinking", "batch"],
             defaults={
-                "model": "claude-sonnet-4-5-20250929",
+                "model": self.default_model,
                 "max_tokens": 4096,
                 "temperature": 0.7,
                 "timeout": 300.0,
                 "context_window": 1000000
                 if self.config.get("enable_1m_context")
-                and any(f in self.default_model.lower() for f in ("sonnet", "opus"))
+                and self._supports_1m(self.default_model)
                 else 200000,
                 "max_output_tokens": 128000 if self._model_family == "opus" else 64000,
             },
@@ -349,10 +359,9 @@ class AnthropicProvider:
                 else:
                     capabilities = ["tools", "thinking", "streaming", "json_mode"]
 
-                # Context window: 1M when enabled for families that support it
-                has_1m = self.config.get("enable_1m_context") and family in (
-                    "sonnet",
-                    "opus",
+                # Context window: 1M when enabled for models that support it
+                has_1m = self.config.get("enable_1m_context") and self._supports_1m(
+                    model_id
                 )
                 context_window = 1000000 if has_1m else 200000
 
@@ -383,6 +392,40 @@ class AnthropicProvider:
             if family in model_lower:
                 return family
         return "sonnet"  # Default to sonnet for unknown models
+
+    @staticmethod
+    def _detect_version(model_id: str, family: str) -> tuple[int, int]:
+        """Extract (major, minor) version from a model ID.
+
+        Parses patterns like ``claude-opus-4-6``, ``claude-sonnet-4-5-20250929``.
+        Returns ``(0, 0)`` when the version cannot be determined — callers
+        should treat unknown versions conservatively.
+        """
+        import re
+
+        # Look for family-MAJOR-MINOR in the model id
+        pattern = rf"{family}-(\d+)-(\d+)"
+        match = re.search(pattern, model_id.lower())
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        return (0, 0)
+
+    @classmethod
+    def _supports_1m(cls, model_id: str) -> bool:
+        """Check whether a model supports the 1M context window beta.
+
+        Currently supported on Opus 4.6+ and Sonnet 4.5+.
+        """
+        family = cls._detect_family(model_id)
+        min_version = _1M_MINIMUM_VERSIONS.get(family)
+        if min_version is None:
+            return False  # Family not eligible (e.g. Haiku)
+        major, minor = cls._detect_version(model_id, family)
+        if (major, minor) == (0, 0):
+            # Unknown version — allow if the family is generally eligible
+            # so new model IDs that don't match the pattern still work.
+            return True
+        return (major, minor) >= min_version
 
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
@@ -766,8 +809,13 @@ class AnthropicProvider:
         thinking_budget = None
         interleaved_thinking_enabled = False
         if thinking_enabled:
+            # Detect family from the actual model being used in this request,
+            # not just the instance-level default (handles per-request overrides).
+            request_model = params["model"]
+            request_family = self._detect_family(request_model)
+
             # Opus has 128K output capacity → larger default thinking budget
-            default_budget = 64000 if self._model_family == "opus" else 32000
+            default_budget = 64000 if request_family == "opus" else 32000
             budget_tokens = (
                 kwargs.get("thinking_budget_tokens")
                 or self.config.get("thinking_budget_tokens")
@@ -787,7 +835,7 @@ class AnthropicProvider:
             # extra fields (budget_tokens is forbidden).  For non-Opus models
             # that don't support adaptive, fall back to "enabled" with an
             # explicit budget.
-            if thinking_type == "adaptive" and self._model_family == "opus":
+            if thinking_type == "adaptive" and request_family == "opus":
                 params["thinking"] = {"type": "adaptive"}
             else:
                 # "enabled" mode (all thinking-capable models): explicit budget
@@ -824,8 +872,8 @@ class AnthropicProvider:
             combined_beta_headers = list(
                 self._beta_headers
             )  # Start with configured headers
-            if "interleaved-thinking-2025-05-14" not in combined_beta_headers:
-                combined_beta_headers.append("interleaved-thinking-2025-05-14")
+            if BETA_HEADER_INTERLEAVED_THINKING not in combined_beta_headers:
+                combined_beta_headers.append(BETA_HEADER_INTERLEAVED_THINKING)
             params["extra_headers"] = {
                 "anthropic-beta": ",".join(combined_beta_headers)
             }
