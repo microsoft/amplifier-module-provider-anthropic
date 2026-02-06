@@ -253,9 +253,7 @@ class AnthropicProvider:
                 if self.config.get("enable_1m_context")
                 and any(f in self.default_model.lower() for f in ("sonnet", "opus"))
                 else 200000,
-                "max_output_tokens": 128000
-                if self._model_family == "opus"
-                else 64000,
+                "max_output_tokens": 128000 if self._model_family == "opus" else 64000,
             },
             config_fields=[
                 ConfigField(
@@ -780,19 +778,33 @@ class AnthropicProvider:
             )
 
             thinking_budget = budget_tokens
-            thinking_type = (
-                kwargs.get("thinking_type")
-                or self.config.get("thinking_type", "adaptive")
+            thinking_type = kwargs.get("thinking_type") or self.config.get(
+                "thinking_type", "adaptive"
             )
-            params["thinking"] = {
-                "type": thinking_type,
-                "budget_tokens": budget_tokens,
-            }
+
+            # Adaptive thinking (Opus 4.6 only): model controls its own budget.
+            # The API schema is a discriminated union — "adaptive" accepts NO
+            # extra fields (budget_tokens is forbidden).  For non-Opus models
+            # that don't support adaptive, fall back to "enabled" with an
+            # explicit budget.
+            if thinking_type == "adaptive" and self._model_family == "opus":
+                params["thinking"] = {"type": "adaptive"}
+            else:
+                # "enabled" mode (all thinking-capable models): explicit budget
+                if thinking_type == "adaptive":
+                    # Caller asked for adaptive but model doesn't support it
+                    thinking_type = "enabled"
+                params["thinking"] = {
+                    "type": thinking_type,
+                    "budget_tokens": budget_tokens,
+                }
 
             # CRITICAL: Anthropic requires temperature=1.0 when thinking is enabled
             params["temperature"] = 1.0
 
-            # Ensure max_tokens accommodates thinking budget + response
+            # Ensure max_tokens accommodates thinking budget + response.
+            # For adaptive mode the model manages its own budget within
+            # max_tokens, so we still need a generous ceiling.
             target_tokens = budget_tokens + buffer_tokens
             if params.get("max_tokens"):
                 params["max_tokens"] = max(params["max_tokens"], target_tokens)
