@@ -1,12 +1,10 @@
 """Tests for tool result repair and infinite loop prevention."""
 
 import asyncio
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest
@@ -26,10 +24,17 @@ class DummyResponse:
 
 
 class MockStreamManager:
-    """Mock for the streaming context manager returned by client.messages.stream()."""
+    """Mock for the streaming context manager returned by client.messages.stream().
 
-    def __init__(self, response: DummyResponse):
-        self.response = response
+    Separates the API message response (returned by get_final_message) from the
+    HTTP response (accessed via .response for rate limit headers).
+    """
+
+    def __init__(self, api_response: DummyResponse):
+        self._api_response = api_response
+        # The real SDK exposes .response as the HTTP response (with headers).
+        # Provide a minimal stub so header extraction doesn't crash.
+        self.response = SimpleNamespace(headers={})
 
     async def __aenter__(self):
         return self
@@ -38,12 +43,24 @@ class MockStreamManager:
         return False
 
     async def get_final_message(self):
-        return self.response
+        return self._api_response
 
 
 def create_stream_mock(response: DummyResponse):
     """Create a mock for client.messages.stream that returns an async context manager."""
     return MagicMock(return_value=MockStreamManager(response))
+
+
+def create_raw_response_mock(response: DummyResponse):
+    """Create a mock for client.messages.with_raw_response.create (non-streaming path).
+
+    The non-streaming path calls with_raw_response.create() which returns an
+    object with .parse() → response and .headers → dict.
+    """
+    raw = MagicMock()
+    raw.parse.return_value = response
+    raw.headers = {}
+    return AsyncMock(return_value=raw)
 
 
 class FakeHooks:
@@ -61,16 +78,20 @@ class FakeCoordinator:
 
 def test_tool_call_sequence_missing_tool_message_is_repaired():
     """Missing tool results should be repaired with synthetic results and emit event."""
-    # use_streaming=False so we use messages.create (which we mock) instead of messages.stream
+    # use_streaming=False so we use with_raw_response.create (which we mock)
     provider = AnthropicProvider(api_key="test-key", config={"use_streaming": False})
-    provider.client.messages.create = AsyncMock(return_value=DummyResponse())
+    provider.client.messages.with_raw_response.create = create_raw_response_mock(
+        DummyResponse()
+    )
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
 
     messages = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_1", name="do_something", input={"value": 1})],
+            content=[
+                ToolCallBlock(id="call_1", name="do_something", input={"value": 1})
+            ],
         ),
         Message(role="user", content="No tool result present"),
     ]
@@ -79,13 +100,20 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
     asyncio.run(provider.complete(request))
 
     # Should succeed (not raise validation error)
-    provider.client.messages.create.assert_awaited_once()
+    provider.client.messages.with_raw_response.create.assert_awaited_once()
 
     # Should not emit validation error
-    assert all(event_name != "provider:validation_error" for event_name, _ in fake_coordinator.hooks.events)
+    assert all(
+        event_name != "provider:validation_error"
+        for event_name, _ in fake_coordinator.hooks.events
+    )
 
     # Should emit repair event
-    repair_events = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events) == 1
     assert repair_events[0][1]["provider"] == "anthropic"
     assert repair_events[0][1]["repair_count"] == 1
@@ -103,9 +131,11 @@ def test_repaired_tool_ids_are_not_detected_again():
 
     The fix tracks repaired tool IDs to skip re-detection.
     """
-    # use_streaming=False so we use messages.create (which we mock) instead of messages.stream
+    # use_streaming=False so we use with_raw_response.create (which we mock)
     provider = AnthropicProvider(api_key="test-key", config={"use_streaming": False})
-    provider.client.messages.create = AsyncMock(return_value=DummyResponse())
+    provider.client.messages.with_raw_response.create = create_raw_response_mock(
+        DummyResponse()
+    )
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
 
@@ -113,7 +143,9 @@ def test_repaired_tool_ids_are_not_detected_again():
     messages = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_abc123", name="grep", input={"pattern": "test"})],
+            content=[
+                ToolCallBlock(id="call_abc123", name="grep", input={"pattern": "test"})
+            ],
         ),
         Message(role="user", content="No tool result present"),
     ]
@@ -124,7 +156,11 @@ def test_repaired_tool_ids_are_not_detected_again():
 
     # Verify repair happened
     assert "call_abc123" in provider._repaired_tool_ids  # pyright: ignore[reportAttributeAccessIssue]
-    repair_events_1 = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events_1 = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events_1) == 1
 
     # Clear events for second call
@@ -135,7 +171,9 @@ def test_repaired_tool_ids_are_not_detected_again():
     messages_2 = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_abc123", name="grep", input={"pattern": "test"})],
+            content=[
+                ToolCallBlock(id="call_abc123", name="grep", input={"pattern": "test"})
+            ],
         ),
         Message(role="user", content="No tool result present"),
     ]
@@ -144,15 +182,21 @@ def test_repaired_tool_ids_are_not_detected_again():
     asyncio.run(provider.complete(request_2))
 
     # Should NOT emit another repair event for the same tool ID
-    repair_events_2 = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events_2 = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events_2) == 0, "Should not re-detect already-repaired tool IDs"
 
 
 def test_multiple_missing_tool_results_all_tracked():
     """Multiple missing tool results should all be tracked to prevent infinite loops."""
-    # use_streaming=False so we use messages.create (which we mock) instead of messages.stream
+    # use_streaming=False so we use with_raw_response.create (which we mock)
     provider = AnthropicProvider(api_key="test-key", config={"use_streaming": False})
-    provider.client.messages.create = AsyncMock(return_value=DummyResponse())
+    provider.client.messages.with_raw_response.create = create_raw_response_mock(
+        DummyResponse()
+    )
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
 
@@ -176,7 +220,11 @@ def test_multiple_missing_tool_results_all_tracked():
     assert provider._repaired_tool_ids == {"call_1", "call_2", "call_3"}  # pyright: ignore[reportAttributeAccessIssue]
 
     # Verify repair event has all 3
-    repair_events = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events) == 1
     assert repair_events[0][1]["repair_count"] == 3
 
@@ -197,7 +245,9 @@ def test_streaming_tool_call_sequence_missing_tool_message_is_repaired():
     messages = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_1", name="do_something", input={"value": 1})],
+            content=[
+                ToolCallBlock(id="call_1", name="do_something", input={"value": 1})
+            ],
         ),
         Message(role="user", content="No tool result present"),
     ]
@@ -209,10 +259,17 @@ def test_streaming_tool_call_sequence_missing_tool_message_is_repaired():
     provider.client.messages.stream.assert_called_once()
 
     # Should not emit validation error
-    assert all(event_name != "provider:validation_error" for event_name, _ in fake_coordinator.hooks.events)
+    assert all(
+        event_name != "provider:validation_error"
+        for event_name, _ in fake_coordinator.hooks.events
+    )
 
     # Should emit repair event
-    repair_events = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events) == 1
     assert repair_events[0][1]["provider"] == "anthropic"
     assert repair_events[0][1]["repair_count"] == 1
@@ -231,7 +288,11 @@ def test_streaming_repaired_tool_ids_are_not_detected_again():
     messages = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_stream_123", name="grep", input={"pattern": "test"})],
+            content=[
+                ToolCallBlock(
+                    id="call_stream_123", name="grep", input={"pattern": "test"}
+                )
+            ],
         ),
         Message(role="user", content="No tool result present"),
     ]
@@ -242,7 +303,11 @@ def test_streaming_repaired_tool_ids_are_not_detected_again():
 
     # Verify repair happened
     assert "call_stream_123" in provider._repaired_tool_ids  # pyright: ignore[reportAttributeAccessIssue]
-    repair_events_1 = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events_1 = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events_1) == 1
 
     # Clear events for second call
@@ -252,7 +317,11 @@ def test_streaming_repaired_tool_ids_are_not_detected_again():
     messages_2 = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_stream_123", name="grep", input={"pattern": "test"})],
+            content=[
+                ToolCallBlock(
+                    id="call_stream_123", name="grep", input={"pattern": "test"}
+                )
+            ],
         ),
         Message(role="user", content="No tool result present"),
     ]
@@ -261,7 +330,11 @@ def test_streaming_repaired_tool_ids_are_not_detected_again():
     asyncio.run(provider.complete(request_2))
 
     # Should NOT emit another repair event for the same tool ID
-    repair_events_2 = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events_2 = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events_2) == 0, "Should not re-detect already-repaired tool IDs"
 
 
@@ -293,6 +366,10 @@ def test_streaming_multiple_missing_tool_results_all_tracked():
     assert provider._repaired_tool_ids == {"stream_1", "stream_2", "stream_3"}  # pyright: ignore[reportAttributeAccessIssue]
 
     # Verify repair event has all 3
-    repair_events = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events) == 1
     assert repair_events[0][1]["repair_count"] == 3

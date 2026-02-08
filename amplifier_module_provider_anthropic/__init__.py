@@ -27,6 +27,16 @@ from amplifier_core import ProviderInfo
 from amplifier_core import TextContent
 from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
+from amplifier_core.llm_errors import AuthenticationError as KernelAuthenticationError
+from amplifier_core.llm_errors import ContentFilterError as KernelContentFilterError
+from amplifier_core.llm_errors import ContextLengthError as KernelContextLengthError
+from amplifier_core.llm_errors import InvalidRequestError as KernelInvalidRequestError
+from amplifier_core.llm_errors import LLMError as KernelLLMError
+from amplifier_core.llm_errors import LLMTimeoutError as KernelLLMTimeoutError
+from amplifier_core.llm_errors import (
+    ProviderUnavailableError as KernelProviderUnavailableError,
+)
+from amplifier_core.llm_errors import RateLimitError as KernelRateLimitError
 from amplifier_core.utils import truncate_values
 
 
@@ -44,8 +54,11 @@ from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolCall
+from anthropic import APIStatusError as AnthropicAPIStatusError
 from anthropic import AsyncAnthropic
-from anthropic import RateLimitError
+from anthropic import AuthenticationError as AnthropicAuthenticationError
+from anthropic import BadRequestError as AnthropicBadRequestError
+from anthropic import RateLimitError as AnthropicRateLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -650,7 +663,7 @@ class AnthropicProvider:
 
         return info
 
-    def _parse_rate_limit_info(self, error: RateLimitError) -> dict[str, Any]:
+    def _parse_rate_limit_info(self, error: AnthropicRateLimitError) -> dict[str, Any]:
         """Extract rate limit details from RateLimitError.
 
         The SDK provides headers via error.response.headers when available.
@@ -842,7 +855,22 @@ class AnthropicProvider:
             logger.info("[PROVIDER] Native web search tool enabled")
 
         # Enable extended thinking if requested (equivalent to OpenAI's reasoning)
+        #
+        # Precedence chain (highest to lowest):
+        #   1. kwargs["extended_thinking"]  — explicit per-request override
+        #   2. request.reasoning_effort     — portable kernel interface (Phase 2)
+        #   3. config defaults              — session-level settings
+        #
+        # kwargs["extended_thinking"]=False can disable thinking even when
+        # reasoning_effort is set (explicit opt-out).
         thinking_enabled = bool(kwargs.get("extended_thinking"))
+
+        # Phase 2: Check request.reasoning_effort when kwargs don't specify
+        reasoning_effort = getattr(request, "reasoning_effort", None)
+        if "extended_thinking" not in kwargs and reasoning_effort is not None:
+            # reasoning_effort implies extended_thinking=True
+            thinking_enabled = True
+
         thinking_budget = None
         interleaved_thinking_enabled = False
         if thinking_enabled:
@@ -850,8 +878,33 @@ class AnthropicProvider:
             # (may differ from instance default when callers pass model=...).
             request_caps = self._get_capabilities(params["model"])
 
+            # Phase 2: reasoning_effort maps to thinking_type + budget_tokens.
+            # This sits between kwargs (highest) and config (lowest) in precedence.
+            #
+            # | reasoning_effort | thinking_type | budget_tokens             |
+            # |-----------------|---------------|---------------------------|
+            # | "low"           | "enabled"     | 4096 (minimal thinking)   |
+            # | "medium"        | "adaptive"*   | model default             |
+            # | "high"          | "adaptive"*   | generous (model default)  |
+            # | None            | (existing)    | (existing)                |
+            # * falls back to "enabled" if model doesn't support adaptive
+
+            effort_thinking_type: str | None = None
+            effort_budget: int | None = None
+            if reasoning_effort == "low":
+                effort_thinking_type = "enabled"
+                effort_budget = 4096
+            elif reasoning_effort == "medium":
+                effort_thinking_type = "adaptive"
+                effort_budget = request_caps.default_thinking_budget
+            elif reasoning_effort == "high":
+                effort_thinking_type = "adaptive"
+                effort_budget = request_caps.default_thinking_budget
+
+            # Resolve budget: kwargs > reasoning_effort > config > model default
             budget_tokens = (
                 kwargs.get("thinking_budget_tokens")
+                or effort_budget
                 or self.config.get("thinking_budget_tokens")
                 or request_caps.default_thinking_budget
             )
@@ -860,8 +913,12 @@ class AnthropicProvider:
             )
 
             thinking_budget = budget_tokens
-            thinking_type = kwargs.get("thinking_type") or self.config.get(
-                "thinking_type", "adaptive"
+
+            # Resolve thinking_type: kwargs > reasoning_effort > config > "adaptive"
+            thinking_type = (
+                kwargs.get("thinking_type")
+                or effort_thinking_type
+                or self.config.get("thinking_type", "adaptive")
             )
 
             # Adaptive thinking: model controls its own budget.  The API schema
@@ -967,125 +1024,151 @@ class AnthropicProvider:
 
         start_time = time.time()
 
-        # Call Anthropic API with retry loop for rate limits
-        # We handle retries ourselves (SDK max_retries=0) to properly honor
-        # retry-after headers with jitter and longer backoffs
-        last_rate_limit_error: RateLimitError | None = None
-
+        # Call Anthropic API with retry loop for transient errors.
+        # We handle retries ourselves (SDK max_retries=0) so we can:
+        # - Honor retry-after headers with jitter and longer backoffs
+        # - Retry all transient errors (not just rate limits)
+        # - Emit observable provider:retry events
+        #
+        # Structure: inner try TRANSLATES SDK errors to kernel types,
+        # outer try RETRIES on kernel errors with retryable=True.
         for attempt in range(
             1, self.max_retries + 2
         ):  # +2 because range is exclusive and attempt 1 is initial try
             try:
-                # Use streaming API to support large context windows (Anthropic requires streaming
-                # for operations that may take > 10 minutes)
-                rate_limit_info: dict[str, Any] = {}
-                if self.use_streaming:
-                    async with asyncio.timeout(self.timeout):
-                        async with self.client.messages.stream(**params) as stream:
-                            response = await stream.get_final_message()
-                            # Capture rate limit headers from stream response
-                            if hasattr(stream, "response") and stream.response:
-                                rate_limit_info = self._extract_rate_limit_headers(
-                                    stream.response.headers
-                                )
-                else:
-                    # Use with_raw_response to access headers
-                    raw_response = await asyncio.wait_for(
-                        self.client.messages.with_raw_response.create(**params),
-                        timeout=self.timeout,
-                    )
-                    response = raw_response.parse()
-                    rate_limit_info = self._extract_rate_limit_headers(
-                        raw_response.headers
-                    )
-
-                # Success - break out of retry loop
-                break
-
-            except RateLimitError as e:
-                last_rate_limit_error = e
-                rate_info = self._parse_rate_limit_info(e)
-                retry_after = rate_info["retry_after_seconds"]
-
-                # Check if we have retries remaining
-                if attempt <= self.max_retries:
-                    delay = self._calculate_retry_delay(retry_after, attempt)
-
-                    logger.info(
-                        f"[PROVIDER] Rate limited (attempt {attempt}/{self.max_retries + 1}). "
-                        f"Waiting {delay:.1f}s before retry..."
-                    )
-
-                    # Emit retry event for observability
-                    if self.coordinator and hasattr(self.coordinator, "hooks"):
-                        await self.coordinator.hooks.emit(
-                            "anthropic:rate_limit_retry",
-                            {
-                                "provider": "anthropic",
-                                "model": params["model"],
-                                "attempt": attempt,
-                                "max_retries": self.max_retries,
-                                "retry_after_header": retry_after,
-                                "actual_delay": delay,
-                                "rate_limit_type": rate_info["rate_limit_type"],
-                            },
+                try:
+                    # Use streaming API to support large context windows
+                    # (Anthropic requires streaming for operations > 10 min)
+                    rate_limit_info: dict[str, Any] = {}
+                    if self.use_streaming:
+                        async with asyncio.timeout(self.timeout):
+                            async with self.client.messages.stream(**params) as stream:
+                                response = await stream.get_final_message()
+                                # Capture rate limit headers from stream response
+                                if hasattr(stream, "response") and stream.response:
+                                    rate_limit_info = self._extract_rate_limit_headers(
+                                        stream.response.headers
+                                    )
+                    else:
+                        # Use with_raw_response to access headers
+                        raw_response = await asyncio.wait_for(
+                            self.client.messages.with_raw_response.create(**params),
+                            timeout=self.timeout,
+                        )
+                        response = raw_response.parse()
+                        rate_limit_info = self._extract_rate_limit_headers(
+                            raw_response.headers
                         )
 
-                    # Wait before retry
-                    await asyncio.sleep(delay)
-                    continue
+                    # Success - break out of retry loop
+                    break
 
-                # No retries remaining - will be handled after loop
-                break
+                except AnthropicRateLimitError as e:
+                    rate_info = self._parse_rate_limit_info(e)
+                    retry_after = rate_info.get("retry_after_seconds")
+                    raise KernelRateLimitError(
+                        str(e),
+                        provider="anthropic",
+                        status_code=429,
+                        retry_after=retry_after,
+                    ) from e
 
-        else:
-            # This else belongs to the for loop - executes if loop completed without break
-            # This shouldn't happen given our logic, but handle it gracefully
-            pass
+                except AnthropicAuthenticationError as e:
+                    raise KernelAuthenticationError(
+                        str(e),
+                        provider="anthropic",
+                        status_code=getattr(e, "status_code", 401),
+                    ) from e
 
-        # Check if we exited due to rate limit exhaustion
-        if last_rate_limit_error is not None and attempt > self.max_retries:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            rate_info = self._parse_rate_limit_info(last_rate_limit_error)
-            retry_after = rate_info["retry_after_seconds"]
+                except AnthropicBadRequestError as e:
+                    msg = str(e).lower()
+                    if "context length" in msg or "too many tokens" in msg:
+                        raise KernelContextLengthError(
+                            str(e),
+                            provider="anthropic",
+                            status_code=getattr(e, "status_code", 400),
+                        ) from e
+                    elif "content filter" in msg or "safety" in msg or "blocked" in msg:
+                        raise KernelContentFilterError(
+                            str(e),
+                            provider="anthropic",
+                            status_code=getattr(e, "status_code", 400),
+                        ) from e
+                    else:
+                        raise KernelInvalidRequestError(
+                            str(e),
+                            provider="anthropic",
+                            status_code=getattr(e, "status_code", 400),
+                        ) from e
 
-            # Build clean, actionable error message
-            error_msg = (
-                f"Rate limited by Anthropic API after {self.max_retries} retries."
-            )
-            if retry_after:
-                error_msg += f" (retry-after: {retry_after}s)"
+                except AnthropicAPIStatusError as e:
+                    status = getattr(e, "status_code", 500)
+                    if status >= 500:
+                        raise KernelProviderUnavailableError(
+                            str(e),
+                            provider="anthropic",
+                            status_code=status,
+                        ) from e
+                    # Non-5xx status errors we don't specifically handle
+                    raise KernelLLMError(
+                        str(e),
+                        provider="anthropic",
+                        status_code=status,
+                        retryable=False,
+                    ) from e
 
-            # Note: We don't log here - the error message will be displayed by the CLI
-            # when it catches the exception. Logging would cause duplicate output.
+                except asyncio.TimeoutError as e:
+                    raise KernelLLMTimeoutError(
+                        f"Request timed out after {self.timeout}s",
+                        provider="anthropic",
+                    ) from e
 
-            # Emit rate limit exhausted event for observability
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "anthropic:rate_limited",
-                    {
-                        "provider": "anthropic",
-                        "model": params["model"],
-                        "retry_after_seconds": retry_after,
-                        "retries_attempted": self.max_retries,
-                        "error_message": str(last_rate_limit_error),
-                        "rate_limit_type": rate_info["rate_limit_type"],
-                    },
+                except KernelLLMError:
+                    # Already a kernel error (e.g. from a nested call) — re-raise
+                    raise
+
+                except Exception as e:
+                    raise KernelLLMError(
+                        str(e) or f"{type(e).__name__}: (no message)",
+                        provider="anthropic",
+                        retryable=True,
+                    ) from e
+
+            except KernelLLMError as e:
+                if not e.retryable or attempt > self.max_retries:
+                    raise
+                # Fail-fast: if retry_after exceeds max_retry_delay, don't wait
+                retry_after = getattr(e, "retry_after", None)
+                if retry_after is not None and retry_after > self.max_retry_delay:
+                    raise
+
+                delay = self._calculate_retry_delay(retry_after, attempt)
+
+                logger.info(
+                    "[PROVIDER] Transient error (attempt %d/%d, %s). "
+                    "Waiting %.1fs before retry...",
+                    attempt,
+                    self.max_retries + 1,
+                    type(e).__name__,
+                    delay,
                 )
 
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "anthropic",
-                        "model": params["model"],
-                        "status": "rate_limited",
-                        "duration_ms": elapsed_ms,
-                        "error": error_msg,
-                    },
-                )
+                # Emit retry event for observability
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    await self.coordinator.hooks.emit(
+                        "provider:retry",
+                        {
+                            "provider": "anthropic",
+                            "model": params["model"],
+                            "attempt": attempt,
+                            "max_retries": self.max_retries,
+                            "delay": delay,
+                            "error_type": type(e).__name__,
+                        },
+                    )
 
-            # Raise with clean message (original exception as cause for debugging)
-            raise RuntimeError(error_msg) from last_rate_limit_error
+                # Wait before retry
+                await asyncio.sleep(delay)
 
         # If we get here, request succeeded - continue with response handling
         try:
@@ -1167,31 +1250,15 @@ class AnthropicProvider:
             # Convert to ChatResponse
             return self._convert_to_chat_response(response)
 
-        except TimeoutError:
-            # Handle timeout specifically - TimeoutError has empty str() representation
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = f"Request timed out after {self.timeout}s"
-            logger.error(f"[PROVIDER] Anthropic API error: {error_msg}")
-
-            # Emit error event
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "anthropic",
-                        "model": params["model"],
-                        "status": "error",
-                        "duration_ms": elapsed_ms,
-                        "error": error_msg,
-                    },
-                )
-            raise TimeoutError(error_msg) from None
+        except KernelLLMError:
+            # Kernel errors from response conversion — re-raise as-is
+            raise
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
             # Ensure error message is never empty
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
-            logger.error(f"[PROVIDER] Anthropic API error: {error_msg}")
+            logger.error(f"[PROVIDER] Anthropic response processing error: {error_msg}")
 
             # Emit error event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -1205,9 +1272,6 @@ class AnthropicProvider:
                         "error": error_msg,
                     },
                 )
-            # Re-raise with meaningful message if original was empty
-            if not str(e):
-                raise type(e)(error_msg) from e
             raise
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
@@ -1800,28 +1864,33 @@ class AnthropicProvider:
                     f"[PROVIDER] Web search returned {len(citations)} citations"
                 )
 
-        # Build usage dict with cache metrics if available
+        # Build usage with named kernel fields + provider-native extras for
+        # backward compatibility.  reasoning_tokens is intentionally None:
+        # Anthropic does not provide a separate reasoning token count (thinking
+        # tokens are included in output_tokens).
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+
+        cache_creation = (
+            getattr(response.usage, "cache_creation_input_tokens", None) or None
+        )
+        cache_read = getattr(response.usage, "cache_read_input_tokens", None) or None
+
         usage_kwargs: dict[str, Any] = {
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
-            "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
+            # Required fields
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            # Named kernel fields (Phase 2)
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_creation,
         }
 
-        # Add cache metrics if available (Anthropic includes these when caching is active)
-        if (
-            hasattr(response.usage, "cache_creation_input_tokens")
-            and response.usage.cache_creation_input_tokens
-        ):
-            usage_kwargs["cache_creation_input_tokens"] = (
-                response.usage.cache_creation_input_tokens
-            )
-        if (
-            hasattr(response.usage, "cache_read_input_tokens")
-            and response.usage.cache_read_input_tokens
-        ):
-            usage_kwargs["cache_read_input_tokens"] = (
-                response.usage.cache_read_input_tokens
-            )
+        # Keep provider-native extras for backward compat (extra="allow" on Usage)
+        if cache_creation is not None:
+            usage_kwargs["cache_creation_input_tokens"] = cache_creation
+        if cache_read is not None:
+            usage_kwargs["cache_read_input_tokens"] = cache_read
 
         usage = Usage(**usage_kwargs)
 
