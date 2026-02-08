@@ -174,7 +174,7 @@ class AnthropicProvider:
             "debug_truncate_length", 180
         )  # Max string length in debug logs
         self.timeout = self.config.get(
-            "timeout", 300.0
+            "timeout", 600.0
         )  # API timeout in seconds (default 5 minutes)
 
         # Rate limit retry configuration
@@ -272,7 +272,7 @@ class AnthropicProvider:
                 "model": self.default_model,
                 "max_tokens": 4096,
                 "temperature": 0.7,
-                "timeout": 300.0,
+                "timeout": 600.0,
                 "context_window": 1000000
                 if self.config.get("enable_1m_context")
                 and self._default_caps.supports_1m
