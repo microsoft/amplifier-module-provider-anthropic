@@ -449,11 +449,11 @@ class AnthropicProvider:
             is_46_plus = not version_known or (major, minor) >= (4, 6)
             return ModelCapabilities(
                 family="opus",
-                max_output_tokens=128000,
+                max_output_tokens=128000 if is_46_plus else 64000,
                 supports_1m=is_46_plus,
                 supports_thinking=True,
                 supports_adaptive_thinking=is_46_plus,
-                default_thinking_budget=64000,
+                default_thinking_budget=64000 if is_46_plus else 32000,
                 capability_tags=("tools", "thinking", "streaming", "json_mode"),
             )
 
@@ -943,9 +943,14 @@ class AnthropicProvider:
             # Ensure max_tokens accommodates thinking budget + response.
             # For adaptive mode the model manages its own budget within
             # max_tokens, so we still need a generous ceiling.
-            target_tokens = budget_tokens + buffer_tokens
+            # Cap to the model's API-enforced output ceiling so we never
+            # exceed what the backend allows (e.g. Opus 4.5 caps at 64K).
+            model_ceiling = request_caps.max_output_tokens
+            target_tokens = min(budget_tokens + buffer_tokens, model_ceiling)
             if params.get("max_tokens"):
-                params["max_tokens"] = max(params["max_tokens"], target_tokens)
+                params["max_tokens"] = min(
+                    max(params["max_tokens"], target_tokens), model_ceiling
+                )
             else:
                 params["max_tokens"] = target_tokens
 
