@@ -878,6 +878,18 @@ class AnthropicProvider:
             # (may differ from instance default when callers pass model=...).
             request_caps = self._get_capabilities(params["model"])
 
+            # Guard: skip thinking entirely for models that don't support it
+            # (e.g. Haiku). Without this check we would send budget_tokens=0
+            # which violates the API's >= 1024 minimum.
+            if not request_caps.supports_thinking:
+                logger.info(
+                    "[PROVIDER] Model %s does not support extended thinking"
+                    " — ignoring thinking request",
+                    params["model"],
+                )
+                thinking_enabled = False
+
+        if thinking_enabled:
             # Phase 2: reasoning_effort maps to thinking_type + budget_tokens.
             # This sits between kwargs (highest) and config (lowest) in precedence.
             #

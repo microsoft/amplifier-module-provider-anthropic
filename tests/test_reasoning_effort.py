@@ -177,6 +177,102 @@ class TestReasoningEffortHigh:
         assert params["thinking"]["type"] == "adaptive"
 
 
+# ---------------------------------------------------------------------------
+# Non-thinking models (Haiku) must silently skip thinking
+# ---------------------------------------------------------------------------
+
+
+class TestReasoningEffortOnNonThinkingModel:
+    """Models that don't support thinking (e.g. Haiku) must never send the
+    ``thinking`` parameter to the API, regardless of reasoning_effort value.
+
+    Regression tests for: budget_tokens >= 1024 API error when Haiku receives
+    thinking params with budget_tokens=0.
+    """
+
+    def test_haiku_low_reasoning_effort_no_thinking(self):
+        """Haiku + reasoning_effort='low' → no thinking param sent."""
+        provider = _make_provider(default_model="claude-haiku-4-5-20251001")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="low",
+        )
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" not in params
+
+    def test_haiku_medium_reasoning_effort_no_thinking(self):
+        """Haiku + reasoning_effort='medium' → no thinking param sent."""
+        provider = _make_provider(default_model="claude-haiku-4-5-20251001")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="medium",
+        )
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" not in params
+
+    def test_haiku_high_reasoning_effort_no_thinking(self):
+        """Haiku + reasoning_effort='high' → no thinking param sent."""
+        provider = _make_provider(default_model="claude-haiku-4-5-20251001")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" not in params
+
+    def test_haiku_explicit_extended_thinking_kwarg_no_thinking(self):
+        """Haiku + kwargs extended_thinking=True → still no thinking param."""
+        provider = _make_provider(default_model="claude-haiku-4-5-20251001")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+        )
+        asyncio.run(provider.complete(request, extended_thinking=True))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" not in params
+
+    def test_haiku_temperature_not_forced_to_1(self):
+        """When thinking is skipped for Haiku, temperature should NOT be forced to 1.0."""
+        provider = _make_provider(default_model="claude-haiku-4-5-20251001")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+            temperature=0.5,
+        )
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" not in params
+        # Temperature should remain as requested, not forced to 1.0
+        assert params.get("temperature") != 1.0
+
+
 class TestReasoningEffortNone:
     def test_none_no_thinking(self):
         """reasoning_effort=None → no thinking (existing behavior)."""
