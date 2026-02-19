@@ -1303,9 +1303,10 @@ class AnthropicProvider:
         # Claude sometimes generates tool_use blocks with empty input {}
         valid_calls = []
         for tc in response.tool_calls:
-            # Skip tool calls with no arguments or empty dict
-            if not tc.arguments:
-                logger.debug(f"Filtering out tool '{tc.name}' with empty arguments")
+            # Skip tool calls with truly missing arguments (None).
+            # Empty dict {} is valid -- many tools take no arguments.
+            if tc.arguments is None:
+                logger.debug(f"Filtering out tool '{tc.name}' with None arguments")
                 continue
             valid_calls.append(tc)
 
