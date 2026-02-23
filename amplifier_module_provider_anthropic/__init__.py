@@ -437,7 +437,7 @@ class AnthropicProvider:
         --------------------
         * **Opus 4.6+** — 1M context, adaptive thinking, 128K output
         * **Sonnet 4.5+** — 1M context, extended thinking, 64K output
-        * **Haiku** — fast inference, no thinking, no 1M
+        * **Haiku 4.5+** — fast inference, extended thinking, no adaptive, no 1M
 
         When the version cannot be parsed from the model ID we assume the
         *latest* capabilities for that family so newly released models work
@@ -471,9 +471,14 @@ class AnthropicProvider:
             )
 
         if family == "haiku":
+            is_45_plus = not version_known or (major, minor) >= (4, 5)
             return ModelCapabilities(
                 family="haiku",
-                capability_tags=("tools", "streaming", "json_mode", "fast"),
+                supports_thinking=is_45_plus,
+                supports_adaptive_thinking=False,
+                default_thinking_budget=32000 if is_45_plus else 0,
+                capability_tags=("tools", "streaming", "json_mode", "fast")
+                + (("thinking",) if is_45_plus else ()),
             )
 
         # Unknown family — conservative defaults

@@ -135,16 +135,71 @@ class TestGetCapabilitiesSonnet:
 
 
 class TestGetCapabilitiesHaiku:
-    """Tests for Haiku model capabilities (should be unaffected by fix)."""
+    """Tests for Haiku model capabilities — version-gated thinking support.
 
-    def test_haiku_max_output_tokens_is_default(self):
+    Haiku 4.5+ supports extended thinking (per Anthropic docs).
+    Haiku 3.5 does NOT support thinking.
+    """
+
+    # --- Haiku 3.5 (no thinking) ---
+
+    def test_haiku_35_max_output_tokens_is_default(self):
         caps = AnthropicProvider._get_capabilities("claude-haiku-3-5-20250929")
         assert caps.max_output_tokens == 64000
 
-    def test_haiku_no_thinking(self):
+    def test_haiku_35_no_thinking(self):
+        """Haiku 3.5 does not support extended thinking."""
         caps = AnthropicProvider._get_capabilities("claude-haiku-3-5-20250929")
         assert caps.supports_thinking is False
+        assert caps.supports_adaptive_thinking is False
+        assert caps.default_thinking_budget == 0
 
-    def test_haiku_family(self):
+    def test_haiku_35_no_thinking_tag(self):
+        caps = AnthropicProvider._get_capabilities("claude-haiku-3-5-20250929")
+        assert "thinking" not in caps.capability_tags
+
+    def test_haiku_35_family(self):
         caps = AnthropicProvider._get_capabilities("claude-haiku-3-5-20250929")
         assert caps.family == "haiku"
+
+    # --- Haiku 4.5 (thinking supported) ---
+
+    def test_haiku_45_supports_thinking(self):
+        """Haiku 4.5 supports extended thinking per Anthropic docs."""
+        caps = AnthropicProvider._get_capabilities("claude-haiku-4-5-20251001")
+        assert caps.supports_thinking is True
+
+    def test_haiku_45_no_adaptive_thinking(self):
+        """Haiku 4.5 does NOT support adaptive thinking per Anthropic docs."""
+        caps = AnthropicProvider._get_capabilities("claude-haiku-4-5-20251001")
+        assert caps.supports_adaptive_thinking is False
+
+    def test_haiku_45_thinking_budget(self):
+        """Haiku 4.5 gets 32K default thinking budget."""
+        caps = AnthropicProvider._get_capabilities("claude-haiku-4-5-20251001")
+        assert caps.default_thinking_budget == 32000
+
+    def test_haiku_45_has_thinking_tag(self):
+        caps = AnthropicProvider._get_capabilities("claude-haiku-4-5-20251001")
+        assert "thinking" in caps.capability_tags
+
+    def test_haiku_45_has_fast_tag(self):
+        """Haiku 4.5 retains the 'fast' tag."""
+        caps = AnthropicProvider._get_capabilities("claude-haiku-4-5-20251001")
+        assert "fast" in caps.capability_tags
+
+    def test_haiku_45_family(self):
+        caps = AnthropicProvider._get_capabilities("claude-haiku-4-5-20251001")
+        assert caps.family == "haiku"
+
+    def test_haiku_45_max_output_tokens_is_default(self):
+        caps = AnthropicProvider._get_capabilities("claude-haiku-4-5-20251001")
+        assert caps.max_output_tokens == 64000
+
+    # --- Unknown Haiku (defaults to latest = thinking enabled) ---
+
+    def test_haiku_unknown_version_assumes_latest(self):
+        """Unknown haiku version defaults to latest (thinking enabled)."""
+        caps = AnthropicProvider._get_capabilities("claude-haiku-latest")
+        assert caps.supports_thinking is True
+        assert caps.default_thinking_budget == 32000
