@@ -239,8 +239,8 @@ class TestProviderThrottleInit:
             api_key="test-key",
             config={"use_streaming": False, "max_retries": 0},
         )
-        assert provider._throttle_threshold == 0.1
-        assert provider._throttle_delay == 5.0
+        assert provider._throttle_threshold == 0.02
+        assert provider._throttle_delay == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +428,8 @@ class TestThrottleEventEmission:
         assert payload["remaining"] == 5
         assert payload["limit"] == 100
         assert payload["delay"] == 5.0
+        assert payload["ratio"] == 0.05  # 5/100
+        assert "reset_timestamp" in payload  # present (may be None)
         assert "model" in payload
 
     @patch("asyncio.sleep", new_callable=AsyncMock)

@@ -279,6 +279,7 @@ class TestRetryEventEmission:
         assert payload["attempt"] == 1
         assert payload["error_type"] == "RateLimitError"
         assert "delay" in payload
+        assert "retry_after" in payload  # new: surfaces server retry-after separately
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
     def test_no_old_event_name(self, mock_sleep):

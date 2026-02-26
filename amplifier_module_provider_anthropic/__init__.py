@@ -295,8 +295,12 @@ class AnthropicProvider:
         )
 
         # Pre-emptive throttle configuration
-        self._throttle_threshold = float(self.config.get("throttle_threshold", 0.1))
-        self._throttle_delay = float(self.config.get("throttle_delay", 5.0))
+        # Threshold: fraction of remaining capacity below which we inject a delay.
+        # Default 0.02 (2%) — only throttle when nearly exhausted, not at 10%.
+        # Delay: fallback sleep when no reset timestamp is available.
+        # Default 1.0s — just enough to ease pressure without punishing every request.
+        self._throttle_threshold = float(self.config.get("throttle_threshold", 0.02))
+        self._throttle_delay = float(self.config.get("throttle_delay", 1.0))
         self._rate_limit_state = _RateLimitState()
 
         # Use streaming API by default to support large context windows (Anthropic requires streaming
@@ -1281,6 +1285,20 @@ class AnthropicProvider:
 
         async def _on_retry(attempt: int, delay: float, error: KernelLLMError):
             """Callback invoked before each retry sleep."""
+            error_type = type(error).__name__
+            retry_after = getattr(error, "retry_after", None)
+
+            # Always log retries at WARNING level — visible even without hooks
+            logger.warning(
+                "[PROVIDER] Retry %d/%d for %s: %s, sleeping %.1fs%s",
+                attempt,
+                self._retry_config.max_retries,
+                error_type,
+                str(error),
+                delay,
+                f" (server retry-after: {retry_after}s)" if retry_after else "",
+            )
+
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     PROVIDER_RETRY,
@@ -1290,7 +1308,8 @@ class AnthropicProvider:
                         "attempt": attempt,
                         "max_retries": self._retry_config.max_retries,
                         "delay": delay,
-                        "error_type": type(error).__name__,
+                        "retry_after": retry_after,
+                        "error_type": error_type,
                         "error_message": str(error),
                     },
                 )
@@ -1319,6 +1338,16 @@ class AnthropicProvider:
                     except (ValueError, TypeError):
                         pass  # Fall back to default delay
 
+                # Always log throttle at WARNING level — visible even without hooks
+                logger.warning(
+                    "[PROVIDER] Throttling: %s at %.1f%% remaining (%s/%s), sleeping %.1fs",
+                    dimension,
+                    ratio * 100,
+                    remaining,
+                    limit,
+                    delay,
+                )
+
                 # Emit throttle event so CLI can warn the user
                 if self.coordinator and hasattr(self.coordinator, "hooks"):
                     await self.coordinator.hooks.emit(
@@ -1330,6 +1359,8 @@ class AnthropicProvider:
                             "dimension": dimension,
                             "remaining": remaining,
                             "limit": limit,
+                            "ratio": ratio,
+                            "reset_timestamp": reset_ts,
                             "delay": delay,
                         },
                     )
