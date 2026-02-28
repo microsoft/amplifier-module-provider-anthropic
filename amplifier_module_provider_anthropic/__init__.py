@@ -154,6 +154,14 @@ class _RateLimitState:
 
 logger = logging.getLogger(__name__)
 
+# Pricing per token (USD) by model family.
+# Used by list_models() to populate ModelInfo cost fields.
+_ANTHROPIC_PRICING: dict[str, dict[str, Any]] = {
+    "opus": {"input": 15.0e-6, "output": 75.0e-6, "tier": "high"},
+    "sonnet": {"input": 3.0e-6, "output": 15.0e-6, "tier": "medium"},
+    "haiku": {"input": 0.80e-6, "output": 4.0e-6, "tier": "low"},
+}
+
 # Beta header constants — single source of truth for experimental feature headers
 BETA_HEADER_1M_CONTEXT = "context-1m-2025-08-07"
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
@@ -487,6 +495,8 @@ class AnthropicProvider:
                 has_1m = self.config.get("enable_1m_context") and caps.supports_1m
                 context_window = 1000000 if has_1m else caps.base_context_window
 
+                pricing = _ANTHROPIC_PRICING.get(family, {})
+
                 result.append(
                     ModelInfo(
                         id=model_id,
@@ -498,6 +508,9 @@ class AnthropicProvider:
                             "temperature": 0.7,
                             "max_tokens": caps.max_output_tokens,
                         },
+                        cost_per_input_token=pricing.get("input"),
+                        cost_per_output_token=pricing.get("output"),
+                        metadata={"cost_tier": pricing.get("tier", "medium")},
                     )
                 )
 
@@ -557,7 +570,7 @@ class AnthropicProvider:
                 supports_thinking=True,
                 supports_adaptive_thinking=is_46_plus,
                 default_thinking_budget=64000 if is_46_plus else 32000,
-                capability_tags=("tools", "thinking", "streaming", "json_mode"),
+                capability_tags=("tools", "thinking", "streaming", "json_mode", "vision"),
             )
 
         if family == "sonnet":
@@ -568,7 +581,7 @@ class AnthropicProvider:
                 supports_thinking=True,
                 supports_adaptive_thinking=False,
                 default_thinking_budget=32000,
-                capability_tags=("tools", "thinking", "streaming", "json_mode"),
+                capability_tags=("tools", "thinking", "streaming", "json_mode", "vision"),
             )
 
         if family == "haiku":
@@ -578,7 +591,7 @@ class AnthropicProvider:
                 supports_thinking=is_45_plus,
                 supports_adaptive_thinking=False,
                 default_thinking_budget=32000 if is_45_plus else 0,
-                capability_tags=("tools", "streaming", "json_mode", "fast")
+                capability_tags=("tools", "streaming", "json_mode", "fast", "vision")
                 + (("thinking",) if is_45_plus else ()),
             )
 
