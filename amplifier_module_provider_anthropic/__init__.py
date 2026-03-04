@@ -413,7 +413,9 @@ class AnthropicProvider:
             self.config.get("rate_limit_state_path", _default_shared_path)
         )
         self._last_shared_state_read: float = 0.0  # epoch time of last file read
-        self._last_written_state: dict[str, Any] = {}  # last written content (for change detection)
+        self._last_written_state: dict[
+            str, Any
+        ] = {}  # last written content (for change detection)
 
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
@@ -2509,3 +2511,11 @@ class AnthropicProvider:
             text=combined_text or None,
             web_search_results=web_search_results if web_search_results else None,
         )
+
+    async def close(self) -> None:
+        """Close the underlying Anthropic client to prevent resource leaks."""
+        if self._client is not None:
+            try:
+                await asyncio.shield(self._client.close())
+            except asyncio.CancelledError:
+                pass
