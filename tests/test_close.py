@@ -50,4 +50,6 @@ async def test_close_can_be_called_twice():
     provider._client = mock_client
 
     await provider.close()
-    await provider.close()  # Should not raise
+    await provider.close()
+
+    assert mock_client.close.await_count == 2
