@@ -53,3 +53,4 @@ async def test_close_can_be_called_twice():
     await provider.close()
 
     assert mock_client.close.await_count == 2
+    assert provider._client is not None  # close() does not clear the reference
