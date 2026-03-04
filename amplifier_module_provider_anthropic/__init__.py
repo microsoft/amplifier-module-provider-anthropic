@@ -252,16 +252,10 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     await coordinator.mount("providers", provider, name="anthropic")
     logger.info("Mounted AnthropicProvider")
 
-    # Return cleanup function
-    # CRITICAL: Check _client directly (not .client property) to avoid triggering
-    # lazy initialization during cleanup. Use asyncio.shield to protect close()
-    # from cancellation during Ctrl+C shutdown.
+    # Return cleanup function that delegates to provider.close().
+    # close() handles lazy-client guard, asyncio.shield, and CancelledError.
     async def cleanup():
-        if provider._client is not None:
-            try:
-                await asyncio.shield(provider._client.close())
-            except asyncio.CancelledError:
-                pass  # Swallow cancellation during cleanup
+        await provider.close()
 
     return cleanup
 
