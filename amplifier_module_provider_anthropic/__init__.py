@@ -1340,8 +1340,52 @@ class AnthropicProvider:
         if stop_sequences := kwargs.get("stop_sequences"):
             params["stop_sequences"] = stop_sequences
 
+        # Wire response_format -> Anthropic output_config.format
+        #
+        # Supports:
+        #   ResponseFormatJsonSchema (type="json_schema") -> output_config with schema
+        #   ResponseFormatJson       (type="json")        -> output_config json mode
+        #   ResponseFormatText       (type="text")        -> no output_config (default)
+        #   Raw dict                                      -> treated as JSON schema
+        #   Raw string "json"                             -> treated as json mode
+        #
+        # CONSTRAINT: output_config and extended thinking are mutually exclusive
+        # in the Anthropic API. Thinking takes precedence when both are set.
+        if request.response_format is not None and not thinking_enabled:
+            rf = request.response_format
+            # Resolve type: works with Pydantic ResponseFormat models and raw values
+            rf_type = getattr(rf, "type", "json" if rf == "json" else None)
+
+            if rf_type == "json_schema":
+                # Extract schema: from ResponseFormatJsonSchema.json_schema or raw dict
+                schema = getattr(rf, "json_schema", None) or (
+                    rf if isinstance(rf, dict) else None
+                )
+                if schema:
+                    params["output_config"] = {
+                        "format": {"type": "json_schema", "schema": schema}
+                    }
+                    logger.info(
+                        "[PROVIDER] Structured output enabled (mode=json_schema, "                        "schema_keys=%s)",
+                        list(schema.get("properties", {}).keys())
+                        if isinstance(schema, dict)
+                        else "?",
+                    )
+
+            elif rf_type == "json":
+                # Schema-less JSON mode: model returns any valid JSON
+                params["output_config"] = {"format": {"type": "json"}}
+                logger.info("[PROVIDER] Structured output enabled (mode=json)")
+
+            # rf_type == "text" or unrecognised: no output_config (default text behaviour)
+
+        elif request.response_format is not None and thinking_enabled:
+            logger.info(
+                "[PROVIDER] response_format requested but extended thinking is enabled "                "-- output_config skipped (API constraint: mutually exclusive)"
+            )
+
         logger.info(
-            f"[PROVIDER] Anthropic API call - model: {params['model']}, messages: {len(params['messages'])}, system: {bool(system_blocks)}, tools: {len(params.get('tools', []))}, thinking: {thinking_enabled}"
+            f"[PROVIDER] Anthropic API call - model: {params['model']}, messages: {len(params['messages'])}, system: {bool(system_blocks)}, tools: {len(params.get('tools', []))}, thinking: {thinking_enabled}, structured_output: {'output_config' in params}"
         )
 
         # Emit llm:request event
