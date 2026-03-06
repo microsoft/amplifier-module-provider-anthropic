@@ -363,8 +363,7 @@ class AnthropicProvider:
         # Handle enable_1m_context from init wizard - translate to beta_headers
         # This bridges the config field (enable_1m_context boolean) to the actual
         # beta header that Anthropic API requires (context-1m-2025-08-07)
-        enable_1m = self.config.get("enable_1m_context")
-        if enable_1m and str(enable_1m).lower() in ("true", "1", "yes"):
+        if self._is_1m_enabled():
             existing_beta = self.config.get("beta_headers", [])
             if isinstance(existing_beta, str):
                 existing_beta = [existing_beta] if existing_beta else []
@@ -433,6 +432,11 @@ class AnthropicProvider:
             )
         return self._client
 
+    def _is_1m_enabled(self) -> bool:
+        """Check if 1M context window is enabled, handling string config values."""
+        v = self.config.get("enable_1m_context")
+        return bool(v) and str(v).lower() in ("true", "1", "yes")
+
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
         return ProviderInfo(
@@ -446,8 +450,7 @@ class AnthropicProvider:
                 "temperature": 0.7,
                 "timeout": 600.0,
                 "context_window": 1000000
-                if self.config.get("enable_1m_context")
-                and self._default_caps.supports_1m
+                if self._is_1m_enabled() and self._default_caps.supports_1m
                 else self._default_caps.base_context_window,
                 "max_output_tokens": self._default_caps.max_output_tokens,
             },
@@ -540,7 +543,7 @@ class AnthropicProvider:
             for model_id, display_name, _ in models_to_include:
                 caps = self._get_capabilities(model_id)
 
-                has_1m = self.config.get("enable_1m_context") and caps.supports_1m
+                has_1m = self._is_1m_enabled() and caps.supports_1m
                 context_window = 1000000 if has_1m else caps.base_context_window
 
                 result.append(
@@ -1767,8 +1770,8 @@ class AnthropicProvider:
                     "provider": "anthropic",
                     "model": params["model"],
                     "usage": {
-                        "input": response.usage.input_tokens,
-                        "output": response.usage.output_tokens,
+                        "input_tokens": response.usage.input_tokens,
+                        "output_tokens": response.usage.output_tokens,
                         **(
                             {"cache_read": response.usage.cache_read_input_tokens}
                             if hasattr(response.usage, "cache_read_input_tokens")
