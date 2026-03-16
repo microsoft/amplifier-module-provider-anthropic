@@ -46,6 +46,7 @@ from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolCall
+from anthropic import APIError as AnthropicAPIError
 from anthropic import APIStatusError as AnthropicAPIStatusError
 from anthropic import AsyncAnthropic
 from anthropic import AuthenticationError as AnthropicAuthenticationError
@@ -1428,6 +1429,35 @@ class AnthropicProvider:
                     )
 
                 captured_rate_limit_info = rate_limit_info
+
+                # Validate response is a proper message, not an error.
+                # Anthropic can return HTTP 200 with an error body in rare
+                # cases (transient server errors during streaming).  The SDK
+                # may parse these without raising an exception.
+                resp_type = getattr(response, "type", None)
+                if resp_type and resp_type != "message":
+                    error_obj = getattr(response, "error", None)
+                    if error_obj:
+                        err_type = getattr(error_obj, "type", "unknown")
+                        err_msg = getattr(error_obj, "message", "Unknown error")
+                    else:
+                        err_type = "unknown"
+                        err_msg = f"Unexpected response type: {resp_type}"
+                    logger.warning(
+                        "[PROVIDER] Anthropic returned non-message response "
+                        "(type=%s): [%s] %s — treating as retryable",
+                        resp_type,
+                        err_type,
+                        err_msg,
+                    )
+                    raise KernelProviderUnavailableError(
+                        f"Anthropic returned error in response body (HTTP 200): "
+                        f"[{err_type}] {err_msg}",
+                        provider="anthropic",
+                        model=params["model"],
+                        status_code=200,
+                        retryable=True,
+                    )
                 return response
 
             except AnthropicRateLimitError as e:
@@ -1567,6 +1597,27 @@ class AnthropicProvider:
                     model=params["model"],
                     status_code=status,
                     retryable=False,
+                ) from e
+
+            except AnthropicAPIError as e:
+                # Base SDK APIError not matched by specific handlers above.
+                # Catches APIConnectionError, APITimeoutError, and any future
+                # SDK error types that don't inherit from APIStatusError.
+                # Treat as transient — retry with backoff.
+                body = getattr(e, "body", None)
+                error_msg = json.dumps(body) if body is not None else str(e)
+                status = getattr(e, "status_code", None) or 500
+                logger.warning(
+                    "[PROVIDER] Anthropic base APIError (not status-specific): "
+                    "%s — treating as retryable",
+                    error_msg,
+                )
+                raise KernelProviderUnavailableError(
+                    error_msg,
+                    provider="anthropic",
+                    model=params["model"],
+                    status_code=status,
+                    retryable=True,
                 ) from e
 
             except asyncio.TimeoutError as e:
