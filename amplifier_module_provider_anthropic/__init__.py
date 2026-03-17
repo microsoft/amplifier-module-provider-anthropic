@@ -1591,6 +1591,24 @@ class AnthropicProvider:
                         status_code=status,
                         retryable=True,
                     ) from e
+                # HTTP 200 (or other 2xx/3xx) with an "event: error" SSE:
+                # The SDK raises APIStatusError(status_code=200) when the
+                # streaming response sends an error event despite a 200 HTTP
+                # status.  This is a transient server-side failure — retry.
+                if status < 400:
+                    logger.warning(
+                        "[PROVIDER] Anthropic raised APIStatusError with "
+                        "HTTP %d (error event in 200 response body) "
+                        "— treating as retryable",
+                        status,
+                    )
+                    raise KernelProviderUnavailableError(
+                        error_msg,
+                        provider="anthropic",
+                        model=params["model"],
+                        status_code=status,
+                        retryable=True,
+                    ) from e
                 raise KernelLLMError(
                     error_msg,
                     provider="anthropic",
