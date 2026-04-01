@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+from threading import Lock
 from typing import Any
 
 from dataclasses import dataclass
@@ -195,6 +196,9 @@ async def _get_process_semaphore(max_concurrent: int) -> asyncio.Semaphore | Non
 # Beta header constants — single source of truth for experimental feature headers
 BETA_HEADER_1M_CONTEXT = "context-1m-2025-08-07"
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
+PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
+PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
+FALLBACK_STATE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -214,6 +218,64 @@ class ModelCapabilities:
     supports_adaptive_thinking: bool = False
     default_thinking_budget: int = 0
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
+
+
+@dataclass(frozen=True)
+class _RuntimeModelInfo:
+    """Best-effort runtime model metadata from Anthropic's Models API."""
+
+    max_input_tokens: int | None = None
+    max_tokens: int | None = None
+    supports_thinking: bool | None = None
+    supports_adaptive_thinking: bool | None = None
+
+
+@dataclass
+class _FallbackWindow:
+    """Temporary downgrade window for a model family."""
+
+    requested_model: str
+    fallback_model: str
+    opened_at: float
+    until: float
+    opened_by_pid: int
+    error_type: str
+    error_message: str
+
+
+_fallback_windows: dict[str, _FallbackWindow] = {}
+_fallback_lock = Lock()
+
+
+def _get_active_fallback_window(
+    family: str, *, now: float | None = None
+) -> _FallbackWindow | None:
+    """Return the active fallback window for a family, if any."""
+    current_time = time.time() if now is None else now
+    with _fallback_lock:
+        window = _fallback_windows.get(family)
+        if window is None:
+            return None
+        if window.until <= current_time:
+            _fallback_windows.pop(family, None)
+            return None
+        return window
+
+
+def _set_fallback_window(family: str, window: _FallbackWindow) -> None:
+    """Store a fallback window for a family."""
+    with _fallback_lock:
+        _fallback_windows[family] = window
+
+
+def _clear_fallback_windows() -> None:
+    """Clear all fallback windows.
+
+    Internal helper for tests. The provider intentionally keeps fallback state
+    process-wide so sibling sessions share the same temporary downgrade window.
+    """
+    with _fallback_lock:
+        _fallback_windows.clear()
 
 
 class AnthropicChatResponse(ChatResponse):
@@ -273,6 +335,45 @@ class AnthropicProvider:
     name = "anthropic"
     api_label = "Anthropic"
 
+    @staticmethod
+    def _config_bool(value: Any) -> bool:
+        """Parse config booleans from YAML or CLI string values."""
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _config_int(value: Any, default: int) -> int:
+        """Parse an int config value with a safe fallback."""
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[PROVIDER] Invalid integer config value %r; using default %s",
+                value,
+                default,
+            )
+            return default
+
+    @staticmethod
+    def _config_float(value: Any, default: float) -> float:
+        """Parse a float config value with a safe fallback."""
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[PROVIDER] Invalid float config value %r; using default %s",
+                value,
+                default,
+            )
+            return default
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -309,14 +410,51 @@ class AnthropicProvider:
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
         # We handle retries ourselves (SDK max_retries=0) to properly honor retry-after headers
         # and use longer backoffs that help with org-wide rate limit pressure.
+        self._retry_max_retries = self._config_int(self.config.get("max_retries", 5), 5)
+        self._retry_min_delay = self._config_float(
+            self.config.get("min_retry_delay", 1.0), 1.0
+        )
+        self._retry_max_delay = self._config_float(
+            self.config.get("max_retry_delay", 60.0), 60.0
+        )
+        self._retry_jitter = self._config_bool(self.config.get("retry_jitter", True))
         self._retry_config = RetryConfig(
-            max_retries=int(self.config.get("max_retries", 5)),
-            initial_delay=float(self.config.get("min_retry_delay", 1.0)),
-            max_delay=float(self.config.get("max_retry_delay", 60.0)),
-            jitter=bool(self.config.get("retry_jitter", True)),
+            max_retries=self._retry_max_retries,
+            initial_delay=self._retry_min_delay,
+            max_delay=self._retry_max_delay,
+            jitter=self._retry_jitter,
         )
         self._overloaded_delay_multiplier = float(
             self.config.get("overloaded_delay_multiplier", 10.0)
+        )
+
+        # Temporary model downgrade on persistent overloads.
+        # When enabled, a higher-tier family gets a short retry budget; if it still
+        # overloads, a process-wide cooldown window routes subsequent requests to
+        # the configured lower-tier model until the cooldown expires.
+        self._fallback_on_overload = self._config_bool(
+            self.config.get("fallback_on_overload", False)
+        )
+        self._fallback_retry_count = max(
+            0, self._config_int(self.config.get("fallback_retry_count", 1), 1)
+        )
+        self._fallback_cooldown_seconds = max(
+            0.0,
+            self._config_float(
+                self.config.get("fallback_cooldown_seconds", 1800.0), 1800.0
+            ),
+        )
+        self._enable_1m_context = self._config_bool(
+            self.config.get("enable_1m_context", True)
+        )
+        self._fallback_sonnet_model = str(
+            self.config.get("fallback_sonnet_model", "claude-sonnet-4-6")
+        )
+        self._fallback_haiku_model = str(
+            self.config.get("fallback_haiku_model", "claude-haiku-4-5")
+        )
+        self._persist_fallback_state = self._config_bool(
+            self.config.get("persist_fallback_state", False)
         )
 
         # Pre-emptive throttle configuration
@@ -351,21 +489,6 @@ class AnthropicProvider:
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
         self._base_url = self.config.get("base_url")
-
-        # Handle enable_1m_context from init wizard - translate to beta_headers
-        # This bridges the config field (enable_1m_context boolean) to the actual
-        # beta header that Anthropic API requires (context-1m-2025-08-07)
-        enable_1m = self.config.get("enable_1m_context")
-        if enable_1m and str(enable_1m).lower() in ("true", "1", "yes"):
-            existing_beta = self.config.get("beta_headers", [])
-            if isinstance(existing_beta, str):
-                existing_beta = [existing_beta] if existing_beta else []
-            if BETA_HEADER_1M_CONTEXT not in existing_beta:
-                existing_beta.append(BETA_HEADER_1M_CONTEXT)
-            self.config["beta_headers"] = existing_beta
-            logger.info(
-                "[PROVIDER] 1M context window enabled via enable_1m_context config"
-            )
 
         # Beta headers support for enabling experimental features
         # Store as instance variable so we can merge with per-request headers later
@@ -403,6 +526,23 @@ class AnthropicProvider:
             str, Any
         ] = {}  # last written content (for change detection)
 
+        # Optional persisted fallback-breaker state for cross-process overload
+        # downgrade windows. Disabled by default so environments that should not
+        # touch the filesystem stay process-local unless explicitly opted in.
+        _default_fallback_state_path = os.path.join(
+            os.path.expanduser("~"), ".amplifier", "anthropic-fallback-state.json"
+        )
+        configured_fallback_state_path = self.config.get(
+            "fallback_state_path", _default_fallback_state_path
+        )
+        self._fallback_state_path: str = (
+            str(configured_fallback_state_path)
+            if self._persist_fallback_state and configured_fallback_state_path is not None
+            else ""
+        )
+        self._last_fallback_state_read: float = 0.0
+        self._runtime_model_info_cache: dict[str, _RuntimeModelInfo | None] = {}
+
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
         # detected repeatedly across LLM iterations (since synthetic results
@@ -438,7 +578,7 @@ class AnthropicProvider:
                 "temperature": 0.7,
                 "timeout": 600.0,
                 "context_window": 1000000
-                if self.config.get("enable_1m_context")
+                if self._enable_1m_context
                 and self._default_caps.supports_1m
                 else self._default_caps.base_context_window,
                 "max_output_tokens": self._default_caps.max_output_tokens,
@@ -464,7 +604,7 @@ class AnthropicProvider:
                     id="enable_1m_context",
                     display_name="1M Context Window",
                     field_type="boolean",
-                    prompt="Enable 1M token context window? (Sonnet and Opus models, beta)",
+                    prompt="Request 1M token context window when the selected model supports it",
                     required=False,
                     default="true",
                     requires_model=True,  # Shown after model selection
@@ -479,6 +619,74 @@ class AnthropicProvider:
                     prompt="Enable prompt caching? (Reduces cost by 90% on cached tokens)",
                     required=False,
                     default="true",
+                ),
+                ConfigField(
+                    id="fallback_on_overload",
+                    display_name="Temporary Overload Downgrade",
+                    field_type="boolean",
+                    prompt="Downgrade temporarily if a higher-tier Claude model stays overloaded?",
+                    required=False,
+                    default="false",
+                    requires_model=True,
+                    show_when={
+                        "default_model": "not_contains:haiku"
+                    },  # No lower Anthropic family exists below Haiku
+                ),
+                ConfigField(
+                    id="fallback_retry_count",
+                    display_name="Retries Before Downgrade",
+                    field_type="text",
+                    prompt="How many overload retries before downgrading?",
+                    required=False,
+                    default="1",
+                    requires_model=True,
+                    show_when={"fallback_on_overload": "true"},
+                ),
+                ConfigField(
+                    id="fallback_cooldown_seconds",
+                    display_name="Downgrade Cooldown (seconds)",
+                    field_type="text",
+                    prompt="How long should the downgrade stay active before retrying the higher model?",
+                    required=False,
+                    default="1800",
+                    requires_model=True,
+                    show_when={"fallback_on_overload": "true"},
+                ),
+                ConfigField(
+                    id="persist_fallback_state",
+                    display_name="Share Downgrade State",
+                    field_type="boolean",
+                    prompt="Persist temporary downgrade state across separate Amplifier processes?",
+                    required=False,
+                    default="false",
+                    requires_model=True,
+                    show_when={"fallback_on_overload": "true"},
+                ),
+                ConfigField(
+                    id="fallback_sonnet_model",
+                    display_name="Opus Fallback Model",
+                    field_type="text",
+                    prompt="Model to use when Opus is overloaded",
+                    required=False,
+                    default="claude-sonnet-4-6",
+                    requires_model=True,
+                    show_when={
+                        "fallback_on_overload": "true",
+                        "default_model": "contains:opus",
+                    },
+                ),
+                ConfigField(
+                    id="fallback_haiku_model",
+                    display_name="Sonnet Fallback Model",
+                    field_type="text",
+                    prompt="Model to use when Sonnet is overloaded",
+                    required=False,
+                    default="claude-haiku-4-5",
+                    requires_model=True,
+                    show_when={
+                        "fallback_on_overload": "true",
+                        "default_model": "not_contains:haiku",
+                    },
                 ),
             ],
         )
@@ -530,10 +738,18 @@ class AnthropicProvider:
             models_to_include = [models[0]] if self.filtered else models
 
             for model_id, display_name, _ in models_to_include:
-                caps = self._get_capabilities(model_id)
+                raw_model = next(model for model in api_models if model.id == model_id)
+                caps = self._apply_runtime_capability_overrides(
+                    self._get_capabilities(model_id),
+                    self._extract_runtime_model_info(raw_model),
+                )
 
-                has_1m = self.config.get("enable_1m_context") and caps.supports_1m
-                context_window = 1000000 if has_1m else caps.base_context_window
+                has_1m = self._enable_1m_context and caps.supports_1m
+                context_window = (
+                    max(caps.base_context_window, 1000000)
+                    if has_1m
+                    else caps.base_context_window
+                )
 
                 result.append(
                     ModelInfo(
@@ -571,11 +787,21 @@ class AnthropicProvider:
         Returns ``(0, 0)`` when the version cannot be determined — callers
         should treat unknown versions conservatively.
         """
-        # Look for family-MAJOR-MINOR in the model id
-        pattern = rf"{family}-(\d+)-(\d+)"
-        match = re.search(pattern, model_id.lower())
+        model_lower = model_id.lower()
+
+        # Prefer family-MAJOR-MINOR where MINOR is a short semantic version part,
+        # not a snapshot suffix like 20250514.
+        pattern = rf"{family}-(\d+)-(\d{{1,2}})(?:-|$)"
+        match = re.search(pattern, model_lower)
         if match:
             return int(match.group(1)), int(match.group(2))
+
+        # Fallback for ids like claude-sonnet-4-20250514 where only the major
+        # semantic version is present before the snapshot date.
+        major_only_pattern = rf"{family}-(\d+)(?:-|$)"
+        match = re.search(major_only_pattern, model_lower)
+        if match:
+            return int(match.group(1)), 0
         return (0, 0)
 
     @classmethod
@@ -615,12 +841,13 @@ class AnthropicProvider:
             )
 
         if family == "sonnet":
-            is_45_plus = not version_known or (major, minor) >= (4, 5)
+            is_46_plus = not version_known or (major, minor) >= (4, 6)
+            is_45_plus = is_46_plus or (major, minor) >= (4, 5)
             return ModelCapabilities(
                 family="sonnet",
-                supports_1m=is_45_plus,
+                supports_1m=is_46_plus,
                 supports_thinking=True,
-                supports_adaptive_thinking=False,
+                supports_adaptive_thinking=is_46_plus,
                 default_thinking_budget=32000,
                 capability_tags=(
                     "tools",
@@ -644,6 +871,193 @@ class AnthropicProvider:
 
         # Unknown family — conservative defaults
         return ModelCapabilities(family=family)
+
+    @staticmethod
+    def _positive_int_or_none(value: Any) -> int | None:
+        """Parse a positive integer from runtime metadata, treating 0 as unknown."""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    @staticmethod
+    def _resolve_model_info_value(model_info: Any, *path: str) -> Any:
+        """Traverse dict/object model metadata without caring about concrete types."""
+        current = model_info
+        for key in path:
+            if current is None:
+                return None
+            if isinstance(current, dict):
+                current = current.get(key)
+            else:
+                current = getattr(current, key, None)
+        return current
+
+    @classmethod
+    def _capability_supported(cls, model_info: Any, *path: str) -> bool | None:
+        """Return capability support from Anthropic Models API metadata."""
+        value = cls._resolve_model_info_value(model_info, *path, "supported")
+        if value is None:
+            return None
+        return bool(value)
+
+    @classmethod
+    def _extract_runtime_model_info(cls, model_info: Any) -> _RuntimeModelInfo:
+        """Extract request-relevant metadata from a Models API response."""
+        return _RuntimeModelInfo(
+            max_input_tokens=cls._positive_int_or_none(
+                cls._resolve_model_info_value(model_info, "max_input_tokens")
+            ),
+            max_tokens=cls._positive_int_or_none(
+                cls._resolve_model_info_value(model_info, "max_tokens")
+            ),
+            supports_thinking=cls._capability_supported(
+                model_info, "capabilities", "thinking"
+            ),
+            supports_adaptive_thinking=cls._capability_supported(
+                model_info, "capabilities", "thinking", "types", "adaptive"
+            ),
+        )
+
+    @classmethod
+    def _apply_runtime_capability_overrides(
+        cls,
+        base_caps: ModelCapabilities,
+        runtime_info: _RuntimeModelInfo | None,
+    ) -> ModelCapabilities:
+        """Overlay live Models API metadata onto the static family heuristics."""
+        if runtime_info is None:
+            return base_caps
+
+        capability_tags = list(base_caps.capability_tags)
+        supports_thinking = (
+            runtime_info.supports_thinking
+            if runtime_info.supports_thinking is not None
+            else base_caps.supports_thinking
+        )
+        supports_adaptive_thinking = (
+            runtime_info.supports_adaptive_thinking
+            if runtime_info.supports_adaptive_thinking is not None
+            else base_caps.supports_adaptive_thinking
+        )
+
+        if supports_thinking and "thinking" not in capability_tags:
+            capability_tags.append("thinking")
+        if not supports_thinking and "thinking" in capability_tags:
+            capability_tags = [tag for tag in capability_tags if tag != "thinking"]
+
+        base_context_window = runtime_info.max_input_tokens or base_caps.base_context_window
+        supports_1m = (
+            runtime_info.max_input_tokens >= 1_000_000
+            if runtime_info.max_input_tokens is not None
+            else base_caps.supports_1m
+        )
+        default_thinking_budget = base_caps.default_thinking_budget
+        if supports_thinking and default_thinking_budget <= 0:
+            default_thinking_budget = 32000
+
+        return ModelCapabilities(
+            family=base_caps.family,
+            max_output_tokens=runtime_info.max_tokens or base_caps.max_output_tokens,
+            base_context_window=base_context_window,
+            supports_1m=supports_1m,
+            supports_thinking=supports_thinking,
+            supports_adaptive_thinking=supports_adaptive_thinking,
+            default_thinking_budget=default_thinking_budget,
+            capability_tags=tuple(capability_tags),
+        )
+
+    async def _get_runtime_model_info(self, model_id: str) -> _RuntimeModelInfo | None:
+        """Retrieve and cache live model metadata from Anthropic's Models API."""
+        if model_id in self._runtime_model_info_cache:
+            return self._runtime_model_info_cache[model_id]
+
+        try:
+            model_info = await self.client.models.retrieve(model_id)
+        except Exception:
+            self._runtime_model_info_cache[model_id] = None
+            return None
+
+        runtime_info = self._extract_runtime_model_info(model_info)
+        self._runtime_model_info_cache[model_id] = runtime_info
+        return runtime_info
+
+    async def _get_request_capabilities(self, model_id: str) -> ModelCapabilities:
+        """Compute capabilities for an effective request model with live overrides."""
+        base_caps = self._get_capabilities(model_id)
+        runtime_info = await self._get_runtime_model_info(model_id)
+        return self._apply_runtime_capability_overrides(base_caps, runtime_info)
+
+    @staticmethod
+    def _dedupe_headers(headers: list[str]) -> list[str]:
+        """Preserve header order while dropping duplicates and blanks."""
+        deduped: list[str] = []
+        for header in headers:
+            if not header or header in deduped:
+                continue
+            deduped.append(header)
+        return deduped
+
+    def _should_add_context_1m_beta(
+        self, model_id: str, request_caps: ModelCapabilities
+    ) -> bool:
+        """Return True when the effective model still needs the 1M beta header."""
+        if not self._enable_1m_context:
+            return False
+
+        family = self._detect_family(model_id)
+        if family == "haiku":
+            return False
+
+        major, minor = self._detect_version(model_id, family)
+        version = (major, minor)
+
+        # Anthropic's current context-window docs list 1M as a beta-header feature
+        # for Opus 4.6 and Sonnet 4.x. Keep the header scoped to those families so
+        # lower-tier fallbacks like Haiku don't inherit it.
+        if family == "opus":
+            return version == (4, 6)
+        return family == "sonnet" and version in {(4, 0), (4, 5), (4, 6)}
+
+    def _should_add_interleaved_beta(
+        self,
+        *,
+        request_caps: ModelCapabilities,
+        tools_present: bool,
+        resolved_thinking_type: str | None,
+    ) -> bool:
+        """Return True when tool-use thinking should opt into interleaving beta."""
+        if not tools_present or not request_caps.supports_thinking:
+            return False
+        if request_caps.family == "haiku":
+            return False
+        if (
+            resolved_thinking_type == "adaptive"
+            and request_caps.supports_adaptive_thinking
+        ):
+            return False
+        return resolved_thinking_type is not None
+
+    def _build_request_beta_headers(
+        self,
+        *,
+        model_id: str,
+        request_caps: ModelCapabilities,
+        tools_present: bool,
+        resolved_thinking_type: str | None,
+    ) -> list[str]:
+        """Build the anthropic-beta header set for a specific effective model."""
+        headers = list(self._beta_headers)
+        if self._should_add_context_1m_beta(model_id, request_caps):
+            headers.append(BETA_HEADER_1M_CONTEXT)
+        if self._should_add_interleaved_beta(
+            request_caps=request_caps,
+            tools_present=tools_present,
+            resolved_thinking_type=resolved_thinking_type,
+        ):
+            headers.append(BETA_HEADER_INTERLEAVED_THINKING)
+        return self._dedupe_headers(headers)
 
     @staticmethod
     def _is_cloudflare_challenge(error: AnthropicAPIStatusError) -> bool:
@@ -682,6 +1096,265 @@ class AnthropicProvider:
             "Checking if the site connection is secure",
         )
         return any(marker in text for marker in cf_markers)
+
+    def _build_retry_config(self, max_retries: int) -> RetryConfig:
+        """Create a retry config that preserves current backoff settings."""
+        return RetryConfig(
+            max_retries=max_retries,
+            initial_delay=self._retry_min_delay,
+            max_delay=self._retry_max_delay,
+            jitter=self._retry_jitter,
+        )
+
+    def _fallback_target_for_model(self, model_id: str) -> str | None:
+        """Return the configured lower-tier fallback for a requested model."""
+        family = self._detect_family(model_id)
+        target: str | None
+        if family == "opus":
+            target = self._fallback_sonnet_model
+        elif family == "sonnet":
+            target = self._fallback_haiku_model
+        else:
+            return None
+
+        if not target or target == model_id:
+            return None
+
+        target_family = self._detect_family(target)
+        if target_family == family:
+            logger.warning(
+                "[PROVIDER] Ignoring invalid overload fallback %s -> %s (same family)",
+                model_id,
+                target,
+            )
+            return None
+
+        return target
+
+    @staticmethod
+    def _is_overload_fallback_error(error: KernelLLMError) -> bool:
+        """Return True when the error indicates model overload, not generic throttling."""
+        status_code = getattr(error, "status_code", None)
+        if isinstance(error, KernelProviderUnavailableError) and status_code == 529:
+            return True
+        if isinstance(error, KernelRateLimitError) and status_code == 429:
+            msg = str(error).lower()
+            return "overload" in msg or "overloaded" in msg
+        return False
+
+    def _resolve_effective_model(
+        self, requested_model: str
+    ) -> tuple[str, list[tuple[str, _FallbackWindow]]]:
+        """Apply any active overload fallback windows to the requested model."""
+        self._read_shared_fallback_state()
+        effective_model = requested_model
+        active_windows: list[tuple[str, _FallbackWindow]] = []
+        seen_families: set[str] = set()
+
+        while True:
+            family = self._detect_family(effective_model)
+            if family in seen_families:
+                break
+            seen_families.add(family)
+
+            window = _get_active_fallback_window(family)
+            if window is None or window.fallback_model == effective_model:
+                break
+
+            active_windows.append((family, window))
+            effective_model = window.fallback_model
+
+        return effective_model, active_windows
+
+    async def _emit_provider_event(self, name: str, payload: dict[str, Any]) -> None:
+        """Emit a provider event when hooks are available."""
+        if self.coordinator and hasattr(self.coordinator, "hooks"):
+            await self.coordinator.hooks.emit(name, payload)
+
+    async def _emit_active_fallback_window(
+        self,
+        requested_model: str,
+        effective_model: str,
+        active_windows: list[tuple[str, _FallbackWindow]],
+    ) -> None:
+        """Emit observability for an active temporary downgrade window."""
+        if not active_windows:
+            return
+
+        now = time.time()
+        payload = {
+            "provider": "anthropic",
+            "requested_model": requested_model,
+            "effective_model": effective_model,
+            "chain": [
+                {
+                    "family": family,
+                    "fallback_model": window.fallback_model,
+                    "until": window.until,
+                    "remaining_seconds": max(0.0, window.until - now),
+                }
+                for family, window in active_windows
+            ],
+        }
+        logger.warning(
+            "[PROVIDER] Temporary downgrade active: %s -> %s",
+            requested_model,
+            effective_model,
+        )
+        await self._emit_provider_event(PROVIDER_FALLBACK_ACTIVE, payload)
+
+    async def _open_fallback_window(
+        self, attempted_model: str, error: KernelLLMError
+    ) -> bool:
+        """Open a temporary downgrade window for the attempted model family."""
+        fallback_model = self._fallback_target_for_model(attempted_model)
+        if not fallback_model:
+            return False
+
+        family = self._detect_family(attempted_model)
+        now = time.time()
+        until = now + self._fallback_cooldown_seconds
+        window = _FallbackWindow(
+            requested_model=attempted_model,
+            fallback_model=fallback_model,
+            opened_at=now,
+            until=until,
+            opened_by_pid=os.getpid(),
+            error_type=type(error).__name__,
+            error_message=str(error),
+        )
+
+        if self._fallback_cooldown_seconds > 0:
+            _set_fallback_window(family, window)
+            self._write_shared_fallback_state(family, window)
+
+        logger.warning(
+            "[PROVIDER] Opening temporary downgrade window for %s -> %s (cooldown %.0fs)",
+            attempted_model,
+            fallback_model,
+            self._fallback_cooldown_seconds,
+        )
+        await self._emit_provider_event(
+            PROVIDER_FALLBACK_OPEN,
+            {
+                "provider": "anthropic",
+                "requested_model": attempted_model,
+                "fallback_model": fallback_model,
+                "family": family,
+                "cooldown_seconds": self._fallback_cooldown_seconds,
+                "until": until,
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+            },
+        )
+        return True
+
+    @staticmethod
+    def _fallback_window_to_dict(window: _FallbackWindow) -> dict[str, Any]:
+        """Serialize a fallback window for JSON persistence."""
+        return {
+            "requested_model": window.requested_model,
+            "fallback_model": window.fallback_model,
+            "opened_at": window.opened_at,
+            "until": window.until,
+            "opened_by_pid": window.opened_by_pid,
+            "error_type": window.error_type,
+            "error_message": window.error_message,
+        }
+
+    @staticmethod
+    def _fallback_window_from_dict(data: Any) -> _FallbackWindow | None:
+        """Parse a persisted fallback window, ignoring malformed entries."""
+        if not isinstance(data, dict):
+            return None
+        try:
+            return _FallbackWindow(
+                requested_model=str(data["requested_model"]),
+                fallback_model=str(data["fallback_model"]),
+                opened_at=float(data["opened_at"]),
+                until=float(data["until"]),
+                opened_by_pid=int(data.get("opened_by_pid", 0)),
+                error_type=str(data.get("error_type", "")),
+                error_message=str(data.get("error_message", "")),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _load_shared_fallback_windows(
+        self, *, now: float | None = None
+    ) -> dict[str, _FallbackWindow]:
+        """Load non-expired persisted fallback windows from disk."""
+        if not self._fallback_state_path:
+            return {}
+        current_time = time.time() if now is None else now
+        try:
+            with open(self._fallback_state_path) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+
+            windows_data = data.get("windows", {})
+            if not isinstance(windows_data, dict):
+                return {}
+
+            windows: dict[str, _FallbackWindow] = {}
+            for family, raw_window in windows_data.items():
+                if not isinstance(family, str):
+                    continue
+                window = self._fallback_window_from_dict(raw_window)
+                if window is None or window.until <= current_time:
+                    continue
+                windows[family] = window
+            return windows
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            return {}
+
+    def _write_shared_fallback_state(self, family: str, window: _FallbackWindow) -> None:
+        """Atomically persist fallback windows when cross-process sharing is enabled."""
+        if not self._fallback_state_path:
+            return
+        try:
+            windows = self._load_shared_fallback_windows(now=time.time())
+            existing = windows.get(family)
+            if existing is None or window.until > existing.until:
+                windows[family] = window
+
+            serialized_windows = {
+                name: self._fallback_window_to_dict(active_window)
+                for name, active_window in sorted(windows.items())
+            }
+            state: dict[str, Any] = {
+                "version": FALLBACK_STATE_VERSION,
+                "updated_at": time.time(),
+                "updated_by_pid": os.getpid(),
+                "windows": serialized_windows,
+            }
+
+            path = self._fallback_state_path
+            tmp_path = path + ".tmp"
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(tmp_path, "w") as f:
+                json.dump(state, f)
+            os.rename(tmp_path, path)
+        except Exception:
+            pass  # Never crash on I/O errors
+
+    def _read_shared_fallback_state(self) -> None:
+        """Merge persisted fallback windows into the process-local breaker state."""
+        if not self._fallback_state_path:
+            return
+        now = time.time()
+        if now - self._last_fallback_state_read < 1.0:
+            return
+        self._last_fallback_state_read = now
+
+        windows = self._load_shared_fallback_windows(now=now)
+        for family, window in windows.items():
+            local_window = _get_active_fallback_window(family, now=now)
+            if local_window is None or window.until > local_window.until:
+                _set_fallback_window(family, window)
 
     def _write_shared_rate_limit_state(self, rate_limit_info: dict[str, Any]) -> None:
         """Atomically write rate-limit header data to the shared cross-process file.
@@ -923,7 +1596,71 @@ class AnthropicProvider:
                     },
                 )
 
-        return await self._complete_chat_request(request, **kwargs)
+        if not self._fallback_on_overload:
+            return await self._complete_chat_request(request, **kwargs)
+
+        requested_model = str(kwargs.get("model", self.default_model))
+        attempted_models: set[str] = set()
+        full_retry_budget_used: set[str] = set()
+
+        while True:
+            effective_model, active_windows = self._resolve_effective_model(
+                requested_model
+            )
+
+            # Guard against misconfigured fallback cycles.
+            if effective_model in attempted_models and effective_model not in full_retry_budget_used:
+                raise RuntimeError(
+                    f"Overload fallback loop detected while resolving {requested_model}"
+                )
+
+            if active_windows:
+                await self._emit_active_fallback_window(
+                    requested_model, effective_model, active_windows
+                )
+
+            current_kwargs = dict(kwargs)
+            current_kwargs["model"] = effective_model
+
+            fallback_target = (
+                self._fallback_target_for_model(effective_model)
+                if self._fallback_on_overload
+                else None
+            )
+            use_short_retry_budget = (
+                fallback_target is not None
+                and effective_model not in full_retry_budget_used
+            )
+            retry_config = (
+                self._build_retry_config(self._fallback_retry_count)
+                if use_short_retry_budget
+                else self._retry_config
+            )
+
+            attempted_models.add(effective_model)
+
+            try:
+                return await self._complete_chat_request(
+                    request,
+                    retry_config=retry_config,
+                    **current_kwargs,
+                )
+            except KernelLLMError as e:
+                if use_short_retry_budget and not self._is_overload_fallback_error(e):
+                    # Preserve the old retry behavior for non-overload failures:
+                    # after the short downgrade budget is exhausted, retry the same
+                    # model once more with the full configured retry policy.
+                    full_retry_budget_used.add(effective_model)
+                    attempted_models.discard(effective_model)
+                    continue
+
+                if not self._fallback_on_overload or not self._is_overload_fallback_error(
+                    e
+                ):
+                    raise
+
+                if not await self._open_fallback_window(effective_model, e):
+                    raise
 
     def _extract_rate_limit_headers(
         self, headers: dict[str, str] | Any
@@ -1082,7 +1819,10 @@ class AnthropicProvider:
         return [block]
 
     async def _complete_chat_request(
-        self, request: ChatRequest, **kwargs
+        self,
+        request: ChatRequest,
+        retry_config: RetryConfig | None = None,
+        **kwargs,
     ) -> ChatResponse:
         """Handle ChatRequest format with developer message conversion.
 
@@ -1093,6 +1833,8 @@ class AnthropicProvider:
         Returns:
             ChatResponse with content blocks
         """
+        active_retry_config = retry_config or self._retry_config
+
         logger.debug(
             f"Received ChatRequest with {len(request.messages)} messages (raw={self.raw})"
         )
@@ -1180,6 +1922,10 @@ class AnthropicProvider:
             params["tools"].insert(0, web_search_tool)
             logger.info("[PROVIDER] Native web search tool enabled")
 
+        request_caps = await self._get_request_capabilities(params["model"])
+        model_ceiling = request_caps.max_output_tokens
+        resolved_thinking_type: str | None = None
+
         # Enable extended thinking if requested (equivalent to OpenAI's reasoning)
         #
         # Precedence chain (highest to lowest):
@@ -1199,7 +1945,6 @@ class AnthropicProvider:
 
         thinking_budget = None
         interleaved_thinking_enabled = False
-        request_caps = self._get_capabilities(params["model"])
         if thinking_enabled:
             # Guard: skip thinking entirely for models that don't support it
             # (e.g. Haiku). Without this check we would send budget_tokens=0
@@ -1243,6 +1988,13 @@ class AnthropicProvider:
                 or self.config.get("thinking_budget_tokens")
                 or request_caps.default_thinking_budget
             )
+            budget_tokens = max(1024, int(budget_tokens))
+            max_budget_tokens = (
+                model_ceiling
+                if params.get("tools")
+                else max(1024, model_ceiling - 1)
+            )
+            budget_tokens = min(budget_tokens, max_budget_tokens)
             buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
                 "thinking_budget_buffer", 4096
             )
@@ -1262,11 +2014,13 @@ class AnthropicProvider:
             # explicit budget when the model doesn't support adaptive.
             if thinking_type == "adaptive" and request_caps.supports_adaptive_thinking:
                 params["thinking"] = {"type": "adaptive"}
+                resolved_thinking_type = "adaptive"
             else:
                 # "enabled" mode (all thinking-capable models): explicit budget
                 if thinking_type == "adaptive":
                     # Caller asked for adaptive but model doesn't support it
                     thinking_type = "enabled"
+                resolved_thinking_type = thinking_type
                 params["thinking"] = {
                     "type": thinking_type,
                     "budget_tokens": budget_tokens,
@@ -1280,7 +2034,6 @@ class AnthropicProvider:
             # max_tokens, so we still need a generous ceiling.
             # Cap to the model's API-enforced output ceiling so we never
             # exceed what the backend allows (e.g. Opus 4.5 caps at 64K).
-            model_ceiling = request_caps.max_output_tokens
             target_tokens = min(budget_tokens + buffer_tokens, model_ceiling)
             if params.get("max_tokens"):
                 params["max_tokens"] = min(
@@ -1289,24 +2042,7 @@ class AnthropicProvider:
             else:
                 params["max_tokens"] = target_tokens
 
-            # Auto-enable interleaved thinking when extended thinking is enabled.
-            # Interleaved thinking allows Claude 4 models to think between tool calls,
-            # producing better reasoning on complex multi-step tasks.
-            # Uses the beta header: interleaved-thinking-2025-05-14
-            #
-            # IMPORTANT: We must merge with the instance's configured beta headers
-            # (e.g., context-1m-2025-08-07 for 1M context window). The extra_headers
-            # in params will override the client's default_headers for the same key,
-            # so we need to include ALL beta headers in the combined value.
-            interleaved_thinking_enabled = True
-            combined_beta_headers = list(
-                self._beta_headers
-            )  # Start with configured headers
-            if BETA_HEADER_INTERLEAVED_THINKING not in combined_beta_headers:
-                combined_beta_headers.append(BETA_HEADER_INTERLEAVED_THINKING)
-            params["extra_headers"] = {
-                "anthropic-beta": ",".join(combined_beta_headers)
-            }
+            interleaved_thinking_enabled = bool(params.get("tools"))
 
             logger.info(
                 "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=1.0, max_tokens=%s, interleaved=%s)",
@@ -1316,9 +2052,29 @@ class AnthropicProvider:
                 interleaved_thinking_enabled,
             )
 
+        if params.get("max_tokens") and params["max_tokens"] > model_ceiling:
+            logger.info(
+                "[PROVIDER] Clamping max_tokens from %s to %s for %s",
+                params["max_tokens"],
+                model_ceiling,
+                params["model"],
+            )
+            params["max_tokens"] = model_ceiling
+
         # Add stop_sequences if specified
         if stop_sequences := kwargs.get("stop_sequences"):
             params["stop_sequences"] = stop_sequences
+
+        request_beta_headers = self._build_request_beta_headers(
+            model_id=params["model"],
+            request_caps=request_caps,
+            tools_present=bool(params.get("tools")),
+            resolved_thinking_type=resolved_thinking_type,
+        )
+        if request_beta_headers:
+            extra_headers = dict(params.get("extra_headers", {}))
+            extra_headers["anthropic-beta"] = ",".join(request_beta_headers)
+            params["extra_headers"] = extra_headers
 
         logger.info(
             f"[PROVIDER] Anthropic API call - model: {params['model']}, messages: {len(params['messages'])}, system: {bool(system_blocks)}, tools: {len(params.get('tools', []))}, thinking: {thinking_enabled}"
@@ -1551,7 +2307,7 @@ class AnthropicProvider:
             logger.warning(
                 "[PROVIDER] Retry %d/%d for %s: %s, sleeping %.1fs%s",
                 attempt,
-                self._retry_config.max_retries,
+                active_retry_config.max_retries,
                 error_type,
                 str(error),
                 delay,
@@ -1565,7 +2321,7 @@ class AnthropicProvider:
                         "provider": "anthropic",
                         "model": params["model"],
                         "attempt": attempt,
-                        "max_retries": self._retry_config.max_retries,
+                        "max_retries": active_retry_config.max_retries,
                         "delay": delay,
                         "retry_after": retry_after,
                         "error_type": error_type,
@@ -1688,7 +2444,7 @@ class AnthropicProvider:
         try:
             response = await retry_with_backoff(
                 _do_complete_guarded,
-                self._retry_config,
+                active_retry_config,
                 on_retry=_on_retry,
             )
 

@@ -59,3 +59,56 @@ class TestBaseUrlConfigField:
 
         assert base_url_field is not None
         assert base_url_field.default == "https://api.anthropic.com"
+
+
+class TestFallbackConfigFields:
+    """Tests for overload fallback ConfigField declarations."""
+
+    def test_fallback_toggle_is_declared(self):
+        provider = AnthropicProvider("test-api-key", {})
+        info = provider.get_info()
+
+        fallback_field = next(
+            (f for f in info.config_fields if f.id == "fallback_on_overload"),
+            None,
+        )
+
+        assert fallback_field is not None
+        assert fallback_field.display_name == "Temporary Overload Downgrade"
+        assert fallback_field.field_type == "boolean"
+        assert fallback_field.default == "false"
+        assert fallback_field.requires_model is True
+
+    def test_fallback_models_have_expected_defaults(self):
+        provider = AnthropicProvider("test-api-key", {})
+        info = provider.get_info()
+
+        sonnet_field = next(
+            (f for f in info.config_fields if f.id == "fallback_sonnet_model"),
+            None,
+        )
+        haiku_field = next(
+            (f for f in info.config_fields if f.id == "fallback_haiku_model"),
+            None,
+        )
+
+        assert sonnet_field is not None
+        assert sonnet_field.default == "claude-sonnet-4-6"
+
+        assert haiku_field is not None
+        assert haiku_field.default == "claude-haiku-4-5"
+
+    def test_persist_fallback_state_toggle_is_declared(self):
+        provider = AnthropicProvider("test-api-key", {})
+        info = provider.get_info()
+
+        persist_field = next(
+            (f for f in info.config_fields if f.id == "persist_fallback_state"),
+            None,
+        )
+
+        assert persist_field is not None
+        assert persist_field.display_name == "Share Downgrade State"
+        assert persist_field.field_type == "boolean"
+        assert persist_field.default == "false"
+        assert persist_field.requires_model is True
