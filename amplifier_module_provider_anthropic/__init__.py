@@ -54,7 +54,7 @@ from anthropic import BadRequestError as AnthropicBadRequestError
 from anthropic import RateLimitError as AnthropicRateLimitError
 from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
-)  # Not exported in public API as of SDK v0.75.0
+)  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 
 @dataclass
@@ -216,6 +216,9 @@ class ModelCapabilities:
     supports_1m: bool = False
     supports_thinking: bool = False
     supports_adaptive_thinking: bool = False
+    supports_manual_thinking: bool = (
+        True  # P1: False on Opus 4.7+ (type="enabled" → 400)
+    )
     default_thinking_budget: int = 0
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
 
@@ -537,7 +540,8 @@ class AnthropicProvider:
         )
         self._fallback_state_path: str = (
             str(configured_fallback_state_path)
-            if self._persist_fallback_state and configured_fallback_state_path is not None
+            if self._persist_fallback_state
+            and configured_fallback_state_path is not None
             else ""
         )
         self._last_fallback_state_read: float = 0.0
@@ -578,8 +582,7 @@ class AnthropicProvider:
                 "temperature": 0.7,
                 "timeout": 600.0,
                 "context_window": 1000000
-                if self._enable_1m_context
-                and self._default_caps.supports_1m
+                if self._enable_1m_context and self._default_caps.supports_1m
                 else self._default_caps.base_context_window,
                 "max_output_tokens": self._default_caps.max_output_tokens,
             },
@@ -824,12 +827,14 @@ class AnthropicProvider:
 
         if family == "opus":
             is_46_plus = not version_known or (major, minor) >= (4, 6)
+            is_47_plus = not version_known or (major, minor) >= (4, 7)
             return ModelCapabilities(
                 family="opus",
                 max_output_tokens=128000 if is_46_plus else 64000,
                 supports_1m=is_46_plus,
                 supports_thinking=True,
                 supports_adaptive_thinking=is_46_plus,
+                supports_manual_thinking=not is_47_plus,
                 default_thinking_budget=64000 if is_46_plus else 32000,
                 capability_tags=(
                     "tools",
@@ -947,7 +952,9 @@ class AnthropicProvider:
         if not supports_thinking and "thinking" in capability_tags:
             capability_tags = [tag for tag in capability_tags if tag != "thinking"]
 
-        base_context_window = runtime_info.max_input_tokens or base_caps.base_context_window
+        base_context_window = (
+            runtime_info.max_input_tokens or base_caps.base_context_window
+        )
         supports_1m = (
             runtime_info.max_input_tokens >= 1_000_000
             if runtime_info.max_input_tokens is not None
@@ -964,6 +971,7 @@ class AnthropicProvider:
             supports_1m=supports_1m,
             supports_thinking=supports_thinking,
             supports_adaptive_thinking=supports_adaptive_thinking,
+            supports_manual_thinking=base_caps.supports_manual_thinking,  # Pass through
             default_thinking_budget=default_thinking_budget,
             capability_tags=tuple(capability_tags),
         )
@@ -1013,12 +1021,13 @@ class AnthropicProvider:
         major, minor = self._detect_version(model_id, family)
         version = (major, minor)
 
-        # Anthropic's current context-window docs list 1M as a beta-header feature
-        # for Opus 4.6 and Sonnet 4.x. Keep the header scoped to those families so
-        # lower-tier fallbacks like Haiku don't inherit it.
+        # Send the 1M beta header for known 1M-capable versions and unknown
+        # versions (forward-compat).  The header is harmless on models where
+        # 1M context is already GA (e.g. Opus 4.7+), but omitting it breaks
+        # models that still need it.
         if family == "opus":
-            return version == (4, 6)
-        return family == "sonnet" and version in {(4, 0), (4, 5), (4, 6)}
+            return version == (0, 0) or version >= (4, 6)
+        return family == "sonnet" and (version == (0, 0) or version >= (4, 0))
 
     def _should_add_interleaved_beta(
         self,
@@ -1311,7 +1320,9 @@ class AnthropicProvider:
         except Exception:
             return {}
 
-    def _write_shared_fallback_state(self, family: str, window: _FallbackWindow) -> None:
+    def _write_shared_fallback_state(
+        self, family: str, window: _FallbackWindow
+    ) -> None:
         """Atomically persist fallback windows when cross-process sharing is enabled."""
         if not self._fallback_state_path:
             return
@@ -1609,7 +1620,10 @@ class AnthropicProvider:
             )
 
             # Guard against misconfigured fallback cycles.
-            if effective_model in attempted_models and effective_model not in full_retry_budget_used:
+            if (
+                effective_model in attempted_models
+                and effective_model not in full_retry_budget_used
+            ):
                 raise RuntimeError(
                     f"Overload fallback loop detected while resolving {requested_model}"
                 )
@@ -1654,8 +1668,9 @@ class AnthropicProvider:
                     attempted_models.discard(effective_model)
                     continue
 
-                if not self._fallback_on_overload or not self._is_overload_fallback_error(
-                    e
+                if (
+                    not self._fallback_on_overload
+                    or not self._is_overload_fallback_error(e)
                 ):
                     raise
 
@@ -1990,9 +2005,7 @@ class AnthropicProvider:
             )
             budget_tokens = max(1024, int(budget_tokens))
             max_budget_tokens = (
-                model_ceiling
-                if params.get("tools")
-                else max(1024, model_ceiling - 1)
+                model_ceiling if params.get("tools") else max(1024, model_ceiling - 1)
             )
             budget_tokens = min(budget_tokens, max_budget_tokens)
             buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
@@ -2013,6 +2026,19 @@ class AnthropicProvider:
             # (budget_tokens is forbidden).  Fall back to "enabled" with an
             # explicit budget when the model doesn't support adaptive.
             if thinking_type == "adaptive" and request_caps.supports_adaptive_thinking:
+                params["thinking"] = {"type": "adaptive"}
+                resolved_thinking_type = "adaptive"
+            elif not request_caps.supports_manual_thinking:
+                # Model rejects type="enabled" (e.g. Opus 4.7+) — force adaptive.
+                # This is safe because models that don't support manual thinking
+                # always support adaptive thinking.
+                if thinking_type != "adaptive":
+                    logger.info(
+                        "[PROVIDER] Model %s does not support manual thinking "
+                        "(type='enabled') — using adaptive instead of '%s'",
+                        params["model"],
+                        thinking_type,
+                    )
                 params["thinking"] = {"type": "adaptive"}
                 resolved_thinking_type = "adaptive"
             else:
