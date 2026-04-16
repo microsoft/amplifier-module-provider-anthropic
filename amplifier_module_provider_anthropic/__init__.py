@@ -219,6 +219,16 @@ class ModelCapabilities:
     supports_manual_thinking: bool = (
         True  # P1: False on Opus 4.7+ (type="enabled" → 400)
     )
+    supports_output_config: bool = False  # P2: output_config.effort GA
+    supports_sampling: bool = True  # P2: False = temperature silently ignored
+    thinking_display_required: bool = (
+        False  # P2: must send display:"summarized" to see thinking
+    )
+    supported_efforts: tuple[str, ...] = (
+        "low",
+        "medium",
+        "high",
+    )  # P2: valid effort levels
     default_thinking_budget: int = 0
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
 
@@ -835,6 +845,14 @@ class AnthropicProvider:
                 supports_thinking=True,
                 supports_adaptive_thinking=is_46_plus,
                 supports_manual_thinking=not is_47_plus,
+                supports_output_config=is_47_plus,
+                supports_sampling=not is_47_plus,
+                thinking_display_required=is_47_plus,
+                supported_efforts=(
+                    ("low", "medium", "high", "xhigh")
+                    if is_47_plus
+                    else ("low", "medium", "high")
+                ),
                 default_thinking_budget=64000 if is_46_plus else 32000,
                 capability_tags=(
                     "tools",
@@ -971,7 +989,11 @@ class AnthropicProvider:
             supports_1m=supports_1m,
             supports_thinking=supports_thinking,
             supports_adaptive_thinking=supports_adaptive_thinking,
-            supports_manual_thinking=base_caps.supports_manual_thinking,  # Pass through
+            supports_manual_thinking=base_caps.supports_manual_thinking,
+            supports_output_config=base_caps.supports_output_config,
+            supports_sampling=base_caps.supports_sampling,
+            thinking_display_required=base_caps.thinking_display_required,
+            supported_efforts=base_caps.supported_efforts,
             default_thinking_budget=default_thinking_budget,
             capability_tags=tuple(capability_tags),
         )
@@ -1905,15 +1927,34 @@ class AnthropicProvider:
         all_messages = self._apply_message_cache_control(all_messages)
         logger.info(f"[PROVIDER] Final message count for API: {len(all_messages)}")
 
+        # Resolve model and capabilities BEFORE building params dict,
+        # so per-model param gating (temperature, output_config) can apply.
+        effective_model = kwargs.get("model", self.default_model)
+        request_caps = await self._get_request_capabilities(effective_model)
+        model_ceiling = request_caps.max_output_tokens
+
         # Prepare request parameters
-        params = {
-            "model": kwargs.get("model", self.default_model),
+        params: dict[str, Any] = {
+            "model": effective_model,
             "messages": all_messages,
             "max_tokens": request.max_output_tokens
             or kwargs.get("max_tokens", self.max_tokens),
-            "temperature": request.temperature
-            or kwargs.get("temperature", self.temperature),
         }
+
+        # Only include temperature for models that support sampling.
+        # Opus 4.7+ silently ignores temperature — omitting it avoids user confusion
+        # and keeps request payloads clean.
+        if request_caps.supports_sampling:
+            params["temperature"] = request.temperature or kwargs.get(
+                "temperature", self.temperature
+            )
+        else:
+            if request.temperature is not None or kwargs.get("temperature") is not None:
+                logger.info(
+                    "[PROVIDER] Model %s does not support sampling parameters"
+                    " — ignoring temperature setting",
+                    params["model"],
+                )
 
         if system_blocks:
             params["system"] = system_blocks
@@ -1936,9 +1977,6 @@ class AnthropicProvider:
             # Add web search tool at the beginning (native tools typically come first)
             params["tools"].insert(0, web_search_tool)
             logger.info("[PROVIDER] Native web search tool enabled")
-
-        request_caps = await self._get_request_capabilities(params["model"])
-        model_ceiling = request_caps.max_output_tokens
         resolved_thinking_type: str | None = None
 
         # Enable extended thinking if requested (equivalent to OpenAI's reasoning)
@@ -1983,6 +2021,8 @@ class AnthropicProvider:
             # | "high"          | "adaptive"*   | generous (model default)  |
             # | None            | (existing)    | (existing)                |
             # * falls back to "enabled" if model doesn't support adaptive
+            # * On Opus 4.7+ "enabled" is intercepted → forced to "adaptive"
+            #   (models without supports_manual_thinking reject type="enabled")
 
             effort_thinking_type: str | None = None
             effort_budget: int | None = None
@@ -1993,6 +2033,9 @@ class AnthropicProvider:
                 effort_thinking_type = "adaptive"
                 effort_budget = request_caps.default_thinking_budget
             elif reasoning_effort == "high":
+                effort_thinking_type = "adaptive"
+                effort_budget = request_caps.default_thinking_budget
+            elif reasoning_effort == "xhigh":
                 effort_thinking_type = "adaptive"
                 effort_budget = request_caps.default_thinking_budget
 
@@ -2052,8 +2095,21 @@ class AnthropicProvider:
                     "budget_tokens": budget_tokens,
                 }
 
-            # CRITICAL: Anthropic requires temperature=1.0 when thinking is enabled
-            params["temperature"] = 1.0
+            # For models where thinking.display defaults to "omitted" (Opus 4.7+),
+            # request "summarized" so thinking content is visible to users.
+            # Users can override via config or kwargs to "omitted" if desired.
+            if request_caps.thinking_display_required:
+                display = kwargs.get(
+                    "thinking_display",
+                    self.config.get("thinking_display", "summarized"),
+                )
+                params["thinking"]["display"] = display
+
+            # Anthropic requires temperature=1.0 when thinking is enabled
+            # on models that support sampling. Non-sampling models (4.7+)
+            # ignore temperature entirely — don't inject it.
+            if request_caps.supports_sampling:
+                params["temperature"] = 1.0
 
             # Ensure max_tokens accommodates thinking budget + response.
             # For adaptive mode the model manages its own budget within
@@ -2071,9 +2127,10 @@ class AnthropicProvider:
             interleaved_thinking_enabled = bool(params.get("tools"))
 
             logger.info(
-                "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=1.0, max_tokens=%s, interleaved=%s)",
+                "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=%s, max_tokens=%s, interleaved=%s)",
                 thinking_budget,
                 buffer_tokens,
+                params.get("temperature", "n/a"),
                 params["max_tokens"],
                 interleaved_thinking_enabled,
             )
@@ -2086,6 +2143,30 @@ class AnthropicProvider:
                 params["model"],
             )
             params["max_tokens"] = model_ceiling
+
+        # Build output_config for models that support it (Opus 4.7+).
+        # output_config.effort is the primary control surface for thinking
+        # intensity on these models, replacing the budget_tokens approach.
+        if request_caps.supports_output_config and reasoning_effort is not None:
+            # kwargs["effort"] allows overriding output_config.effort independently
+            # of reasoning_effort (e.g. reasoning_effort="high" for thinking type,
+            # but effort="xhigh" for output config intensity).
+            effort = kwargs.get("effort", reasoning_effort)
+            if effort in request_caps.supported_efforts:
+                params["output_config"] = {"effort": effort}
+                logger.info(
+                    "[PROVIDER] output_config.effort=%s for %s",
+                    effort,
+                    params["model"],
+                )
+            else:
+                logger.warning(
+                    "[PROVIDER] Effort level '%s' not supported by %s "
+                    "(supported: %s) — omitting output_config.effort",
+                    effort,
+                    params["model"],
+                    request_caps.supported_efforts,
+                )
 
         # Add stop_sequences if specified
         if stop_sequences := kwargs.get("stop_sequences"):

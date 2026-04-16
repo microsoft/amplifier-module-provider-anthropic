@@ -303,3 +303,252 @@ class TestBetaHeader1MFix:
 
     def test_sonnet_unknown_gets_1m_header(self):
         assert self._check("claude-sonnet-latest") is True
+
+
+# ---------------------------------------------------------------------------
+# TestOpus47OutputConfig — output_config.effort on Opus 4.7
+# ---------------------------------------------------------------------------
+
+
+class TestOpus47OutputConfig:
+    """output_config.effort on Opus 4.7."""
+
+    def test_opus_47_high_effort_sends_output_config(self):
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"] == {"effort": "high"}
+
+    def test_opus_47_xhigh_effort_sends_output_config(self):
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="xhigh",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"] == {"effort": "xhigh"}
+
+    def test_opus_47_low_effort_sends_output_config(self):
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="low",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"] == {"effort": "low"}
+
+    def test_opus_47_no_effort_no_output_config(self):
+        """reasoning_effort=None → no output_config at all."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "output_config" not in params
+
+    def test_opus_46_no_output_config(self):
+        """Opus 4.6 doesn't support output_config — never sent."""
+        provider = _make_provider(default_model="claude-opus-4-6-20260101")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "output_config" not in params
+
+    def test_opus_47_supported_efforts(self):
+        """Opus 4.7 capabilities include xhigh."""
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
+        assert "xhigh" in caps.supported_efforts
+        assert caps.supported_efforts == ("low", "medium", "high", "xhigh")
+
+    def test_opus_46_no_xhigh(self):
+        """Opus 4.6 capabilities don't include xhigh."""
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-6-20260101")
+        assert "xhigh" not in caps.supported_efforts
+
+    def test_opus_47_invalid_effort_omits_output_config(self):
+        """Unknown effort level → output_config omitted (not a hard error)."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="max",  # not in supported_efforts for 4.7
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "output_config" not in params
+
+
+# ---------------------------------------------------------------------------
+# TestOpus47ThinkingDisplay — thinking.display integration for Opus 4.7
+# ---------------------------------------------------------------------------
+
+
+class TestOpus47ThinkingDisplay:
+    """thinking.display integration for Opus 4.7."""
+
+    def test_opus_47_thinking_sends_display_summarized(self):
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["thinking"]["display"] == "summarized"
+
+    def test_opus_47_display_config_override(self):
+        """Config thinking_display='omitted' overrides default."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.config["thinking_display"] = "omitted"
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["thinking"]["display"] == "omitted"
+
+    def test_opus_47_display_kwargs_override(self):
+        """kwargs thinking_display overrides config."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.config["thinking_display"] = "omitted"
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request, thinking_display="summarized"))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["thinking"]["display"] == "summarized"
+
+    def test_opus_46_no_display_field(self):
+        """Opus 4.6 thinking dict has no display field."""
+        provider = _make_provider(default_model="claude-opus-4-6-20260101")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "display" not in params["thinking"]
+
+    def test_opus_47_thinking_display_required_flag(self):
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
+        assert caps.thinking_display_required is True
+
+    def test_opus_46_thinking_display_required_false(self):
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-6-20260101")
+        assert caps.thinking_display_required is False
+
+
+# ---------------------------------------------------------------------------
+# TestOpus47Temperature — temperature stripping for non-sampling models
+# ---------------------------------------------------------------------------
+
+
+class TestOpus47Temperature:
+    """Temperature stripping for non-sampling models."""
+
+    def test_opus_47_no_temperature_in_params(self):
+        """Opus 4.7 requests should not include temperature."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "temperature" not in params
+
+    def test_opus_47_explicit_temperature_ignored(self):
+        """Even if user sets temperature, Opus 4.7 omits it."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            temperature=0.5,
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "temperature" not in params
+
+    def test_opus_47_thinking_does_not_force_temperature_1(self):
+        """With thinking on 4.7, temperature is omitted (not forced to 1.0)."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "temperature" not in params
+
+    def test_opus_46_temperature_still_sent(self):
+        """Opus 4.6 still includes temperature in params."""
+        provider = _make_provider(default_model="claude-opus-4-6-20260101")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "temperature" in params
+
+    def test_opus_47_supports_sampling_false(self):
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
+        assert caps.supports_sampling is False
+
+    def test_opus_46_supports_sampling_true(self):
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-6-20260101")
+        assert caps.supports_sampling is True
+
+    def test_sonnet_supports_sampling_true(self):
+        caps = AnthropicProvider._get_capabilities("claude-sonnet-4-6-20260101")
+        assert caps.supports_sampling is True
