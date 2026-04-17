@@ -20,7 +20,6 @@ Two features under test:
 
 import asyncio
 import os
-from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -35,6 +34,8 @@ from amplifier_core.llm_errors import (
 from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
 from anthropic import APIStatusError as AnthropicAPIStatusError
+
+from tests._helpers import DummyResponse, FakeCoordinator
 
 
 # ---------------------------------------------------------------------------
@@ -72,35 +73,12 @@ def _make_api_status_error(
     return error
 
 
-class DummyResponse:
-    """Minimal response stub accepted by the provider's response converter."""
-
-    def __init__(self):
-        self.content = []
-        self.usage = SimpleNamespace(input_tokens=0, output_tokens=0)
-        self.stop_reason = "end_turn"
-        self.model = "claude-sonnet-4-5-20250929"
-
-
 def _ok_raw_response():
     """Return a fake raw HTTP response that parse()s to DummyResponse."""
     raw = MagicMock()
     raw.parse.return_value = DummyResponse()
     raw.headers = {}
     return raw
-
-
-class FakeHooks:
-    def __init__(self):
-        self.events: list[tuple[str, dict]] = []
-
-    async def emit(self, name: str, payload: dict) -> None:
-        self.events.append((name, payload))
-
-
-class FakeCoordinator:
-    def __init__(self):
-        self.hooks = FakeHooks()
 
 
 # ---------------------------------------------------------------------------

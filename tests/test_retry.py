@@ -10,7 +10,6 @@ Verifies:
 """
 
 import asyncio
-from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,33 +30,12 @@ from amplifier_core.llm_errors import (
 from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
 
+from tests._helpers import DummyResponse, FakeCoordinator
+
 
 # ---------------------------------------------------------------------------
 # Helpers (same as test_error_translation.py)
 # ---------------------------------------------------------------------------
-
-
-class FakeHooks:
-    def __init__(self):
-        self.events: list[tuple[str, dict]] = []
-
-    async def emit(self, name: str, payload: dict) -> None:
-        self.events.append((name, payload))
-
-
-class FakeCoordinator:
-    def __init__(self):
-        self.hooks = FakeHooks()
-
-
-class DummyResponse:
-    """Minimal Anthropic API response stub."""
-
-    def __init__(self):
-        self.content = [SimpleNamespace(type="text", text="ok")]
-        self.usage = SimpleNamespace(input_tokens=10, output_tokens=5)
-        self.stop_reason = "end_turn"
-        self.model = "claude-sonnet-4-5-20250929"
 
 
 def _make_provider(

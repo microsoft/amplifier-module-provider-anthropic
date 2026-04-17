@@ -31,23 +31,12 @@ from amplifier_core.llm_errors import (
 from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
 
+from tests._helpers import FakeCoordinator
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-class FakeHooks:
-    def __init__(self):
-        self.events: list[tuple[str, dict]] = []
-
-    async def emit(self, name: str, payload: dict) -> None:
-        self.events.append((name, payload))
-
-
-class FakeCoordinator:
-    def __init__(self):
-        self.hooks = FakeHooks()
 
 
 def _make_provider() -> AnthropicProvider:

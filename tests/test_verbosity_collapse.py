@@ -16,32 +16,12 @@ from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
 
+from tests._helpers import FakeCoordinator
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-class FakeHooks:
-    def __init__(self):
-        self.events: list[tuple[str, dict]] = []
-
-    async def emit(self, name: str, payload: dict) -> None:
-        self.events.append((name, payload))
-
-    def emitted_names(self) -> list[str]:
-        return [name for name, _ in self.events]
-
-    def payload_for(self, event_name: str) -> dict | None:
-        for name, payload in self.events:
-            if name == event_name:
-                return payload
-        return None
-
-
-class FakeCoordinator:
-    def __init__(self):
-        self.hooks = FakeHooks()
 
 
 def _make_provider(*, raw: bool = False) -> AnthropicProvider:

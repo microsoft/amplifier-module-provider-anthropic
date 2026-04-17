@@ -6,7 +6,6 @@ and 1M beta header fix.
 
 import asyncio
 import logging
-from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -15,33 +14,12 @@ from amplifier_core.message_models import ChatRequest, Message
 import amplifier_module_provider_anthropic as anthropic_module
 from amplifier_module_provider_anthropic import AnthropicProvider, _RuntimeModelInfo
 
+from tests._helpers import DummyResponse, FakeCoordinator
+
 
 # ---------------------------------------------------------------------------
 # Helpers (same infrastructure as test_reasoning_effort.py)
 # ---------------------------------------------------------------------------
-
-
-class FakeHooks:
-    def __init__(self):
-        self.events: list[tuple[str, dict]] = []
-
-    async def emit(self, name: str, payload: dict) -> None:
-        self.events.append((name, payload))
-
-
-class FakeCoordinator:
-    def __init__(self):
-        self.hooks = FakeHooks()
-
-
-class DummyResponse:
-    """Minimal Anthropic API response stub."""
-
-    def __init__(self):
-        self.content = [SimpleNamespace(type="text", text="ok")]
-        self.usage = SimpleNamespace(input_tokens=10, output_tokens=5)
-        self.stop_reason = "end_turn"
-        self.model = "claude-opus-4-7-20260416"
 
 
 def _make_provider(
@@ -61,7 +39,7 @@ def _make_provider(
 
 def _make_raw_mock() -> MagicMock:
     raw = MagicMock()
-    raw.parse.return_value = DummyResponse()
+    raw.parse.return_value = DummyResponse(model="claude-opus-4-7-20260416")
     raw.headers = {}
     return raw
 

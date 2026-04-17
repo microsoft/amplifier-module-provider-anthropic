@@ -26,6 +26,8 @@ from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
 from anthropic import APIStatusError as AnthropicAPIStatusError
 
+from tests._helpers import DummyResponse, FakeCoordinator, FakeHooks
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,16 +64,6 @@ def _make_api_status_error(
     return error
 
 
-class DummyResponse:
-    """Minimal response stub for provider tests."""
-
-    def __init__(self, content=None):
-        self.content = content or []
-        self.usage = SimpleNamespace(input_tokens=0, output_tokens=0)
-        self.stop_reason = "end_turn"
-        self.model = "claude-sonnet-4-5-20250929"
-
-
 class MockStreamManager:
     def __init__(self, api_response: DummyResponse):
         self._api_response = api_response
@@ -86,18 +78,6 @@ class MockStreamManager:
     async def get_final_message(self):
         return self._api_response
 
-
-class FakeHooks:
-    def __init__(self):
-        self.events: list[tuple[str, dict]] = []
-
-    async def emit(self, name: str, payload: dict) -> None:
-        self.events.append((name, payload))
-
-
-class FakeCoordinator:
-    def __init__(self):
-        self.hooks = FakeHooks()
 
 
 # ============================================================================

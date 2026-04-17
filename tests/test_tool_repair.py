@@ -12,15 +12,7 @@ from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolCallBlock
 from amplifier_module_provider_anthropic import AnthropicProvider
 
-
-class DummyResponse:
-    """Minimal response stub for provider tests."""
-
-    def __init__(self, content=None):
-        self.content = content or []
-        self.usage = SimpleNamespace(input_tokens=0, output_tokens=0)
-        self.stop_reason = "end_turn"
-        self.model = "claude-sonnet-4-5-20250929"
+from tests._helpers import DummyResponse, FakeCoordinator
 
 
 class MockStreamManager:
@@ -61,19 +53,6 @@ def create_raw_response_mock(response: DummyResponse):
     raw.parse.return_value = response
     raw.headers = {}
     return AsyncMock(return_value=raw)
-
-
-class FakeHooks:
-    def __init__(self):
-        self.events: list[tuple[str, dict]] = []
-
-    async def emit(self, name: str, payload: dict) -> None:
-        self.events.append((name, payload))
-
-
-class FakeCoordinator:
-    def __init__(self):
-        self.hooks = FakeHooks()
 
 
 def test_tool_call_sequence_missing_tool_message_is_repaired():
