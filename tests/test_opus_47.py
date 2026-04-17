@@ -5,12 +5,14 @@ and 1M beta header fix.
 """
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message
+import amplifier_module_provider_anthropic as anthropic_module
 from amplifier_module_provider_anthropic import AnthropicProvider, _RuntimeModelInfo
 
 
@@ -552,3 +554,312 @@ class TestOpus47Temperature:
     def test_sonnet_supports_sampling_true(self):
         caps = AnthropicProvider._get_capabilities("claude-sonnet-4-6-20260101")
         assert caps.supports_sampling is True
+
+
+# ---------------------------------------------------------------------------
+# TestTemperatureZeroBug — temperature=0.0 must not be treated as falsy
+# ---------------------------------------------------------------------------
+
+
+class TestTemperatureZeroBug:
+    """temperature=0.0 must be respected, not treated as falsy."""
+
+    def test_temperature_zero_is_respected(self):
+        """request.temperature=0.0 should send 0.0, not fall back to default 0.7."""
+        provider = _make_provider(default_model="claude-sonnet-4-6-20260101")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            temperature=0.0,
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["temperature"] == 0.0
+
+    def test_temperature_none_falls_back_to_default(self):
+        """request.temperature=None should fall back to provider default (0.7)."""
+        provider = _make_provider(default_model="claude-sonnet-4-6-20260101")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["temperature"] == 0.7
+
+    def test_temperature_explicit_value_sent(self):
+        """request.temperature=0.5 should send 0.5."""
+        provider = _make_provider(default_model="claude-sonnet-4-6-20260101")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            temperature=0.5,
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["temperature"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# TestTokenizerBufferBump — default thinking buffer increased for Opus 4.7
+# ---------------------------------------------------------------------------
+
+
+class TestTokenizerBufferBump:
+    """Default thinking_budget_buffer bumped from 4096 to 8192."""
+
+    def test_default_buffer_is_8192(self):
+        """Default buffer_tokens should be 8192 (not the old 4096)."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        # max_tokens = min(budget + buffer, ceiling) = min(64000 + 8192, 128000) = 72192
+        # Old behavior: min(64000 + 4096, 128000) = 68096
+        assert params["max_tokens"] >= 72192
+
+    def test_config_buffer_override_still_works(self):
+        """Config thinking_budget_buffer overrides the new default."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.config["thinking_budget_buffer"] = 16384
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        # min(64000 + 16384, 128000) = 80384
+        assert params["max_tokens"] >= 80384
+
+
+# ---------------------------------------------------------------------------
+# TestDeprecationWarnings — warn once per process for deprecated models
+# ---------------------------------------------------------------------------
+
+
+class TestDeprecationWarnings:
+    """Deprecation warnings for models approaching retirement."""
+
+    def setup_method(self):
+        """Clear warned set before each test."""
+        anthropic_module._clear_deprecated_model_warnings()
+
+    def test_deprecated_model_emits_warning(self, caplog):
+        """Deprecated model emits a logger.warning on first use."""
+        provider = _make_provider(default_model="claude-3-haiku-20240307")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request))
+        assert any("deprecated" in r.message.lower() for r in caplog.records)
+        assert any("2026-04-19" in r.message for r in caplog.records)
+
+    def test_warning_only_emitted_once(self, caplog):
+        """Second call with same deprecated model does NOT warn again."""
+        provider = _make_provider(default_model="claude-3-haiku-20240307")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request))
+        first_count = sum(
+            1 for r in caplog.records if "deprecated" in r.message.lower()
+        )
+
+        caplog.clear()
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request))
+        second_count = sum(
+            1 for r in caplog.records if "deprecated" in r.message.lower()
+        )
+        assert first_count == 1
+        assert second_count == 0
+
+    def test_non_deprecated_model_no_warning(self, caplog):
+        """Non-deprecated model emits no deprecation warning."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request))
+        assert not any("deprecated" in r.message.lower() for r in caplog.records)
+
+    def test_deprecated_models_table_has_expected_entries(self):
+        """Verify the deprecation table contains all known deprecated models."""
+        deprecated = anthropic_module._DEPRECATED_MODELS
+        assert "claude-3-haiku-20240307" in deprecated
+        assert "claude-sonnet-4-20250514" in deprecated
+        assert "claude-opus-4-20250514" in deprecated
+        assert len(deprecated) == 3
+
+    def test_clear_function_resets_warned_set(self):
+        """_clear_deprecated_model_warnings() allows re-warning."""
+        provider = _make_provider(default_model="claude-3-haiku-20240307")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+        )
+        asyncio.run(provider.complete(request))
+
+        anthropic_module._clear_deprecated_model_warnings()
+
+        # After clearing, the next call should warn again (verified by checking
+        # the set is empty — the warn-once test already covers the actual logging)
+        assert len(anthropic_module._warned_deprecated_models) == 0
+
+
+# ---------------------------------------------------------------------------
+# TestTaskBudgets — task budget beta feature for Opus 4.7+
+# ---------------------------------------------------------------------------
+
+
+class TestTaskBudgets:
+    """Task budget support (beta) for Opus 4.7+."""
+
+    def test_opus_47_supports_task_budget(self):
+        """Opus 4.7 capabilities include supports_task_budget=True."""
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
+        assert caps.supports_task_budget is True
+
+    def test_opus_46_no_task_budget(self):
+        """Opus 4.6 does not support task budgets."""
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-6-20260101")
+        assert caps.supports_task_budget is False
+
+    def test_sonnet_no_task_budget(self):
+        """Sonnet does not support task budgets."""
+        caps = AnthropicProvider._get_capabilities("claude-sonnet-4-6-20260101")
+        assert caps.supports_task_budget is False
+
+    def test_task_budget_in_output_config(self):
+        """task_budget_tokens kwarg adds task_budget to output_config."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request, task_budget_tokens=50000))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "output_config" in params
+        assert params["output_config"]["task_budget"] == {
+            "type": "tokens",
+            "total": 50000,
+        }
+
+    def test_task_budget_min_20k_enforced(self):
+        """Task budget below 20000 is clamped to 20000."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request, task_budget_tokens=5000))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"]["task_budget"]["total"] == 20000
+
+    def test_task_budget_from_config(self):
+        """Config-level task_budget_tokens is used when kwarg not provided."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.config["task_budget_tokens"] = 80000
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"]["task_budget"]["total"] == 80000
+
+    def test_task_budget_adds_beta_header(self):
+        """When task_budget is present, the beta header must be included."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request, task_budget_tokens=50000))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        beta_header = params.get("extra_headers", {}).get("anthropic-beta", "")
+        assert "task-budgets-2026-03-13" in beta_header
+
+    def test_no_task_budget_no_beta_header(self):
+        """When task_budget is not set, the task-budgets beta header is absent."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        beta_header = params.get("extra_headers", {}).get("anthropic-beta", "")
+        assert "task-budgets-2026-03-13" not in beta_header
+
+    def test_task_budget_ignored_on_unsupported_model(self):
+        """task_budget_tokens on Opus 4.6 (unsupported) is silently ignored."""
+        provider = _make_provider(default_model="claude-opus-4-6-20260101")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request, task_budget_tokens=50000))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        # output_config should not exist for 4.6 at all
+        assert "output_config" not in params
+
+    def test_runtime_overrides_preserve_task_budget(self):
+        """_apply_runtime_capability_overrides passes through supports_task_budget."""
+        base_caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
+        assert base_caps.supports_task_budget is True
+        runtime_info = _RuntimeModelInfo()
+        overridden = AnthropicProvider._apply_runtime_capability_overrides(
+            base_caps, runtime_info
+        )
+        assert overridden.supports_task_budget is True

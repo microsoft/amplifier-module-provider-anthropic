@@ -196,9 +196,28 @@ async def _get_process_semaphore(max_concurrent: int) -> asyncio.Semaphore | Non
 # Beta header constants — single source of truth for experimental feature headers
 BETA_HEADER_1M_CONTEXT = "context-1m-2025-08-07"
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
+BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
 PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
 FALLBACK_STATE_VERSION = 1
+
+# ---------------------------------------------------------------------------
+# Deprecated model retirement dates — warn once per process per model
+# ---------------------------------------------------------------------------
+_DEPRECATED_MODELS: dict[str, str] = {
+    "claude-3-haiku-20240307": "2026-04-19",
+    "claude-sonnet-4-20250514": "2026-06-15",
+    "claude-opus-4-20250514": "2026-06-15",
+}
+_warned_deprecated_models: set[str] = set()
+
+
+def _clear_deprecated_model_warnings() -> None:
+    """Clear the warned-models set.
+
+    Internal helper for tests. Follows the same pattern as _clear_fallback_windows().
+    """
+    _warned_deprecated_models.clear()
 
 
 @dataclass(frozen=True)
@@ -217,18 +236,21 @@ class ModelCapabilities:
     supports_thinking: bool = False
     supports_adaptive_thinking: bool = False
     supports_manual_thinking: bool = (
-        True  # P1: False on Opus 4.7+ (type="enabled" → 400)
+        True  # False on Opus 4.7+ (type="enabled" returns HTTP 400)
     )
-    supports_output_config: bool = False  # P2: output_config.effort GA
-    supports_sampling: bool = True  # P2: False = temperature silently ignored
+    supports_output_config: bool = False  # True = model accepts output_config.effort
+    supports_sampling: bool = True  # False = temperature silently ignored by model
     thinking_display_required: bool = (
-        False  # P2: must send display:"summarized" to see thinking
+        False  # True = must send thinking.display to see thinking content
     )
     supported_efforts: tuple[str, ...] = (
         "low",
         "medium",
         "high",
-    )  # P2: valid effort levels
+    )  # Valid effort levels for output_config and reasoning_effort
+    supports_task_budget: bool = (
+        False  # True = model accepts output_config.task_budget (beta)
+    )
     default_thinking_budget: int = 0
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
 
@@ -846,6 +868,7 @@ class AnthropicProvider:
                 supports_adaptive_thinking=is_46_plus,
                 supports_manual_thinking=not is_47_plus,
                 supports_output_config=is_47_plus,
+                supports_task_budget=is_47_plus,
                 supports_sampling=not is_47_plus,
                 thinking_display_required=is_47_plus,
                 supported_efforts=(
@@ -991,6 +1014,7 @@ class AnthropicProvider:
             supports_adaptive_thinking=supports_adaptive_thinking,
             supports_manual_thinking=base_caps.supports_manual_thinking,
             supports_output_config=base_caps.supports_output_config,
+            supports_task_budget=base_caps.supports_task_budget,
             supports_sampling=base_caps.supports_sampling,
             thinking_display_required=base_caps.thinking_display_required,
             supported_efforts=base_caps.supported_efforts,
@@ -1077,6 +1101,7 @@ class AnthropicProvider:
         request_caps: ModelCapabilities,
         tools_present: bool,
         resolved_thinking_type: str | None,
+        has_task_budget: bool = False,
     ) -> list[str]:
         """Build the anthropic-beta header set for a specific effective model."""
         headers = list(self._beta_headers)
@@ -1088,6 +1113,8 @@ class AnthropicProvider:
             resolved_thinking_type=resolved_thinking_type,
         ):
             headers.append(BETA_HEADER_INTERLEAVED_THINKING)
+        if has_task_budget:
+            headers.append(BETA_HEADER_TASK_BUDGETS)
         return self._dedupe_headers(headers)
 
     @staticmethod
@@ -1933,6 +1960,20 @@ class AnthropicProvider:
         request_caps = await self._get_request_capabilities(effective_model)
         model_ceiling = request_caps.max_output_tokens
 
+        # Emit once-per-process deprecation warning for models nearing retirement
+        if (
+            effective_model in _DEPRECATED_MODELS
+            and effective_model not in _warned_deprecated_models
+        ):
+            _warned_deprecated_models.add(effective_model)
+            retire_date = _DEPRECATED_MODELS[effective_model]
+            logger.warning(
+                "[PROVIDER] Model %s is deprecated and will be retired on %s. "
+                "Please migrate to a newer model.",
+                effective_model,
+                retire_date,
+            )
+
         # Prepare request parameters
         params: dict[str, Any] = {
             "model": effective_model,
@@ -1945,8 +1986,10 @@ class AnthropicProvider:
         # Opus 4.7+ silently ignores temperature — omitting it avoids user confusion
         # and keeps request payloads clean.
         if request_caps.supports_sampling:
-            params["temperature"] = request.temperature or kwargs.get(
-                "temperature", self.temperature
+            params["temperature"] = (
+                request.temperature
+                if request.temperature is not None
+                else kwargs.get("temperature", self.temperature)
             )
         else:
             if request.temperature is not None or kwargs.get("temperature") is not None:
@@ -2051,8 +2094,10 @@ class AnthropicProvider:
                 model_ceiling if params.get("tools") else max(1024, model_ceiling - 1)
             )
             budget_tokens = min(budget_tokens, max_budget_tokens)
+            # Default buffer raised from 4096 → 8192 to accommodate Opus 4.7's
+            # denser tokenizer (1.0–1.35× more tokens for equivalent text).
             buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
-                "thinking_budget_buffer", 4096
+                "thinking_budget_buffer", 8192
             )
 
             thinking_budget = budget_tokens
@@ -2168,6 +2213,28 @@ class AnthropicProvider:
                     request_caps.supported_efforts,
                 )
 
+        # Task budget (beta): output_config.task_budget for Opus 4.7+
+        # COE CONSTRAINT: Use `is not None` (not `or`) to avoid falsy-zero bug.
+        has_task_budget = False
+        if request_caps.supports_task_budget:
+            task_budget_tokens = kwargs.get("task_budget_tokens")
+            if task_budget_tokens is None:
+                task_budget_tokens = self.config.get("task_budget_tokens")
+            if task_budget_tokens is not None:
+                task_budget_tokens = max(20000, int(task_budget_tokens))
+                if "output_config" not in params:
+                    params["output_config"] = {}
+                params["output_config"]["task_budget"] = {
+                    "type": "tokens",
+                    "total": task_budget_tokens,
+                }
+                has_task_budget = True
+                logger.info(
+                    "[PROVIDER] output_config.task_budget=%d for %s",
+                    task_budget_tokens,
+                    params["model"],
+                )
+
         # Add stop_sequences if specified
         if stop_sequences := kwargs.get("stop_sequences"):
             params["stop_sequences"] = stop_sequences
@@ -2177,6 +2244,7 @@ class AnthropicProvider:
             request_caps=request_caps,
             tools_present=bool(params.get("tools")),
             resolved_thinking_type=resolved_thinking_type,
+            has_task_budget=has_task_budget,
         )
         if request_beta_headers:
             extra_headers = dict(params.get("extra_headers", {}))
