@@ -160,6 +160,30 @@ def test_event_usage_uses_cache_read_tokens_key():
     assert "cache_read_tokens" in usage, f"Expected 'cache_read_tokens', got keys: {list(usage.keys())}"
 
 
+def test_event_usage_contains_cache_write_tokens():
+    """Regression guard: cache_write_tokens must appear in emitted event_usage.
+
+    ddcbb29 restored this field after a silent regression removed it.
+    This test ensures it never silently disappears again.
+    """
+    provider = _make_provider()
+    provider.client.messages.with_raw_response.create = AsyncMock(
+        return_value=_make_raw_response(cache_creation_input_tokens=300)
+    )
+    asyncio.run(provider.complete(_simple_request()))
+    hooks = cast(FakeCoordinator, provider.coordinator).hooks
+    payload = hooks.payload_for("llm:response")
+    assert payload is not None
+    usage = payload.get("usage", {})
+    assert "cache_write_tokens" in usage, (
+        f"Expected 'cache_write_tokens' in event_usage (regression guard for ddcbb29), "
+        f"got keys: {list(usage.keys())}"
+    )
+    assert usage["cache_write_tokens"] == 300, (
+        f"Expected cache_write_tokens=300, got {usage['cache_write_tokens']}"
+    )
+
+
 def test_event_usage_input_tokens_is_gross_total():
     """llm:response event's input_tokens should be the gross total (fresh + cache_read)."""
     provider = _make_provider()
