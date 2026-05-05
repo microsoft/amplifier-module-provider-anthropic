@@ -2653,16 +2653,21 @@ class AnthropicProvider:
 
             # Emit from canonical fields
             if self.coordinator and hasattr(self.coordinator, "hooks"):
+                # Build usage dict per #69 schema — is-not-None guards for cache fields
+                _event_usage: dict[str, Any] = {
+                    "input_tokens":  chat_response.usage.input_tokens,
+                    "output_tokens": chat_response.usage.output_tokens,
+                }
+                if chat_response.usage.cache_read_tokens is not None:
+                    _event_usage["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                if chat_response.usage.cache_write_tokens is not None:
+                    _event_usage["cache_write_tokens"] = chat_response.usage.cache_write_tokens
                 response_event: dict[str, Any] = {
                     "provider": "anthropic",
                     "model": params["model"],
                     "duration_ms": elapsed_ms,
                     "status": "ok",
-                    "usage": {
-                        "input_tokens":      chat_response.usage.input_tokens,
-                        "output_tokens":     chat_response.usage.output_tokens,
-                        "cache_read_tokens": chat_response.usage.cache_read_tokens,
-                    },
+                    "usage": _event_usage,
                 }
                 # Add rate limit info if available
                 if rate_limit_info:
