@@ -9,12 +9,57 @@ Covers:
   (f) Unknown model returns None
   (g) None != Decimal('0')
   (h) Result type is always Decimal, never float
+
+Integration tests (i–k): _convert_to_chat_response stamps cost_usd on Usage
+  (i)  Known model + tokens → cost_usd is Decimal > 0
+  (j)  1M cache_creation_input_tokens → cost_usd == Decimal('3.75')
+  (k)  Unknown model → cost_usd is None
 """
 
 from decimal import Decimal
+from typing import cast
+from unittest.mock import MagicMock
 
+from amplifier_core import ModuleCoordinator
 
+from amplifier_module_provider_anthropic import AnthropicProvider
 from amplifier_module_provider_anthropic._cost import compute_cost
+
+from tests._helpers import FakeCoordinator
+
+
+# ---------------------------------------------------------------------------
+# Integration test helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_provider() -> AnthropicProvider:
+    """Create a minimal AnthropicProvider for direct method testing."""
+    provider = AnthropicProvider(
+        api_key="test-key",
+        config={"use_streaming": False, "max_retries": 0},
+    )
+    provider.coordinator = cast(ModuleCoordinator, FakeCoordinator())
+    return provider
+
+
+def _make_response(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
+) -> MagicMock:
+    """Build a fake Anthropic API response for testing _convert_to_chat_response."""
+    response = MagicMock()
+    response.content = []
+    response.model = model
+    response.stop_reason = "end_turn"
+    response.usage.input_tokens = input_tokens
+    response.usage.output_tokens = output_tokens
+    response.usage.cache_read_input_tokens = cache_read_input_tokens
+    response.usage.cache_creation_input_tokens = cache_creation_input_tokens
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -104,3 +149,60 @@ def test_result_type_is_decimal():
     result = compute_cost("claude-sonnet-4-5-20250929", input_tokens=1_000)
     assert isinstance(result, Decimal), f"Expected Decimal, got {type(result)}"
     assert not isinstance(result, float), "Result must not be a float"
+
+
+# ---------------------------------------------------------------------------
+# (i) Integration: _convert_to_chat_response stamps cost_usd for known model
+# ---------------------------------------------------------------------------
+def test_convert_stamps_cost_on_usage():
+    """Known model + tokens → result.usage.cost_usd is not None, Decimal, > 0."""
+    provider = _make_provider()
+    response = _make_response(
+        model="claude-sonnet-4-5-20250929",
+        input_tokens=1_000,
+        output_tokens=500,
+    )
+    result = provider._convert_to_chat_response(response)
+    assert result.usage is not None
+    assert result.usage.cost_usd is not None, "cost_usd should be stamped for known model"
+    assert isinstance(result.usage.cost_usd, Decimal), (
+        f"cost_usd should be Decimal, got {type(result.usage.cost_usd)}"
+    )
+    assert result.usage.cost_usd > 0, f"cost_usd should be > 0, got {result.usage.cost_usd}"
+
+
+# ---------------------------------------------------------------------------
+# (j) Integration: _convert_to_chat_response includes cache write in cost
+# ---------------------------------------------------------------------------
+def test_convert_includes_cache_write_in_cost():
+    """1M cache_creation_input_tokens on claude-sonnet-4-5-20250929 → cost_usd == Decimal('3.75')."""
+    provider = _make_provider()
+    response = _make_response(
+        model="claude-sonnet-4-5-20250929",
+        input_tokens=0,
+        output_tokens=0,
+        cache_creation_input_tokens=1_000_000,
+    )
+    result = provider._convert_to_chat_response(response)
+    assert result.usage is not None
+    assert result.usage.cost_usd == Decimal("3.75"), (
+        f"Expected Decimal('3.75') for 1M cache_creation_input_tokens, got {result.usage.cost_usd!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (k) Integration: _convert_to_chat_response leaves cost_usd=None for unknown model
+# ---------------------------------------------------------------------------
+def test_convert_leaves_cost_none_for_unknown_model():
+    """Unknown model → result.usage.cost_usd is None."""
+    provider = _make_provider()
+    response = _make_response(
+        model="claude-unknown-model-9999",
+        input_tokens=1_000,
+        output_tokens=500,
+    )
+    result = provider._convert_to_chat_response(response)
+    assert result.usage is not None
+    assert result.usage.cost_usd is None, (
+        f"cost_usd should be None for unknown model, got {result.usage.cost_usd!r}"
+    )

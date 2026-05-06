@@ -56,6 +56,8 @@ from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
+from ._cost import compute_cost
+
 
 @dataclass
 class WebSearchContent:
@@ -3354,6 +3356,15 @@ class AnthropicProvider:
             usage_kwargs["cache_read_input_tokens"] = cache_read
 
         usage = Usage(**usage_kwargs)
+
+        cost = compute_cost(
+            response.model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", 0) or 0,
+            cache_creation_input_tokens=getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
+        )
+        usage = usage.model_copy(update={"cost_usd": cost})
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
