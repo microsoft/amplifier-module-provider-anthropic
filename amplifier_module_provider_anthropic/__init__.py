@@ -2685,11 +2685,7 @@ class AnthropicProvider:
                     _event_usage["cache_read_tokens"] = chat_response.usage.cache_read_tokens
                 if chat_response.usage.cache_write_tokens is not None:
                     _event_usage["cache_write_tokens"] = chat_response.usage.cache_write_tokens
-                _event_usage["cost_usd"] = (
-                    str(chat_response.usage.cost_usd)
-                    if chat_response.usage.cost_usd is not None
-                    else None
-                )
+                _event_usage["cost_usd"] = chat_response.usage.cost_usd
                 response_event: dict[str, Any] = {
                     "provider": "anthropic",
                     "model": params["model"],
@@ -3390,7 +3386,7 @@ class AnthropicProvider:
             cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", 0) or 0,
             cache_creation_input_tokens=getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
         )
-        usage = usage.model_copy(update={"cost_usd": str(cost) if cost is not None else None})
+        usage = usage.model_copy(update={"cost_usd": cost})
 
         combined_text = "\n\n".join(text_accumulator).strip()
 

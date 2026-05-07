@@ -165,10 +165,10 @@ def test_convert_stamps_cost_on_usage():
     result = provider._convert_to_chat_response(response)
     assert result.usage is not None
     assert result.usage.cost_usd is not None, "cost_usd should be stamped for known model"
-    assert isinstance(result.usage.cost_usd, str), (
-        f"cost_usd should be str, got {type(result.usage.cost_usd)}"
+    assert isinstance(result.usage.cost_usd, Decimal), (
+        f"cost_usd should be Decimal, got {type(result.usage.cost_usd)}"
     )
-    assert Decimal(result.usage.cost_usd) > 0, f"cost_usd should be > 0, got {result.usage.cost_usd}"
+    assert result.usage.cost_usd > 0, f"cost_usd should be > 0, got {result.usage.cost_usd}"
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +185,7 @@ def test_convert_includes_cache_write_in_cost():
     )
     result = provider._convert_to_chat_response(response)
     assert result.usage is not None
-    assert Decimal(result.usage.cost_usd) == Decimal("3.75"), (
+    assert result.usage.cost_usd == Decimal("3.75"), (
         f"Expected Decimal('3.75') for 1M cache_creation_input_tokens, got {result.usage.cost_usd!r}"
     )
 
