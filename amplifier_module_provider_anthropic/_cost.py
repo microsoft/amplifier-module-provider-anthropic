@@ -60,37 +60,46 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_write_per_m": Decimal("3.75"),
     },
     # ------------------------------------------------------------------
-    # Claude Opus 4.5 family  ($5 / $25 / $0.50 / $6.25)
+    # Claude Opus 4.x family  ($15 / $75 / $1.50 / $18.75)
+    # Source: anthropic.com/pricing (verified 2026-05-07)
+    # All Opus 4 variants share the same tier: $15 input / $75 output.
+    # cache_read = 10% of input ($1.50); cache_write = 125% of input ($18.75)
     # ------------------------------------------------------------------
+    "claude-opus-4-5": {
+        "input_per_m": Decimal("15.00"),
+        "output_per_m": Decimal("75.00"),
+        "cache_read_per_m": Decimal("1.50"),
+        "cache_write_per_m": Decimal("18.75"),
+    },
     "claude-opus-4-5-20251101": {
-        "input_per_m": Decimal("5.00"),
-        "output_per_m": Decimal("25.00"),
-        "cache_read_per_m": Decimal("0.50"),
-        "cache_write_per_m": Decimal("6.25"),
+        "input_per_m": Decimal("15.00"),
+        "output_per_m": Decimal("75.00"),
+        "cache_read_per_m": Decimal("1.50"),
+        "cache_write_per_m": Decimal("18.75"),
     },
     "claude-opus-4-6": {
-        "input_per_m": Decimal("5.00"),
-        "output_per_m": Decimal("25.00"),
-        "cache_read_per_m": Decimal("0.50"),
-        "cache_write_per_m": Decimal("6.25"),
+        "input_per_m": Decimal("15.00"),
+        "output_per_m": Decimal("75.00"),
+        "cache_read_per_m": Decimal("1.50"),
+        "cache_write_per_m": Decimal("18.75"),
     },
     "claude-opus-4-6-20260101": {
-        "input_per_m": Decimal("5.00"),
-        "output_per_m": Decimal("25.00"),
-        "cache_read_per_m": Decimal("0.50"),
-        "cache_write_per_m": Decimal("6.25"),
+        "input_per_m": Decimal("15.00"),
+        "output_per_m": Decimal("75.00"),
+        "cache_read_per_m": Decimal("1.50"),
+        "cache_write_per_m": Decimal("18.75"),
     },
     "claude-opus-4-7": {
-        "input_per_m": Decimal("5.00"),
-        "output_per_m": Decimal("25.00"),
-        "cache_read_per_m": Decimal("0.50"),
-        "cache_write_per_m": Decimal("6.25"),
+        "input_per_m": Decimal("15.00"),
+        "output_per_m": Decimal("75.00"),
+        "cache_read_per_m": Decimal("1.50"),
+        "cache_write_per_m": Decimal("18.75"),
     },
     "claude-opus-4-7-20260416": {
-        "input_per_m": Decimal("5.00"),
-        "output_per_m": Decimal("25.00"),
-        "cache_read_per_m": Decimal("0.50"),
-        "cache_write_per_m": Decimal("6.25"),
+        "input_per_m": Decimal("15.00"),
+        "output_per_m": Decimal("75.00"),
+        "cache_read_per_m": Decimal("1.50"),
+        "cache_write_per_m": Decimal("18.75"),
     },
     # ------------------------------------------------------------------
     # Claude Haiku 3.5  ($0.80 / $4.00 / $0.08 / $1.00)
