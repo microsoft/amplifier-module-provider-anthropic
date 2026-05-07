@@ -80,6 +80,12 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("0.50"),
         "cache_write_per_m": Decimal("6.25"),
     },
+    "claude-opus-4-7": {
+        "input_per_m": Decimal("5.00"),
+        "output_per_m": Decimal("25.00"),
+        "cache_read_per_m": Decimal("0.50"),
+        "cache_write_per_m": Decimal("6.25"),
+    },
     "claude-opus-4-7-20260416": {
         "input_per_m": Decimal("5.00"),
         "output_per_m": Decimal("25.00"),
