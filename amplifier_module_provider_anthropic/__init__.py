@@ -3390,7 +3390,7 @@ class AnthropicProvider:
             cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", 0) or 0,
             cache_creation_input_tokens=getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
         )
-        usage = usage.model_copy(update={"cost_usd": cost})
+        usage = usage.model_copy(update={"cost_usd": str(cost) if cost is not None else None})
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
