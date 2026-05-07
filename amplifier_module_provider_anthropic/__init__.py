@@ -344,19 +344,23 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     # Registered unconditionally so cost tracking works even if the provider
     # is not fully mounted (e.g. missing API key in tests).
     # ---------------------------------------------------------------------------
-    _totals: dict = {'cost_usd': None, 'has_data': False}
+    _totals: dict = {"cost_usd": None, "has_data": False}
 
     async def _accumulate(event: str, data: dict) -> None:
-        raw = (data.get('usage') or {}).get('cost_usd')
+        if data.get("provider") != "anthropic":  # ignore events from other providers
+            return
+        raw = (data.get("usage") or {}).get("cost_usd")
         if raw is not None:
-            _totals['cost_usd'] = (_totals['cost_usd'] if _totals['cost_usd'] is not None else Decimal('0')) + Decimal(str(raw))
-            _totals['has_data'] = True
+            _totals["cost_usd"] = (
+                _totals["cost_usd"] if _totals["cost_usd"] is not None else Decimal("0")
+            ) + Decimal(str(raw))
+            _totals["has_data"] = True
 
-    coordinator.hooks.register('llm:response', _accumulate)
+    coordinator.hooks.register("llm:response", _accumulate)
     coordinator.register_contributor(
-        'session.cost',
-        'provider-anthropic',
-        lambda: {'cost_usd': _totals['cost_usd']} if _totals['has_data'] else None,
+        "session.cost",
+        "provider-anthropic",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
     )
 
     # Get API key from config or environment
@@ -2678,13 +2682,17 @@ class AnthropicProvider:
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 # Build usage dict per #69 schema — is-not-None guards for cache fields
                 _event_usage: dict[str, Any] = {
-                    "input_tokens":  chat_response.usage.input_tokens,
+                    "input_tokens": chat_response.usage.input_tokens,
                     "output_tokens": chat_response.usage.output_tokens,
                 }
                 if chat_response.usage.cache_read_tokens is not None:
-                    _event_usage["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                    _event_usage["cache_read_tokens"] = (
+                        chat_response.usage.cache_read_tokens
+                    )
                 if chat_response.usage.cache_write_tokens is not None:
-                    _event_usage["cache_write_tokens"] = chat_response.usage.cache_write_tokens
+                    _event_usage["cache_write_tokens"] = (
+                        chat_response.usage.cache_write_tokens
+                    )
                 _event_usage["cost_usd"] = chat_response.usage.cost_usd
                 response_event: dict[str, Any] = {
                     "provider": "anthropic",
@@ -3383,8 +3391,14 @@ class AnthropicProvider:
             response.model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
-            cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", 0) or 0,
-            cache_creation_input_tokens=getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
+            cache_read_input_tokens=getattr(
+                response.usage, "cache_read_input_tokens", 0
+            )
+            or 0,
+            cache_creation_input_tokens=getattr(
+                response.usage, "cache_creation_input_tokens", 0
+            )
+            or 0,
         )
         usage = usage.model_copy(update={"cost_usd": cost})
 
