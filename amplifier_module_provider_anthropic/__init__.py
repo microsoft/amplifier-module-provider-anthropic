@@ -339,11 +339,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     """
     config = config or {}
 
-    # ---------------------------------------------------------------------------
-    # Cost accumulation hook and session.cost contributor
-    # Registered unconditionally so cost tracking works even if the provider
-    # is not fully mounted (e.g. missing API key in tests).
-    # ---------------------------------------------------------------------------
     # Get API key from config or environment
     api_key = config.get("api_key")
     if not api_key:
