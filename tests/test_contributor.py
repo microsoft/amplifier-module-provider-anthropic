@@ -84,8 +84,8 @@ async def test_contributor_accumulates_after_llm_response(mock_coordinator):
     accumulate = mock_coordinator.registered_hooks["llm:response"]
     callback = mock_coordinator.registered_contributors[("session.cost", "provider-anthropic")]
 
-    await accumulate("llm:response", {"usage": {"cost_usd": "0.05"}})
-    await accumulate("llm:response", {"usage": {"cost_usd": "0.03"}})
+    await accumulate("llm:response", {"provider": "anthropic", "usage": {"cost_usd": "0.05"}})
+    await accumulate("llm:response", {"provider": "anthropic", "usage": {"cost_usd": "0.03"}})
 
     result = callback()
     assert result is not None, "Callback should return a dict after cost events"
@@ -111,6 +111,6 @@ async def test_contributor_ignores_none_cost(mock_coordinator):
     accumulate = mock_coordinator.registered_hooks["llm:response"]
     callback = mock_coordinator.registered_contributors[("session.cost", "provider-anthropic")]
 
-    await accumulate("llm:response", {"usage": {"cost_usd": None}})
+    await accumulate("llm:response", {"provider": "anthropic", "usage": {"cost_usd": None}})
 
     assert callback() is None, "Callback should still return None after a None-cost event"
