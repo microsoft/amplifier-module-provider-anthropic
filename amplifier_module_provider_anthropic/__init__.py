@@ -339,6 +339,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     """
     config = config or {}
 
+    _totals: dict = {"cost_usd": None, "has_data": False}
+
+    def _add_cost(cost) -> None:
+        if cost is not None:
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + cost
+            _totals["has_data"] = True
+
     # Get API key from config or environment
     api_key = config.get("api_key")
     if not api_key:
@@ -348,8 +355,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         logger.warning("No API key found for Anthropic provider")
         return None
 
-    provider = AnthropicProvider(api_key, config, coordinator)
+    provider = AnthropicProvider(api_key, config, coordinator, add_cost=_add_cost)
     await coordinator.mount("providers", provider, name="anthropic")
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-anthropic",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+    )
     logger.info("Mounted AnthropicProvider")
 
     # Return cleanup function that delegates to provider.close().
@@ -417,6 +429,7 @@ class AnthropicProvider:
         api_key: str | None = None,
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
+        add_cost=None,
     ):
         """
         Initialize Anthropic provider.
@@ -587,6 +600,7 @@ class AnthropicProvider:
         # detected repeatedly across LLM iterations (since synthetic results
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
+        self._add_cost = add_cost or (lambda cost: None)
 
     @property
     def client(self) -> AsyncAnthropic:
@@ -3377,6 +3391,7 @@ class AnthropicProvider:
             or 0,
         )
         usage = usage.model_copy(update={"cost_usd": cost})
+        self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
