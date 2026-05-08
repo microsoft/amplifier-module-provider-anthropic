@@ -2683,7 +2683,8 @@ class AnthropicProvider:
                     _event_usage["cache_write_tokens"] = (
                         chat_response.usage.cache_write_tokens
                     )
-                _event_usage["cost_usd"] = chat_response.usage.cost_usd
+                _cost = chat_response.usage.cost_usd
+                _event_usage["cost_usd"] = str(_cost) if _cost is not None else None
                 response_event: dict[str, Any] = {
                     "provider": "anthropic",
                     "model": params["model"],

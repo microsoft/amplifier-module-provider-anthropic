@@ -226,3 +226,55 @@ def test_event_does_not_use_old_output_key():
     assert payload is not None
     usage = payload.get("usage", {})
     assert "output" not in usage, f"Old 'output' key should be gone, found: {usage}"
+
+
+# ---------------------------------------------------------------------------
+# cost_usd JSON serializability
+# ---------------------------------------------------------------------------
+
+
+def test_event_usage_cost_usd_is_json_safe():
+    """llm:response event payload must be json.dumps-safe.
+
+    Root cause: RustHookRegistry.emit() calls json.dumps() on the event dict
+    before dispatching to handlers. cost_usd was a Decimal (not JSON-native),
+    crashing emit() with 'Object of type Decimal is not JSON serializable'
+    before any handler ran.
+
+    Fix: convert cost_usd to str at the emit boundary in the provider.
+    """
+    import json
+    from decimal import Decimal
+
+    provider = _make_provider()
+    provider.client.messages.with_raw_response.create = AsyncMock(
+        return_value=_make_raw_response()
+    )
+    asyncio.run(provider.complete(_simple_request()))
+    hooks = cast(FakeCoordinator, provider.coordinator).hooks
+    payload = hooks.payload_for("llm:response")
+    assert payload is not None
+    # Must not raise TypeError: Object of type Decimal is not JSON serializable
+    json.dumps(payload)
+
+
+def test_event_usage_cost_usd_is_str_not_decimal():
+    """cost_usd in llm:response event usage must be str, not Decimal.
+
+    Decimal is not JSON-serializable. The provider must convert before emit.
+    None is preserved as-is (unknown cost stays distinct from zero cost).
+    """
+    from decimal import Decimal
+
+    provider = _make_provider()
+    provider.client.messages.with_raw_response.create = AsyncMock(
+        return_value=_make_raw_response()
+    )
+    asyncio.run(provider.complete(_simple_request()))
+    hooks = cast(FakeCoordinator, provider.coordinator).hooks
+    payload = hooks.payload_for("llm:response")
+    assert payload is not None
+    cost_usd = payload.get("usage", {}).get("cost_usd")
+    assert not isinstance(cost_usd, Decimal), (
+        f"cost_usd must not be Decimal in emitted event, got {type(cost_usd)}"
+    )
