@@ -284,7 +284,9 @@ class TestTemporaryFallbackOnOverload:
         assert anthropic_module.BETA_HEADER_1M_CONTEXT not in fallback_header
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_sonnet_45_still_adds_context_beta_header_when_enabled(self, mock_sleep):
+    def test_sonnet_45_no_longer_gets_context_beta_header(self, mock_sleep):
+        # context-1m-2025-08-07 was retired for Sonnet 4.0/4.5 on 2026-04-30;
+        # those models now hard-cap at 200k and reject the header with a 400.
         provider = _make_provider("claude-sonnet-4-5", enable_1m_context=True)
         provider._get_runtime_model_info = AsyncMock(
             return_value=_runtime_model_info(
@@ -301,7 +303,7 @@ class TestTemporaryFallbackOnOverload:
         assert result is not None
         call_kwargs = provider.client.messages.with_raw_response.create.await_args.kwargs
         beta_header = call_kwargs.get("extra_headers", {}).get("anthropic-beta", "")
-        assert anthropic_module.BETA_HEADER_1M_CONTEXT in beta_header
+        assert anthropic_module.BETA_HEADER_1M_CONTEXT not in beta_header
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
     def test_persisted_breaker_state_is_opt_in(self, mock_sleep, tmp_path):

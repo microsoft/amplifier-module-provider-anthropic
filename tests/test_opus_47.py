@@ -278,8 +278,13 @@ class TestBetaHeader1MFix:
     def test_sonnet_46_gets_1m_header(self):
         assert self._check("claude-sonnet-4-6-20260101") is True
 
-    def test_sonnet_45_gets_1m_header(self):
-        assert self._check("claude-sonnet-4-5-20250929") is True
+    def test_sonnet_45_no_1m_header(self):
+        # Retirement of context-1m-2025-08-07 for Sonnet 4.0/4.5 on 2026-04-30.
+        assert self._check("claude-sonnet-4-5-20250929") is False
+
+    def test_sonnet_40_no_1m_header(self):
+        # Retirement of context-1m-2025-08-07 for Sonnet 4.0/4.5 on 2026-04-30.
+        assert self._check("claude-sonnet-4-20250514") is False
 
     def test_sonnet_unknown_gets_1m_header(self):
         assert self._check("claude-sonnet-latest") is True
@@ -639,7 +644,9 @@ class TestDeprecationWarnings:
 
     def test_deprecated_model_emits_warning(self, caplog):
         """Deprecated model emits a logger.warning on first use."""
-        provider = _make_provider(default_model="claude-3-haiku-20240307")
+        # claude-3-haiku-20240307 is fully retired (removed from dict);
+        # use claude-sonnet-4-20250514 which still has an upcoming retirement date.
+        provider = _make_provider(default_model="claude-sonnet-4-20250514")
         provider.client.messages.with_raw_response.create = AsyncMock(
             return_value=_make_raw_mock()
         )
@@ -649,11 +656,11 @@ class TestDeprecationWarnings:
         with caplog.at_level(logging.WARNING):
             asyncio.run(provider.complete(request))
         assert any("deprecated" in r.message.lower() for r in caplog.records)
-        assert any("2026-04-19" in r.message for r in caplog.records)
+        assert any("2026-06-15" in r.message for r in caplog.records)
 
     def test_warning_only_emitted_once(self, caplog):
         """Second call with same deprecated model does NOT warn again."""
-        provider = _make_provider(default_model="claude-3-haiku-20240307")
+        provider = _make_provider(default_model="claude-sonnet-4-20250514")
         provider.client.messages.with_raw_response.create = AsyncMock(
             return_value=_make_raw_mock()
         )
@@ -694,14 +701,15 @@ class TestDeprecationWarnings:
     def test_deprecated_models_table_has_expected_entries(self):
         """Verify the deprecation table contains all known deprecated models."""
         deprecated = anthropic_module._DEPRECATED_MODELS
-        assert "claude-3-haiku-20240307" in deprecated
+        # claude-3-haiku-20240307 was fully retired 2026-04-19 and removed from the dict.
+        assert "claude-3-haiku-20240307" not in deprecated
         assert "claude-sonnet-4-20250514" in deprecated
         assert "claude-opus-4-20250514" in deprecated
-        assert len(deprecated) == 3
+        assert len(deprecated) == 2
 
     def test_clear_function_resets_warned_set(self):
         """_clear_deprecated_model_warnings() allows re-warning."""
-        provider = _make_provider(default_model="claude-3-haiku-20240307")
+        provider = _make_provider(default_model="claude-sonnet-4-20250514")
         provider.client.messages.with_raw_response.create = AsyncMock(
             return_value=_make_raw_mock()
         )
@@ -841,3 +849,80 @@ class TestTaskBudgets:
             base_caps, runtime_info
         )
         assert overridden.supports_task_budget is True
+
+# ---------------------------------------------------------------------------
+# TestEnable1mContextRetirementWarning — warn at __init__ time when
+#   enable_1m_context=True but the model's 1M beta was retired on 2026-04-30
+# ---------------------------------------------------------------------------
+
+
+class TestEnable1mContextRetirementWarning:
+    """Warning emitted at __init__ when enable_1m_context=True on a retired-1m model."""
+
+    def _make(self, model: str, enable_1m_context: bool = True) -> AnthropicProvider:
+        return AnthropicProvider(
+            api_key="test-key",
+            config={
+                "use_streaming": False,
+                "max_retries": 0,
+                "default_model": model,
+                "enable_1m_context": enable_1m_context,
+            },
+        )
+
+    def test_sonnet_45_enable_1m_warns_at_init(self, caplog):
+        """Sonnet 4.5 + enable_1m_context=True → retirement warning at __init__."""
+        with caplog.at_level(logging.WARNING):
+            self._make("claude-sonnet-4-5-20250929", enable_1m_context=True)
+        assert any("1M context window" in r.message for r in caplog.records), (
+            "Expected 1M context retirement warning for Sonnet 4.5"
+        )
+        assert any("context-1m-2025-08-07" in r.message for r in caplog.records)
+
+    def test_opus_45_enable_1m_warns_at_init(self, caplog):
+        """Opus 4.5 + enable_1m_context=True → retirement warning at __init__."""
+        with caplog.at_level(logging.WARNING):
+            self._make("claude-opus-4-5-20251101", enable_1m_context=True)
+        assert any("1M context window" in r.message for r in caplog.records), (
+            "Expected 1M context retirement warning for Opus 4.5"
+        )
+
+    def test_sonnet_46_no_warning(self, caplog):
+        """Sonnet 4.6+ with enable_1m_context=True does NOT warn — still supports 1M."""
+        with caplog.at_level(logging.WARNING):
+            self._make("claude-sonnet-4-6-20260101", enable_1m_context=True)
+        assert not any("1M context window" in r.message for r in caplog.records)
+
+    def test_opus_46_no_warning(self, caplog):
+        """Opus 4.6+ with enable_1m_context=True does NOT warn — still supports 1M."""
+        with caplog.at_level(logging.WARNING):
+            self._make("claude-opus-4-6-20260101", enable_1m_context=True)
+        assert not any("1M context window" in r.message for r in caplog.records)
+
+    def test_enable_1m_false_no_warning_even_retired_model(self, caplog):
+        """enable_1m_context=False suppresses the warning even for a retired model."""
+        with caplog.at_level(logging.WARNING):
+            self._make("claude-sonnet-4-5-20250929", enable_1m_context=False)
+        assert not any("1M context window" in r.message for r in caplog.records)
+
+    def test_haiku_never_warned(self, caplog):
+        """Haiku models are unaffected — the warning only covers Sonnet/Opus."""
+        with caplog.at_level(logging.WARNING):
+            self._make("claude-haiku-4-5-20251001", enable_1m_context=True)
+        assert not any("1M context window" in r.message for r in caplog.records)
+
+    def test_unknown_sonnet_version_no_warning(self, caplog):
+        """Unknown sonnet version (0, 0) is treated conservatively — no false warning."""
+        with caplog.at_level(logging.WARNING):
+            self._make("claude-sonnet-futuristic", enable_1m_context=True)
+        assert not any("1M context window" in r.message for r in caplog.records)
+
+    def test_warning_message_includes_model_and_cap_window(self, caplog):
+        """Warning message names the model and reports its base context window."""
+        model = "claude-sonnet-4-5-20250929"
+        with caplog.at_level(logging.WARNING):
+            self._make(model, enable_1m_context=True)
+        msgs = [r.message for r in caplog.records if "1M context window" in r.message]
+        assert msgs, "No 1M context retirement warning found"
+        assert model in msgs[0], "Warning should name the model"
+        assert "200000" in msgs[0], "Warning should include the base context window size"

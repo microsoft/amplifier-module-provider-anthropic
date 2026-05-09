@@ -207,8 +207,8 @@ FALLBACK_STATE_VERSION = 1
 # ---------------------------------------------------------------------------
 # Deprecated model retirement dates — warn once per process per model
 # ---------------------------------------------------------------------------
+# Note: claude-3-haiku-20240307 (retired 2026-04-19) removed from this table — fully past retirement.
 _DEPRECATED_MODELS: dict[str, str] = {
-    "claude-3-haiku-20240307": "2026-04-19",
     "claude-sonnet-4-20250514": "2026-06-15",
     "claude-opus-4-20250514": "2026-06-15",
 }
@@ -498,6 +498,21 @@ class AnthropicProvider:
         self._enable_1m_context = self._config_bool(
             self.config.get("enable_1m_context", True)
         )
+        if self._enable_1m_context:
+            family = self._detect_family(self.default_model)
+            major, minor = self._detect_version(self.default_model, family)
+            version = (major, minor)
+            retired_sonnet = family == "sonnet" and version != (0, 0) and version < (4, 6)
+            retired_opus = family == "opus" and version != (0, 0) and version < (4, 6)
+            if retired_sonnet or retired_opus:
+                logger.warning(
+                    "[PROVIDER] enable_1m_context is set but %s no longer supports the "
+                    "1M context window — context-1m-2025-08-07 was retired by Anthropic "
+                    "on 2026-04-30 for models before Sonnet/Opus 4.6. Sessions are capped "
+                    "at %s tokens. Migrate to claude-sonnet-4-6 or claude-opus-4-6 for 1M context.",
+                    self.default_model,
+                    self._default_caps.base_context_window,
+                )
         self._fallback_sonnet_model = str(
             self.config.get("fallback_sonnet_model", "claude-sonnet-4-6")
         )
@@ -1085,12 +1100,16 @@ class AnthropicProvider:
         version = (major, minor)
 
         # Send the 1M beta header for known 1M-capable versions and unknown
-        # versions (forward-compat).  The header is harmless on models where
-        # 1M context is already GA (e.g. Opus 4.7+), but omitting it breaks
-        # models that still need it.
+        # versions (forward-compat).  The header is harmless on GA models
+        # (Sonnet 4.6+, Opus 4.6+). It was retired for Sonnet 4.0 and 4.5 on
+        # 2026-04-30; those models now hard-cap at 200k.
         if family == "opus":
             return version == (0, 0) or version >= (4, 6)
-        return family == "sonnet" and (version == (0, 0) or version >= (4, 0))
+        # context-1m-2025-08-07 was retired by Anthropic on 2026-04-30 for Sonnet 4.0 and 4.5.
+        # The header now has no effect on those models; any context exceeding 200k returns a 400.
+        # Only send for Sonnet 4.6+ (where 1M is GA and the header is still accepted) or unknown
+        # versions for forward-compat.
+        return family == "sonnet" and (version == (0, 0) or version >= (4, 6))
 
     def _should_add_interleaved_beta(
         self,
@@ -1104,6 +1123,9 @@ class AnthropicProvider:
             return False
         if request_caps.family == "haiku":
             return False
+        # Opus 4.6+ (and any model with supports_adaptive_thinking=True) using adaptive
+        # thinking already handles tool-use interleaving natively — the beta header must
+        # NOT be sent or the API returns a 400 conflict error.
         if (
             resolved_thinking_type == "adaptive"
             and request_caps.supports_adaptive_thinking
