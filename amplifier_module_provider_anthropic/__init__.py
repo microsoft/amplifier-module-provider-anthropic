@@ -2335,6 +2335,14 @@ class AnthropicProvider:
                     request_id = str(uuid.uuid4())
                     block_sequences: dict[int, int] = {}
                     block_types: dict[int, str] = {}
+                    # Per-block content accumulator: maps block_index →
+                    # assembled block dict.  Populated during start/delta
+                    # events so that content_block:end can include the full
+                    # block payload.  The atomic renderer (hooks-streaming-ui)
+                    # reads block.get("thinking") / block.get("text") to
+                    # paint the formatted bordered block after the transient
+                    # Live region clears.
+                    block_contents: dict[int, dict[str, Any]] = {}
                     partial_emitted = False
                     hooks_available = self.coordinator and hasattr(
                         self.coordinator, "hooks"
@@ -2357,6 +2365,38 @@ class AnthropicProvider:
                                             else "text"
                                         )
                                         block_types[idx] = btype
+                                        # Initialise the content accumulator
+                                        # for this block.  Each block type
+                                        # gets the right empty fields so
+                                        # content_block:end can deliver a
+                                        # complete block dict regardless of
+                                        # whether any deltas arrive.
+                                        if btype == "thinking":
+                                            block_contents[idx] = {
+                                                "type": "thinking",
+                                                "thinking": "",
+                                            }
+                                        elif btype == "tool_use":
+                                            block_contents[idx] = {
+                                                "type": "tool_use",
+                                                "name": (
+                                                    getattr(block, "name", "") or ""
+                                                    if block is not None
+                                                    else ""
+                                                ),
+                                                "id": (
+                                                    getattr(block, "id", "") or ""
+                                                    if block is not None
+                                                    else ""
+                                                ),
+                                                "input": {},
+                                            }
+                                        else:
+                                            # text and any other future types
+                                            block_contents[idx] = {
+                                                "type": btype,
+                                                "text": "",
+                                            }
                                         if hooks_available:
                                             payload: dict[str, Any] = {
                                                 "request_id": request_id,
@@ -2385,6 +2425,16 @@ class AnthropicProvider:
                                         dtype = getattr(delta, "type", "")
                                         if dtype == "text_delta":
                                             text = getattr(delta, "text", "") or ""
+                                            # Accumulate into block_contents
+                                            # before emitting so that if a
+                                            # downstream handler inspects the
+                                            # block on the delta event it
+                                            # already has up-to-date content.
+                                            if idx in block_contents:
+                                                block_contents[idx]["text"] = (
+                                                    block_contents[idx].get("text", "")
+                                                    + text
+                                                )
                                             if text and hooks_available:
                                                 await self.coordinator.hooks.emit(
                                                     "content_block:delta",
@@ -2400,6 +2450,14 @@ class AnthropicProvider:
                                             text = (
                                                 getattr(delta, "thinking", "") or ""
                                             )
+                                            # Accumulate into block_contents.
+                                            if idx in block_contents:
+                                                block_contents[idx]["thinking"] = (
+                                                    block_contents[idx].get(
+                                                        "thinking", ""
+                                                    )
+                                                    + text
+                                                )
                                             if text and hooks_available:
                                                 await self.coordinator.hooks.emit(
                                                     "thinking:delta",
@@ -2422,13 +2480,21 @@ class AnthropicProvider:
                                         if idx is None:
                                             continue
                                         if hooks_available:
+                                            btype_end = block_types.get(idx, "text")
                                             await self.coordinator.hooks.emit(
                                                 "content_block:end",
                                                 {
                                                     "request_id": request_id,
                                                     "block_index": idx,
-                                                    "block_type": block_types.get(
-                                                        idx, "text"
+                                                    "block_type": btype_end,
+                                                    # Include the fully-assembled
+                                                    # block dict so that the atomic
+                                                    # renderer can display thinking
+                                                    # / text content after the
+                                                    # transient Live region clears.
+                                                    "block": block_contents.get(
+                                                        idx,
+                                                        {"type": btype_end},
                                                     ),
                                                 },
                                             )
