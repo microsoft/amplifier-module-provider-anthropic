@@ -49,6 +49,7 @@ def _make_response(
     output_tokens: int,
     cache_read_input_tokens: int = 0,
     cache_creation_input_tokens: int = 0,
+    speed: str | None = None,
 ) -> MagicMock:
     """Build a fake Anthropic API response for testing _convert_to_chat_response."""
     response = MagicMock()
@@ -59,6 +60,7 @@ def _make_response(
     response.usage.output_tokens = output_tokens
     response.usage.cache_read_input_tokens = cache_read_input_tokens
     response.usage.cache_creation_input_tokens = cache_creation_input_tokens
+    response.usage.speed = speed
     return response
 
 
@@ -266,4 +268,42 @@ def test_no_multiplier_when_speed_standard():
     no_speed = compute_cost("claude-opus-4-8", input_tokens=1_000_000, speed=None)
     assert no_speed == Decimal("5.00"), (
         f"Expected Decimal('5.00') for speed=None, got {no_speed!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (q) Integration: _convert_to_chat_response applies fast multiplier from response speed
+# ---------------------------------------------------------------------------
+def test_convert_applies_fast_multiplier_from_response_speed():
+    """response.usage.speed='fast' on claude-opus-4-8 with 1M input tokens → cost_usd == Decimal('10.00')."""
+    provider = _make_provider()
+    response = _make_response(
+        model="claude-opus-4-8",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        speed="fast",
+    )
+    result = provider._convert_to_chat_response(response)
+    assert result.usage is not None
+    assert result.usage.cost_usd == Decimal("10.00"), (
+        f"Expected Decimal('10.00') for speed='fast' on claude-opus-4-8, got {result.usage.cost_usd!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (r) Integration: _convert_to_chat_response does NOT apply multiplier for speed='standard'
+# ---------------------------------------------------------------------------
+def test_convert_no_multiplier_for_standard_speed():
+    """response.usage.speed='standard' on claude-opus-4-8 with 1M input tokens → cost_usd == Decimal('5.00')."""
+    provider = _make_provider()
+    response = _make_response(
+        model="claude-opus-4-8",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        speed="standard",
+    )
+    result = provider._convert_to_chat_response(response)
+    assert result.usage is not None
+    assert result.usage.cost_usd == Decimal("5.00"), (
+        f"Expected Decimal('5.00') for speed='standard' on claude-opus-4-8, got {result.usage.cost_usd!r}"
     )

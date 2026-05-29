@@ -426,3 +426,36 @@ class TestTemperatureOverride:
 
         params = _get_api_params(provider.client.messages.with_raw_response.create)
         assert params["temperature"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Speed config plumbing — end-to-end request param and beta header
+# ---------------------------------------------------------------------------
+
+
+class TestSpeedConfigEndToEnd:
+    def test_speed_fast_config_sends_speed_param_and_beta_header(self):
+        """config speed='fast' + claude-opus-4-8 → params['speed']=='fast' and fast-mode beta header."""
+        provider = AnthropicProvider(
+            api_key="test-key",
+            config={
+                "use_streaming": False,
+                "max_retries": 0,
+                "default_model": "claude-opus-4-8",
+                "speed": "fast",
+            },
+        )
+        provider.coordinator = cast(ModuleCoordinator, FakeCoordinator())
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+        )
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params.get("speed") == "fast"
+        beta_header = params.get("extra_headers", {}).get("anthropic-beta", "")
+        assert "fast-mode-2026-02-01" in beta_header

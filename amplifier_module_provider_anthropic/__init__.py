@@ -200,6 +200,7 @@ async def _get_process_semaphore(max_concurrent: int) -> asyncio.Semaphore | Non
 BETA_HEADER_1M_CONTEXT = "context-1m-2025-08-07"
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
 BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
+BETA_HEADER_FAST_MODE = "fast-mode-2026-02-01"
 PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
 FALLBACK_STATE_VERSION = 1
@@ -1138,6 +1139,7 @@ class AnthropicProvider:
         tools_present: bool,
         resolved_thinking_type: str | None,
         has_task_budget: bool = False,
+        fast_mode: bool = False,
     ) -> list[str]:
         """Build the anthropic-beta header set for a specific effective model."""
         headers = list(self._beta_headers)
@@ -1151,6 +1153,8 @@ class AnthropicProvider:
             headers.append(BETA_HEADER_INTERLEAVED_THINKING)
         if has_task_budget:
             headers.append(BETA_HEADER_TASK_BUDGETS)
+        if fast_mode:
+            headers.append(BETA_HEADER_FAST_MODE)
         return self._dedupe_headers(headers)
 
     @staticmethod
@@ -2271,6 +2275,25 @@ class AnthropicProvider:
                     params["model"],
                 )
 
+        # Speed parameter (Opus 4.8+): inject into API params when model supports it.
+        # Mirrors the supports_sampling pattern — if unsupported, log warning and omit.
+        fast_mode_enabled = False
+        speed = self.config.get("speed")
+        if speed is not None:
+            if request_caps.supports_speed:
+                params["speed"] = speed
+                fast_mode_enabled = speed == "fast"
+                logger.info(
+                    "[PROVIDER] speed=%s for %s",
+                    speed,
+                    params["model"],
+                )
+            else:
+                logger.warning(
+                    "[PROVIDER] Model %s does not support the speed parameter — omitting",
+                    params["model"],
+                )
+
         # Add stop_sequences if specified
         if stop_sequences := kwargs.get("stop_sequences"):
             params["stop_sequences"] = stop_sequences
@@ -2281,6 +2304,7 @@ class AnthropicProvider:
             tools_present=bool(params.get("tools")),
             resolved_thinking_type=resolved_thinking_type,
             has_task_budget=has_task_budget,
+            fast_mode=fast_mode_enabled,
         )
         if request_beta_headers:
             extra_headers = dict(params.get("extra_headers", {}))
@@ -3409,6 +3433,7 @@ class AnthropicProvider:
                 response.usage, "cache_creation_input_tokens", 0
             )
             or 0,
+            speed=getattr(response.usage, "speed", None),
         )
         usage = usage.model_copy(update={"cost_usd": cost})
         self._add_cost(cost)
