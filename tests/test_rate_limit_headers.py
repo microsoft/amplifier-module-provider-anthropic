@@ -169,6 +169,62 @@ class TestAllHeadersTogether:
         assert info == {"input_tokens_remaining": 800000}
 
 
+class TestFastModeInputTokenHeaders:
+    """Verify fast-mode input token headers are parsed into fast_input_tokens_* keys."""
+
+    def test_fast_input_tokens_remaining_and_limit(self):
+        provider = _make_provider()
+        headers = {
+            "anthropic-fast-input-tokens-remaining": "500000",
+            "anthropic-fast-input-tokens-limit": "1000000",
+        }
+        info = provider._extract_rate_limit_headers(headers)
+        assert info["fast_input_tokens_remaining"] == 500000
+        assert info["fast_input_tokens_limit"] == 1000000
+
+    def test_fast_input_tokens_reset(self):
+        provider = _make_provider()
+        headers = {
+            "anthropic-fast-input-tokens-reset": "2026-05-29T12:00:00Z",
+        }
+        info = provider._extract_rate_limit_headers(headers)
+        assert info["fast_input_tokens_reset"] == "2026-05-29T12:00:00Z"
+
+
+class TestFastModeOutputTokenHeaders:
+    """Verify fast-mode output token headers are parsed into fast_output_tokens_* keys."""
+
+    def test_fast_output_tokens_remaining_and_limit(self):
+        provider = _make_provider()
+        headers = {
+            "anthropic-fast-output-tokens-remaining": "40000",
+            "anthropic-fast-output-tokens-limit": "50000",
+        }
+        info = provider._extract_rate_limit_headers(headers)
+        assert info["fast_output_tokens_remaining"] == 40000
+        assert info["fast_output_tokens_limit"] == 50000
+
+    def test_fast_output_tokens_reset(self):
+        provider = _make_provider()
+        headers = {
+            "anthropic-fast-output-tokens-reset": "2026-05-29T12:00:00Z",
+        }
+        info = provider._extract_rate_limit_headers(headers)
+        assert info["fast_output_tokens_reset"] == "2026-05-29T12:00:00Z"
+
+    def test_fast_headers_absent_when_not_present(self):
+        """Fast-mode fields should not appear in dict when headers are absent."""
+        provider = _make_provider()
+        headers = {
+            "anthropic-ratelimit-requests-remaining": "95",
+        }
+        info = provider._extract_rate_limit_headers(headers)
+        assert "fast_input_tokens_remaining" not in info
+        assert "fast_input_tokens_limit" not in info
+        assert "fast_output_tokens_remaining" not in info
+        assert "fast_output_tokens_limit" not in info
+
+
 class TestHeaderParsingEdgeCases:
     """Edge cases for header value parsing."""
 

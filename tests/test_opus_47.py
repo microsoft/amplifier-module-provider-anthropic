@@ -266,8 +266,9 @@ class TestBetaHeader1MFix:
     def test_opus_47_gets_1m_header(self):
         assert self._check("claude-opus-4-7-20260416") is True
 
-    def test_opus_unknown_gets_1m_header(self):
-        assert self._check("claude-opus-latest") is True
+    def test_opus_unknown_no_1m_header(self):
+        # Unknown opus versions assume latest (4.8+) where 1M is GA — no header needed.
+        assert self._check("claude-opus-latest") is False
 
     def test_opus_45_no_1m_header(self):
         assert self._check("claude-opus-4-5-20251101") is False

@@ -132,6 +132,40 @@ class TestRateLimitStateDataclass:
         state.update_from_headers({"unknown_key": 42, "requests_remaining": 5})
         assert state.requests_remaining == 5
 
+    def test_fast_mode_fields_start_none(self):
+        """Fast-mode fields should all be None on creation."""
+        from amplifier_module_provider_anthropic import _RateLimitState
+
+        state = _RateLimitState()
+        assert state.fast_input_tokens_remaining is None
+        assert state.fast_input_tokens_limit is None
+        assert state.fast_input_tokens_reset is None
+        assert state.fast_output_tokens_remaining is None
+        assert state.fast_output_tokens_limit is None
+        assert state.fast_output_tokens_reset is None
+
+    def test_update_from_headers_fast_mode(self):
+        """update_from_headers should set fast-mode fields from parsed dict."""
+        from amplifier_module_provider_anthropic import _RateLimitState
+
+        state = _RateLimitState()
+        state.update_from_headers(
+            {
+                "fast_input_tokens_remaining": 500000,
+                "fast_input_tokens_limit": 1000000,
+                "fast_input_tokens_reset": "2026-05-29T12:00:00Z",
+                "fast_output_tokens_remaining": 40000,
+                "fast_output_tokens_limit": 50000,
+                "fast_output_tokens_reset": "2026-05-29T12:01:00Z",
+            }
+        )
+        assert state.fast_input_tokens_remaining == 500000
+        assert state.fast_input_tokens_limit == 1000000
+        assert state.fast_input_tokens_reset == "2026-05-29T12:00:00Z"
+        assert state.fast_output_tokens_remaining == 40000
+        assert state.fast_output_tokens_limit == 50000
+        assert state.fast_output_tokens_reset == "2026-05-29T12:01:00Z"
+
 
 class TestMostConstrainedRatio:
     def test_no_data_returns_1(self):
@@ -194,6 +228,38 @@ class TestMostConstrainedRatio:
         ratio, dimension, _, _, _ = state.most_constrained_ratio()
         assert ratio == 1.0
         assert dimension == "unknown"
+
+    def test_fast_dims_considered_when_present(self):
+        """most_constrained_ratio should pick a fast dimension when it's most constrained."""
+        from amplifier_module_provider_anthropic import _RateLimitState
+
+        state = _RateLimitState()
+        # requests: 50/100 = 0.5
+        state.requests_remaining = 50
+        state.requests_limit = 100
+        # fast_input: 100/1000000 = 0.0001 (most constrained)
+        state.fast_input_tokens_remaining = 100
+        state.fast_input_tokens_limit = 1000000
+        state.fast_input_tokens_reset = "2026-05-29T12:00:00Z"
+
+        ratio, dimension, remaining, limit, reset = state.most_constrained_ratio()
+        assert ratio == pytest.approx(0.0001)
+        assert dimension == "fast_input_tokens"
+        assert remaining == 100
+        assert limit == 1000000
+        assert reset == "2026-05-29T12:00:00Z"
+
+    def test_fast_dims_ignored_when_none(self):
+        """Fast dimensions with None remaining/limit should not affect ratio."""
+        from amplifier_module_provider_anthropic import _RateLimitState
+
+        state = _RateLimitState()
+        state.requests_remaining = 50
+        state.requests_limit = 100
+        # fast fields are None (not present)
+        ratio, dimension, _, _, _ = state.most_constrained_ratio()
+        assert ratio == pytest.approx(0.5)
+        assert dimension == "requests"
 
 
 # ---------------------------------------------------------------------------

@@ -93,6 +93,14 @@ class _RateLimitState:
     output_tokens_limit: int | None = None
     output_tokens_reset: str | None = None
 
+    # Fast-mode token dimensions (present only when fast-mode is active)
+    fast_input_tokens_remaining: int | None = None
+    fast_input_tokens_limit: int | None = None
+    fast_input_tokens_reset: str | None = None
+    fast_output_tokens_remaining: int | None = None
+    fast_output_tokens_limit: int | None = None
+    fast_output_tokens_reset: str | None = None
+
     def update_from_headers(self, rate_limit_info: dict[str, Any] | None) -> None:
         """Update state from parsed rate limit headers dict."""
         if not rate_limit_info:
@@ -107,6 +115,12 @@ class _RateLimitState:
             "output_tokens_remaining",
             "output_tokens_limit",
             "output_tokens_reset",
+            "fast_input_tokens_remaining",
+            "fast_input_tokens_limit",
+            "fast_input_tokens_reset",
+            "fast_output_tokens_remaining",
+            "fast_output_tokens_limit",
+            "fast_output_tokens_reset",
         ):
             val = rate_limit_info.get(attr)
             if val is not None:
@@ -140,6 +154,18 @@ class _RateLimitState:
                 "output_tokens_remaining",
                 "output_tokens_limit",
                 "output_tokens_reset",
+            ),
+            (
+                "fast_input_tokens",
+                "fast_input_tokens_remaining",
+                "fast_input_tokens_limit",
+                "fast_input_tokens_reset",
+            ),
+            (
+                "fast_output_tokens",
+                "fast_output_tokens_remaining",
+                "fast_output_tokens_limit",
+                "fast_output_tokens_reset",
             ),
         ):
             remaining = getattr(self, remaining_attr)
@@ -1104,12 +1130,12 @@ class AnthropicProvider:
         major, minor = self._detect_version(model_id, family)
         version = (major, minor)
 
-        # Send the 1M beta header for known 1M-capable versions and unknown
-        # versions (forward-compat).  The header is harmless on models where
-        # 1M context is already GA (e.g. Opus 4.7+), but omitting it breaks
-        # models that still need it.
         if family == "opus":
-            return version == (0, 0) or version >= (4, 6)
+            # 1M context is GA for Opus 4.8+; beta header only needed for 4.6 and 4.7.
+            # Unknown versions (0, 0) assume latest (4.8+), so no header.
+            if version == (0, 0):
+                return False
+            return (4, 6) <= version < (4, 8)
         return family == "sonnet" and (version == (0, 0) or version >= (4, 0))
 
     def _should_add_interleaved_beta(
@@ -1850,6 +1876,28 @@ class AnthropicProvider:
             info["output_tokens_limit"] = output_tokens_limit
         if output_tokens_reset is not None:
             info["output_tokens_reset"] = output_tokens_reset
+
+        # Fast-mode input token limits (present only when fast-mode is active)
+        fast_input_tokens_remaining = get_int("anthropic-fast-input-tokens-remaining")
+        fast_input_tokens_limit = get_int("anthropic-fast-input-tokens-limit")
+        fast_input_tokens_reset = get_str("anthropic-fast-input-tokens-reset")
+        if fast_input_tokens_remaining is not None:
+            info["fast_input_tokens_remaining"] = fast_input_tokens_remaining
+        if fast_input_tokens_limit is not None:
+            info["fast_input_tokens_limit"] = fast_input_tokens_limit
+        if fast_input_tokens_reset is not None:
+            info["fast_input_tokens_reset"] = fast_input_tokens_reset
+
+        # Fast-mode output token limits (present only when fast-mode is active)
+        fast_output_tokens_remaining = get_int("anthropic-fast-output-tokens-remaining")
+        fast_output_tokens_limit = get_int("anthropic-fast-output-tokens-limit")
+        fast_output_tokens_reset = get_str("anthropic-fast-output-tokens-reset")
+        if fast_output_tokens_remaining is not None:
+            info["fast_output_tokens_remaining"] = fast_output_tokens_remaining
+        if fast_output_tokens_limit is not None:
+            info["fast_output_tokens_limit"] = fast_output_tokens_limit
+        if fast_output_tokens_reset is not None:
+            info["fast_output_tokens_reset"] = fast_output_tokens_reset
 
         # Retry-after (typically only on 429)
         if retry_after := headers.get("retry-after"):
