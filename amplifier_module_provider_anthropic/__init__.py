@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from decimal import Decimal
 from threading import Lock
 from typing import Any
@@ -2304,14 +2305,122 @@ class AnthropicProvider:
                 # (Anthropic requires streaming for operations > 10 min)
                 rate_limit_info: dict[str, Any] = {}
                 if self.use_streaming:
-                    async with asyncio.timeout(self.timeout):
-                        async with self.client.messages.stream(**params) as stream:
-                            response = await stream.get_final_message()
-                            # Capture rate limit headers from stream response
-                            if hasattr(stream, "response") and stream.response:
-                                rate_limit_info = self._extract_rate_limit_headers(
-                                    stream.response.headers
-                                )
+                    # ----- Streaming path with per-token delta emission --------
+                    # We iterate the SDK's event stream rather than calling
+                    # get_final_message() directly, so we can fan each delta out
+                    # to the hook bus. The SDK still accumulates internally;
+                    # get_final_message() after the loop returns the complete
+                    # assembled Message we'd have gotten before.
+                    #
+                    # Events emitted on the hook bus (one per fragment):
+                    #   content_block:delta     for text_delta
+                    #   thinking:delta          for thinking_delta
+                    #   content_block:stream_done  once, after iteration ends,
+                    #     carrying total_blocks (distinct block_indices seen).
+                    # If the stream aborts mid-flight (timeout / disconnect /
+                    # mid-stream API error) and we already emitted at least one
+                    # delta, we also emit llm:stream_aborted before re-raising
+                    # so the renderer hook can finalize cleanly.
+                    request_id = str(uuid.uuid4())
+                    block_sequences: dict[int, int] = {}
+                    seen_block_indices: set[int] = set()
+                    partial_emitted = False
+                    hooks_available = self.coordinator and hasattr(
+                        self.coordinator, "hooks"
+                    )
+                    try:
+                        async with asyncio.timeout(self.timeout):
+                            async with self.client.messages.stream(
+                                **params
+                            ) as stream:
+                                async for event in stream:
+                                    etype = type(event).__name__
+                                    idx = getattr(event, "index", None)
+                                    if etype == "RawContentBlockStartEvent":
+                                        if idx is not None:
+                                            seen_block_indices.add(idx)
+                                    elif etype == "RawContentBlockDeltaEvent":
+                                        delta = getattr(event, "delta", None)
+                                        if delta is None or idx is None:
+                                            continue
+                                        seen_block_indices.add(idx)
+                                        seq = block_sequences.get(idx, 0)
+                                        block_sequences[idx] = seq + 1
+                                        dtype = getattr(delta, "type", "")
+                                        if dtype == "text_delta":
+                                            text = getattr(delta, "text", "") or ""
+                                            if text and hooks_available:
+                                                await self.coordinator.hooks.emit(
+                                                    "content_block:delta",
+                                                    {
+                                                        "request_id": request_id,
+                                                        "block_index": idx,
+                                                        "sequence": seq,
+                                                        "text": text,
+                                                    },
+                                                )
+                                                partial_emitted = True
+                                        elif dtype == "thinking_delta":
+                                            text = (
+                                                getattr(delta, "thinking", "") or ""
+                                            )
+                                            if text and hooks_available:
+                                                await self.coordinator.hooks.emit(
+                                                    "thinking:delta",
+                                                    {
+                                                        "request_id": request_id,
+                                                        "block_index": idx,
+                                                        "sequence": seq,
+                                                        "text": text,
+                                                    },
+                                                )
+                                                partial_emitted = True
+                                        # signature_delta and any future delta
+                                        # types are observed silently — the
+                                        # SDK still accumulates them into the
+                                        # final message.
+                                    # All other event types (RawMessageStart,
+                                    # ParsedContentBlockStop, ParsedMessageStop,
+                                    # SignatureEvent, etc.) flow through the
+                                    # SDK's internal accumulator.
+
+                                # Stream drained. Final message is now ready.
+                                response = await stream.get_final_message()
+
+                                # Signal end-of-stream so the renderer hook
+                                # can trigger the ANSI swap.
+                                if hooks_available:
+                                    await self.coordinator.hooks.emit(
+                                        "content_block:stream_done",
+                                        {
+                                            "request_id": request_id,
+                                            "total_blocks": len(seen_block_indices),
+                                        },
+                                    )
+
+                                # Capture rate limit headers from stream response
+                                if hasattr(stream, "response") and stream.response:
+                                    rate_limit_info = self._extract_rate_limit_headers(
+                                        stream.response.headers
+                                    )
+                    except Exception as e:
+                        # Mid-stream failure. If we emitted any partial output,
+                        # tell the renderer so it can finalize / drop the live
+                        # region cleanly. Then re-raise so the outer except
+                        # clauses below translate the SDK error to a kernel
+                        # error type.
+                        if partial_emitted and hooks_available:
+                            await self.coordinator.hooks.emit(
+                                "llm:stream_aborted",
+                                {
+                                    "request_id": request_id,
+                                    "error": {
+                                        "type": type(e).__name__,
+                                        "msg": str(e),
+                                    },
+                                },
+                            )
+                        raise
                 else:
                     # Use with_raw_response to access headers
                     raw_response = await asyncio.wait_for(
@@ -2667,6 +2776,17 @@ class AnthropicProvider:
 
             # Build ChatResponse first
             chat_response = self._convert_to_chat_response(response)
+
+            # Signal to the orchestrator that this provider already emitted
+            # real content_block:start/delta/end events on the hook bus.
+            # `loop-streaming` reads this and suppresses its faux start/end
+            # synthesis (which fires after `complete()` returns and would
+            # otherwise duplicate the per-block events the renderer already
+            # painted from). ChatResponse uses ConfigDict(extra="allow"), so
+            # adding `metadata` here costs nothing.
+            if self.use_streaming:
+                chat_response.metadata = chat_response.metadata or {}
+                chat_response.metadata["provider_emitted_blocks"] = True
 
             # Emit from canonical fields
             if self.coordinator and hasattr(self.coordinator, "hooks"):
