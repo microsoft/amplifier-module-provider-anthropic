@@ -164,11 +164,15 @@ def test_convert_stamps_cost_on_usage():
     )
     result = provider._convert_to_chat_response(response)
     assert result.usage is not None
-    assert result.usage.cost_usd is not None, "cost_usd should be stamped for known model"
+    assert result.usage.cost_usd is not None, (
+        "cost_usd should be stamped for known model"
+    )
     assert isinstance(result.usage.cost_usd, Decimal), (
         f"cost_usd should be Decimal, got {type(result.usage.cost_usd)}"
     )
-    assert result.usage.cost_usd > 0, f"cost_usd should be > 0, got {result.usage.cost_usd}"
+    assert result.usage.cost_usd > 0, (
+        f"cost_usd should be > 0, got {result.usage.cost_usd}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -205,4 +209,61 @@ def test_convert_leaves_cost_none_for_unknown_model():
     assert result.usage is not None
     assert result.usage.cost_usd is None, (
         f"cost_usd should be None for unknown model, got {result.usage.cost_usd!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (l) claude-opus-4-8 input cost: 1M input → $5.00
+# ---------------------------------------------------------------------------
+def test_opus_48_input_tokens_cost():
+    """claude-opus-4-8: 1M input → $5.00"""
+    result = compute_cost("claude-opus-4-8", input_tokens=1_000_000)
+    assert result == Decimal("5.00"), f"Expected Decimal('5.00'), got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# (m) claude-opus-4-8 output cost: 1M output → $25.00
+# ---------------------------------------------------------------------------
+def test_opus_48_output_tokens_cost():
+    """claude-opus-4-8: 1M output → $25.00"""
+    result = compute_cost("claude-opus-4-8", output_tokens=1_000_000)
+    assert result == Decimal("25.00"), f"Expected Decimal('25.00'), got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# (n) speed='fast' doubles cost for eligible model (claude-opus-4-8)
+# ---------------------------------------------------------------------------
+def test_fast_mode_doubles_cost_for_eligible_model():
+    """speed='fast' on claude-opus-4-8: 1M input → $5.00 base, $10.00 fast"""
+    base = compute_cost("claude-opus-4-8", input_tokens=1_000_000)
+    assert base == Decimal("5.00"), f"Expected base Decimal('5.00'), got {base!r}"
+    fast = compute_cost("claude-opus-4-8", input_tokens=1_000_000, speed="fast")
+    assert fast == Decimal("10.00"), f"Expected fast Decimal('10.00'), got {fast!r}"
+
+
+# ---------------------------------------------------------------------------
+# (o) speed='fast' does NOT apply multiplier for ineligible model
+# ---------------------------------------------------------------------------
+def test_fast_mode_no_multiplier_for_ineligible_model():
+    """speed='fast' on claude-sonnet-4-5-20250929: 1M input stays at $3.00"""
+    base = compute_cost("claude-sonnet-4-5-20250929", input_tokens=1_000_000)
+    assert base == Decimal("3.00"), f"Expected base Decimal('3.00'), got {base!r}"
+    fast = compute_cost(
+        "claude-sonnet-4-5-20250929", input_tokens=1_000_000, speed="fast"
+    )
+    assert fast == Decimal("3.00"), f"Expected fast Decimal('3.00'), got {fast!r}"
+
+
+# ---------------------------------------------------------------------------
+# (p) speed='standard' and speed=None both leave cost unchanged
+# ---------------------------------------------------------------------------
+def test_no_multiplier_when_speed_standard():
+    """speed='standard' and speed=None both leave claude-opus-4-8 1M input at $5.00"""
+    standard = compute_cost("claude-opus-4-8", input_tokens=1_000_000, speed="standard")
+    assert standard == Decimal("5.00"), (
+        f"Expected Decimal('5.00') for speed='standard', got {standard!r}"
+    )
+    no_speed = compute_cost("claude-opus-4-8", input_tokens=1_000_000, speed=None)
+    assert no_speed == Decimal("5.00"), (
+        f"Expected Decimal('5.00') for speed=None, got {no_speed!r}"
     )

@@ -104,6 +104,15 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_write_per_m": Decimal("6.25"),
     },
     # ------------------------------------------------------------------
+    # Claude Opus 4.8  ($5 / $25 / $0.50 / $6.25)
+    # ------------------------------------------------------------------
+    "claude-opus-4-8": {
+        "input_per_m": Decimal("5.00"),
+        "output_per_m": Decimal("25.00"),
+        "cache_read_per_m": Decimal("0.50"),
+        "cache_write_per_m": Decimal("6.25"),
+    },
+    # ------------------------------------------------------------------
     # Claude Haiku 3.5  ($0.80 / $4.00 / $0.08 / $1.00)
     # ------------------------------------------------------------------
     "claude-haiku-3-5-20250929": {
@@ -150,6 +159,17 @@ _RATES: dict[str, dict[str, Decimal]] = {
     },
 }
 
+# Models for which the 2x fast-mode multiplier applies when speed=='fast'.
+# The 2x cost multiplier is applied ONLY when BOTH the response confirms
+# speed=='fast' AND the model is listed here — this prevents a silent API
+# fallback to standard speed (or misconfigured caller) from inflating
+# tracked cost.
+_FAST_ELIGIBLE_MODELS: set[str] = {
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+}
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -163,6 +183,7 @@ def compute_cost(
     output_tokens: int = 0,
     cache_read_input_tokens: int = 0,
     cache_creation_input_tokens: int = 0,
+    speed: str | None = None,
 ) -> Decimal | None:
     """Return the USD cost for an Anthropic API call as a :class:`~decimal.Decimal`.
 
@@ -181,6 +202,9 @@ def compute_cost(
     cache_creation_input_tokens:
         Tokens written to the prompt cache (slightly more expensive than
         fresh input).
+    speed:
+        When ``'fast'`` AND *model* is in :data:`_FAST_ELIGIBLE_MODELS` a 2x
+        multiplier is applied; any other value leaves cost unchanged.
 
     Returns
     -------
@@ -204,5 +228,8 @@ def compute_cost(
         cost += (
             Decimal(cache_creation_input_tokens) * rates["cache_write_per_m"] / _PER_M
         )
+
+    if speed == "fast" and model in _FAST_ELIGIBLE_MODELS:
+        cost *= 2
 
     return cost
