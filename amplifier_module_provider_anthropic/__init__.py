@@ -2305,25 +2305,36 @@ class AnthropicProvider:
                 # (Anthropic requires streaming for operations > 10 min)
                 rate_limit_info: dict[str, Any] = {}
                 if self.use_streaming:
-                    # ----- Streaming path with per-token delta emission --------
+                    # ----- Streaming path with per-block event emission --------
                     # We iterate the SDK's event stream rather than calling
-                    # get_final_message() directly, so we can fan each delta out
-                    # to the hook bus. The SDK still accumulates internally;
-                    # get_final_message() after the loop returns the complete
-                    # assembled Message we'd have gotten before.
+                    # get_final_message() directly, so we can emit the full
+                    # block lifecycle (start/delta/end) on the hook bus. The
+                    # SDK still accumulates internally; get_final_message()
+                    # after the loop returns the complete assembled Message.
                     #
-                    # Events emitted on the hook bus (one per fragment):
-                    #   content_block:delta     for text_delta
-                    #   thinking:delta          for thinking_delta
-                    #   content_block:stream_done  once, after iteration ends,
-                    #     carrying total_blocks (distinct block_indices seen).
+                    # Events emitted on the hook bus, per content block:
+                    #   content_block:start  when a new block begins (with
+                    #                        block_type so the renderer knows
+                    #                        to open a Live region or print a
+                    #                        placeholder)
+                    #   content_block:delta  for each text_delta fragment
+                    #   thinking:delta       for each thinking_delta fragment
+                    #   content_block:end    when the block completes
+                    #
+                    # The block lifecycle events bound a "transient region" in
+                    # the renderer (v2 design — Rich Live for parent flavor,
+                    # line-buffer for sub-agent flavor). On content_block:end
+                    # the renderer clears its transient and the existing atomic
+                    # handler paints the final formatted block.
+                    #
                     # If the stream aborts mid-flight (timeout / disconnect /
                     # mid-stream API error) and we already emitted at least one
                     # delta, we also emit llm:stream_aborted before re-raising
-                    # so the renderer hook can finalize cleanly.
+                    # so the renderer hook can close any open Live regions
+                    # cleanly.
                     request_id = str(uuid.uuid4())
                     block_sequences: dict[int, int] = {}
-                    seen_block_indices: set[int] = set()
+                    block_types: dict[int, str] = {}
                     partial_emitted = False
                     hooks_available = self.coordinator and hasattr(
                         self.coordinator, "hooks"
@@ -2337,13 +2348,38 @@ class AnthropicProvider:
                                     etype = type(event).__name__
                                     idx = getattr(event, "index", None)
                                     if etype == "RawContentBlockStartEvent":
-                                        if idx is not None:
-                                            seen_block_indices.add(idx)
+                                        if idx is None:
+                                            continue
+                                        block = getattr(event, "content_block", None)
+                                        btype = (
+                                            getattr(block, "type", "text")
+                                            if block is not None
+                                            else "text"
+                                        )
+                                        block_types[idx] = btype
+                                        if hooks_available:
+                                            payload: dict[str, Any] = {
+                                                "request_id": request_id,
+                                                "block_index": idx,
+                                                "block_type": btype,
+                                            }
+                                            # Tool-use blocks carry a name we
+                                            # surface so the renderer's
+                                            # placeholder (decision A in v2)
+                                            # can show "Building tool call:
+                                            # <name>..." immediately.
+                                            if btype == "tool_use" and block is not None:
+                                                name = getattr(block, "name", None)
+                                                if name:
+                                                    payload["name"] = name
+                                            await self.coordinator.hooks.emit(
+                                                "content_block:start",
+                                                payload,
+                                            )
                                     elif etype == "RawContentBlockDeltaEvent":
                                         delta = getattr(event, "delta", None)
                                         if delta is None or idx is None:
                                             continue
-                                        seen_block_indices.add(idx)
                                         seq = block_sequences.get(idx, 0)
                                         block_sequences[idx] = seq + 1
                                         dtype = getattr(delta, "type", "")
@@ -2379,24 +2415,30 @@ class AnthropicProvider:
                                         # types are observed silently — the
                                         # SDK still accumulates them into the
                                         # final message.
+                                    elif etype in (
+                                        "ParsedContentBlockStopEvent",
+                                        "RawContentBlockStopEvent",
+                                    ):
+                                        if idx is None:
+                                            continue
+                                        if hooks_available:
+                                            await self.coordinator.hooks.emit(
+                                                "content_block:end",
+                                                {
+                                                    "request_id": request_id,
+                                                    "block_index": idx,
+                                                    "block_type": block_types.get(
+                                                        idx, "text"
+                                                    ),
+                                                },
+                                            )
                                     # All other event types (RawMessageStart,
-                                    # ParsedContentBlockStop, ParsedMessageStop,
-                                    # SignatureEvent, etc.) flow through the
-                                    # SDK's internal accumulator.
+                                    # ParsedMessageStop, SignatureEvent, etc.)
+                                    # flow through the SDK's internal
+                                    # accumulator and are not surfaced.
 
                                 # Stream drained. Final message is now ready.
                                 response = await stream.get_final_message()
-
-                                # Signal end-of-stream so the renderer hook
-                                # can trigger the ANSI swap.
-                                if hooks_available:
-                                    await self.coordinator.hooks.emit(
-                                        "content_block:stream_done",
-                                        {
-                                            "request_id": request_id,
-                                            "total_blocks": len(seen_block_indices),
-                                        },
-                                    )
 
                                 # Capture rate limit headers from stream response
                                 if hasattr(stream, "response") and stream.response:
@@ -2405,8 +2447,8 @@ class AnthropicProvider:
                                     )
                     except Exception as e:
                         # Mid-stream failure. If we emitted any partial output,
-                        # tell the renderer so it can finalize / drop the live
-                        # region cleanly. Then re-raise so the outer except
+                        # tell the renderer so it can close any open Live
+                        # regions cleanly. Then re-raise so the outer except
                         # clauses below translate the SDK error to a kernel
                         # error type.
                         if partial_emitted and hooks_available:
