@@ -117,6 +117,44 @@ class TestGetCapabilitiesOpus:
         assert caps.default_thinking_budget + buffer <= caps.max_output_tokens
 
 
+class TestGetCapabilitiesOpus48:
+    """Tests for Opus 4.8 capabilities — is_48_plus gate, speed/inline_system flags, max effort."""
+
+    def test_opus_48_supports_speed(self):
+        """Opus 4.8 accepts the speed parameter."""
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-8")
+        assert caps.supports_speed is True
+
+    def test_opus_48_supports_inline_system(self):
+        """Opus 4.8 accepts role='system' in messages[]."""
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-8")
+        assert caps.supports_inline_system is True
+
+    def test_opus_48_has_max_effort(self):
+        """Opus 4.8 has 'max' effort tier and the full effort tuple."""
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-8")
+        assert "max" in caps.supported_efforts
+        assert caps.supported_efforts == ("low", "medium", "high", "xhigh", "max")
+
+    def test_opus_47_does_not_support_speed(self):
+        """Opus 4.7 does NOT accept the speed parameter."""
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
+        assert caps.supports_speed is False
+        assert caps.supports_inline_system is False
+
+    def test_opus_47_no_max_effort(self):
+        """Opus 4.7 does not have the 'max' effort tier."""
+        caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
+        assert "max" not in caps.supported_efforts
+        assert caps.supported_efforts == ("low", "medium", "high", "xhigh")
+
+    def test_opus_unknown_version_assumes_48(self):
+        """Unknown opus version (e.g. claude-opus-latest) assumes 4.8 for forward compatibility."""
+        caps = AnthropicProvider._get_capabilities("claude-opus-latest")
+        assert caps.supports_speed is True
+        assert "max" in caps.supported_efforts
+
+
 class TestGetCapabilitiesSonnet:
     """Tests for Sonnet model capabilities (should be unaffected by fix)."""
 

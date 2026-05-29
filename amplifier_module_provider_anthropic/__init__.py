@@ -255,6 +255,10 @@ class ModelCapabilities:
         False  # True = model accepts output_config.task_budget (beta)
     )
     default_thinking_budget: int = 0
+    supports_speed: bool = False  # True = model accepts the speed parameter
+    supports_inline_system: bool = (
+        False  # True = model accepts role='system' in messages[]
+    )
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
 
 
@@ -360,7 +364,15 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_contributor(
         "session.cost",
         "provider-anthropic",
-        lambda: {"cost_usd": str(_totals["cost_usd"]) if _totals["cost_usd"] is not None else None} if _totals["has_data"] else None,
+        lambda: (
+            {
+                "cost_usd": str(_totals["cost_usd"])
+                if _totals["cost_usd"] is not None
+                else None
+            }
+            if _totals["has_data"]
+            else None
+        ),
     )
     logger.info("Mounted AnthropicProvider")
 
@@ -877,6 +889,7 @@ class AnthropicProvider:
         if family == "opus":
             is_46_plus = not version_known or (major, minor) >= (4, 6)
             is_47_plus = not version_known or (major, minor) >= (4, 7)
+            is_48_plus = not version_known or (major, minor) >= (4, 8)
             return ModelCapabilities(
                 family="opus",
                 max_output_tokens=128000 if is_46_plus else 64000,
@@ -889,10 +902,14 @@ class AnthropicProvider:
                 supports_sampling=not is_47_plus,
                 thinking_display_required=is_47_plus,
                 supported_efforts=(
-                    ("low", "medium", "high", "xhigh")
+                    ("low", "medium", "high", "xhigh", "max")
+                    if is_48_plus
+                    else ("low", "medium", "high", "xhigh")
                     if is_47_plus
                     else ("low", "medium", "high")
                 ),
+                supports_speed=is_48_plus,
+                supports_inline_system=is_48_plus,
                 default_thinking_budget=64000 if is_46_plus else 32000,
                 capability_tags=(
                     "tools",
@@ -1035,6 +1052,8 @@ class AnthropicProvider:
             supports_sampling=base_caps.supports_sampling,
             thinking_display_required=base_caps.thinking_display_required,
             supported_efforts=base_caps.supported_efforts,
+            supports_speed=base_caps.supports_speed,
+            supports_inline_system=base_caps.supports_inline_system,
             default_thinking_budget=default_thinking_budget,
             capability_tags=tuple(capability_tags),
         )
