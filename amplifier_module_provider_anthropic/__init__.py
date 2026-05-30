@@ -2304,7 +2304,19 @@ class AnthropicProvider:
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
                 rate_limit_info: dict[str, Any] = {}
-                if self.use_streaming:
+
+                # Per-request non-streaming override via request.metadata:
+                #   metadata={"stream": False}
+                # Callers (e.g. session-naming background tasks) that must NOT
+                # emit llm:stream_* events set this flag.  It overrides
+                # self.use_streaming for this single call only — the shared
+                # provider instance's default behavior is completely unchanged.
+                _metadata = getattr(request, "metadata", None)
+                _use_streaming = self.use_streaming
+                if isinstance(_metadata, dict) and _metadata.get("stream") is False:
+                    _use_streaming = False
+
+                if _use_streaming:
                     # ----- Streaming path with per-block event emission --------
                     # We iterate the SDK's event stream rather than calling
                     # get_final_message() directly, so we can emit the full
