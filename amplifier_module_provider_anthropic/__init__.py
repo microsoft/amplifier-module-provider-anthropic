@@ -2330,8 +2330,9 @@ class AnthropicProvider:
                     #                            block_type so the renderer knows
                     #                            to open a Live region or print a
                     #                            placeholder)
-                    #   llm:stream_block_delta   for each text_delta fragment
-                    #   llm:stream_thinking_delta for each thinking_delta fragment
+                    #   llm:stream_block_delta   for each text_delta AND thinking_delta
+                    #                            fragment (block_type in payload
+                    #                            distinguishes text vs thinking)
                     #   llm:stream_block_end     when the block streaming completes
                     #
                     # These events are on a SEPARATE channel from the atomic
@@ -2404,6 +2405,9 @@ class AnthropicProvider:
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
+                                                        "block_type": block_types.get(
+                                                            idx, "text"
+                                                        ),
                                                         "sequence": seq,
                                                         "text": text,
                                                     },
@@ -2415,10 +2419,13 @@ class AnthropicProvider:
                                             )
                                             if text and hooks_available:
                                                 await self.coordinator.hooks.emit(
-                                                    "llm:stream_thinking_delta",
+                                                    "llm:stream_block_delta",
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
+                                                        "block_type": block_types.get(
+                                                            idx, "thinking"
+                                                        ),
                                                         "sequence": seq,
                                                         "text": text,
                                                     },
