@@ -48,6 +48,43 @@ config = {
 }
 ```
 
+### Reasoning Effort
+
+The `effort` config key sets a session-level default reasoning effort for every
+request, so you can opt into higher-intensity reasoning once instead of supplying
+it per-request. On Opus 4.7+ it is sent as the API's `output_config.effort`; on
+thinking-capable models it also drives the extended-thinking type/budget mapping.
+
+```yaml
+providers:
+  - module: provider-anthropic
+    config:
+      default_model: claude-opus-4-8
+      effort: xhigh
+```
+
+**Accepted values** (the complete set the Anthropic API accepts):
+
+| Value | Meaning | Availability |
+| --- | --- | --- |
+| `low` | Most token-efficient | All thinking-capable models |
+| `medium` | Balanced | All thinking-capable models |
+| `high` | Default (same as omitting `effort`) | All thinking-capable models |
+| `xhigh` | Extended capability for long-horizon agentic/coding work | Opus 4.7+ |
+| `max` | Maximum capability, no token constraints | Opus 4.8+ |
+
+**Precedence** (highest wins): per-call `effort` kwarg → `request.reasoning_effort`
+(set by the orchestrator) → this `effort` config default.
+
+**Notes**:
+- `output_config.effort` is only emitted for models that support it (Opus 4.7+).
+  On models without `output_config` support the value is ignored (a warning is
+  logged) — only the extended-thinking mapping applies there.
+- `xhigh`/`max` are silently omitted from `output_config.effort` on models whose
+  capability matrix doesn't list them, falling back to adaptive thinking.
+- This key is also exposed through `amplifier provider use` (shown for Opus
+  models), so it can be set interactively without hand-editing YAML.
+
 ### Debug Configuration
 
 **Standard Debug** (`debug: true`):

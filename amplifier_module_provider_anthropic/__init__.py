@@ -713,6 +713,22 @@ class AnthropicProvider:
                     default="true",
                 ),
                 ConfigField(
+                    id="effort",
+                    display_name="Reasoning Effort",
+                    field_type="text",
+                    prompt=(
+                        "Default reasoning effort for every request "
+                        "(low, medium, high, xhigh, max). Leave blank to use the "
+                        "model default. xhigh requires Opus 4.7+, max requires "
+                        "Opus 4.8+; ignored on models without output_config support."
+                    ),
+                    required=False,
+                    requires_model=True,  # Shown after model selection
+                    show_when={
+                        "default_model": "contains:opus"
+                    },  # output_config.effort is an Opus 4.7+ surface
+                ),
+                ConfigField(
                     id="fallback_on_overload",
                     display_name="Temporary Overload Downgrade",
                     field_type="boolean",
@@ -2124,6 +2140,13 @@ class AnthropicProvider:
 
         # Phase 2: Check request.reasoning_effort when kwargs don't specify
         reasoning_effort = getattr(request, "reasoning_effort", None)
+        # Phase 3: fall back to the provider's config-level `effort` default.
+        # This lets users set effort once in their provider config
+        # (settings.yaml / bundle `config:` block) instead of supplying it
+        # per-request or via kwargs. Full precedence (highest wins):
+        #   kwargs["effort"] > request.reasoning_effort > config["effort"]
+        if reasoning_effort is None:
+            reasoning_effort = self.config.get("effort")
         if "extended_thinking" not in kwargs and reasoning_effort is not None:
             # reasoning_effort implies extended_thinking=True
             thinking_enabled = True
@@ -2168,6 +2191,13 @@ class AnthropicProvider:
                 effort_thinking_type = "adaptive"
                 effort_budget = request_caps.default_thinking_budget
             elif reasoning_effort == "xhigh":
+                effort_thinking_type = "adaptive"
+                effort_budget = request_caps.default_thinking_budget
+            elif reasoning_effort == "max":
+                # "max" (Opus 4.8+) uses adaptive thinking; the model removes
+                # token constraints itself. Without this branch "max" fell
+                # through to None, silently dropping back to the config/model
+                # default thinking_type rather than adaptive.
                 effort_thinking_type = "adaptive"
                 effort_budget = request_caps.default_thinking_budget
 
