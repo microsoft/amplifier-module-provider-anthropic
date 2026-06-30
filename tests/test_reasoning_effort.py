@@ -354,6 +354,133 @@ class TestReasoningEffortNone:
 
 
 # ---------------------------------------------------------------------------
+# Config-level `effort` default (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def _make_provider_with_effort(
+    effort: Any,
+    default_model: str = "claude-sonnet-4-5-20250929",
+) -> AnthropicProvider:
+    """Provider whose config carries an `effort` default."""
+    provider = AnthropicProvider(
+        api_key="test-key",
+        config={
+            "use_streaming": False,
+            "max_retries": 0,
+            "default_model": default_model,
+            "effort": effort,
+        },
+    )
+    provider.coordinator = cast(ModuleCoordinator, FakeCoordinator())
+    return provider
+
+
+class TestConfigEffortDefault:
+    """config['effort'] is the lowest-priority source for reasoning_effort.
+
+    It follows the SAME coupling as request.reasoning_effort: a valid value
+    enables extended thinking. request.reasoning_effort wins over it; an
+    invalid config value is ignored (no thinking).
+    """
+
+    def test_config_effort_enables_thinking_when_no_request_effort(self):
+        """config effort='high' + no request effort → thinking enabled."""
+        provider = _make_provider_with_effort("high")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" in params
+
+    def test_request_effort_wins_over_config_effort(self):
+        """request.reasoning_effort='low' overrides config effort='high'."""
+        provider = _make_provider_with_effort("high")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="low",
+        )
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" in params
+        # 'low' wins → enabled + 4096; would be adaptive/default if 'high' leaked
+        assert params["thinking"]["type"] == "enabled"
+        assert params["thinking"]["budget_tokens"] == 4096
+
+    def test_invalid_config_effort_is_ignored(self):
+        """An invalid config effort (e.g. 'ultra') is ignored → no thinking."""
+        provider = _make_provider_with_effort("ultra")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" not in params
+        assert "output_config" not in params
+
+    def test_config_effort_is_case_insensitive(self):
+        """config effort='High' (mixed case / whitespace) is normalised."""
+        provider = _make_provider_with_effort("  High ")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" in params
+
+    def test_config_effort_max_on_opus_48_sets_output_config(self):
+        """config effort='max' on Opus 4.8 → output_config.effort=max + adaptive."""
+        provider = _make_provider_with_effort(
+            "max", default_model="claude-opus-4-8-20260101"
+        )
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params.get("output_config", {}).get("effort") == "max"
+        assert params["thinking"]["type"] == "adaptive"
+
+    def test_config_effort_xhigh_unsupported_on_sonnet_omits_output_config(self):
+        """config effort='xhigh' on a model that lacks output_config → omitted.
+
+        Thinking still engages (the coupling), but output_config.effort is not
+        sent because the model's capability matrix doesn't list it.
+        """
+        provider = _make_provider_with_effort(
+            "xhigh", default_model="claude-sonnet-4-5-20250929"
+        )
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "output_config" not in params
+        assert "thinking" in params
+
+
+# ---------------------------------------------------------------------------
 # Precedence / override tests
 # ---------------------------------------------------------------------------
 

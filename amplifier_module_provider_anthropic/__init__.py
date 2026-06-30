@@ -715,18 +715,25 @@ class AnthropicProvider:
                 ConfigField(
                     id="effort",
                     display_name="Reasoning Effort",
-                    field_type="text",
+                    field_type="choice",
+                    choices=["low", "medium", "high", "xhigh", "max"],
                     prompt=(
-                        "Default reasoning effort for every request "
-                        "(low, medium, high, xhigh, max). Leave blank to use the "
-                        "model default. xhigh requires Opus 4.7+, max requires "
-                        "Opus 4.8+; ignored on models without output_config support."
+                        "Default reasoning effort applied to every request. Like "
+                        "request.reasoning_effort, this ENABLES extended thinking "
+                        "and sets its depth, so it raises token cost on every call "
+                        "\u2014 leave blank unless you want stronger reasoning by default. "
+                        "low/medium/high work on all thinking-capable models; xhigh "
+                        "requires Opus 4.7+; max requires Opus 4.8+/Sonnet 4.6. "
+                        "On Opus 4.7+ it is also sent as output_config.effort. "
+                        "Unsupported values for the selected model are ignored."
                     ),
                     required=False,
                     requires_model=True,  # Shown after model selection
-                    show_when={
-                        "default_model": "contains:opus"
-                    },  # output_config.effort is an Opus 4.7+ surface
+                    # Gate on the EFFECT surface (extended thinking), not on
+                    # output_config support: effort enables/sizes thinking on
+                    # every thinking-capable model, so hide it only for models
+                    # that don't support thinking at all (pre-4.5 Haiku).
+                    show_when={"default_model": "not_contains:haiku-3"},
                 ),
                 ConfigField(
                     id="fallback_on_overload",
@@ -2141,14 +2148,40 @@ class AnthropicProvider:
         # Phase 2: Check request.reasoning_effort when kwargs don't specify
         reasoning_effort = getattr(request, "reasoning_effort", None)
         # Phase 3: fall back to the provider's config-level `effort` default.
-        # This lets users set effort once in their provider config
-        # (settings.yaml / bundle `config:` block) instead of supplying it
-        # per-request or via kwargs. Full precedence (highest wins):
-        #   kwargs["effort"] > request.reasoning_effort > config["effort"]
+        # Lets users set effort once in their provider config (settings.yaml /
+        # bundle `config:` block) instead of per-request or via kwargs.
+        #
+        # Two precedence chains are in play here and they are NOT the same:
+        #   (1) reasoning_effort — drives extended thinking (on/off + depth) and,
+        #       on Opus 4.7+, output_config.effort.  Precedence (highest wins):
+        #           request.reasoning_effort > config["effort"]
+        #   (2) kwargs["effort"] — an output_config.effort-ONLY override applied
+        #       later (see the output_config block).  It does NOT feed this
+        #       thinking path and does NOT enable thinking on its own.
         if reasoning_effort is None:
-            reasoning_effort = self.config.get("effort")
+            config_effort = self.config.get("effort")
+            if config_effort is not None:
+                # Validate/normalise the config value so a typo (e.g. "ultra",
+                # "High", "EXTRA HIGH") can't silently flip thinking on with a
+                # value the ladder/output_config don't understand.
+                normalized = str(config_effort).strip().lower()
+                valid_efforts = ("low", "medium", "high", "xhigh", "max")
+                if normalized in valid_efforts:
+                    reasoning_effort = normalized
+                else:
+                    logger.warning(
+                        "[PROVIDER] Ignoring invalid config 'effort'=%r "
+                        "(valid values: %s)",
+                        config_effort,
+                        ", ".join(valid_efforts),
+                    )
         if "extended_thinking" not in kwargs and reasoning_effort is not None:
-            # reasoning_effort implies extended_thinking=True
+            # reasoning_effort implies extended_thinking=True. This is a
+            # deliberate Amplifier mapping (commit bc026a43): the portable
+            # reasoning_effort hint enables Anthropic extended thinking, the
+            # same way OpenAI's reasoning effort engages its reasoning. effort
+            # and thinking are independent at the API level; coupling them is
+            # Amplifier's "reason harder" product semantics.
             thinking_enabled = True
 
         thinking_budget = None
@@ -2179,6 +2212,11 @@ class AnthropicProvider:
             # * On Opus 4.7+ "enabled" is intercepted → forced to "adaptive"
             #   (models without supports_manual_thinking reject type="enabled")
 
+            # NOTE: effort_budget below is DEAD on adaptive-thinking models
+            # (Opus 4.6+, Sonnet 4.6): those send thinking={"type":"adaptive"}
+            # with no budget_tokens, so the budget is discarded and the real
+            # intensity lever is output_config.effort. effort_budget only
+            # matters on manual-thinking models (e.g. Haiku 4.5, Sonnet <4.6).
             effort_thinking_type: str | None = None
             effort_budget: int | None = None
             if reasoning_effort == "low":
@@ -2194,10 +2232,12 @@ class AnthropicProvider:
                 effort_thinking_type = "adaptive"
                 effort_budget = request_caps.default_thinking_budget
             elif reasoning_effort == "max":
-                # "max" (Opus 4.8+) uses adaptive thinking; the model removes
-                # token constraints itself. Without this branch "max" fell
-                # through to None, silently dropping back to the config/model
-                # default thinking_type rather than adaptive.
+                # "max" (Opus 4.8+/Sonnet 4.6) uses adaptive thinking. This
+                # branch only changes behaviour when a user set
+                # config.thinking_type="enabled": it forces adaptive instead of
+                # inheriting "enabled". (The resolved default is already
+                # "adaptive", so without it "max" still resolves to adaptive.)
+                # The real intensity for "max" is carried by output_config.effort.
                 effort_thinking_type = "adaptive"
                 effort_budget = request_caps.default_thinking_budget
 
