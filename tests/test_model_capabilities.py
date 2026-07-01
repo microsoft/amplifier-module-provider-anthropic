@@ -375,6 +375,12 @@ class TestGetCapabilitiesSonnet5:
         caps = AnthropicProvider._get_capabilities("claude-sonnet-5")
         assert caps.supports_speed is False
 
+    def test_sonnet_5_no_sampling(self):
+        """Sonnet 5 must NOT support sampling — Anthropic rejects `temperature`
+        ("deprecated for this model"). Regression guard for amplifier-support#299."""
+        caps = AnthropicProvider._get_capabilities("claude-sonnet-5")
+        assert caps.supports_sampling is False
+
     def test_sonnet_46_unchanged_by_sonnet5_gate(self):
         """Regression guard: Sonnet 4.6 keeps default efforts and no output_config."""
         caps = AnthropicProvider._get_capabilities("claude-sonnet-4-6")
