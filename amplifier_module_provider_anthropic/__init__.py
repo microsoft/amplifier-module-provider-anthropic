@@ -991,6 +991,9 @@ class AnthropicProvider:
                 supports_output_config=is_5_plus,
                 supports_task_budget=is_5_plus,
                 thinking_display_required=is_5_plus,
+                # Sonnet 5 rejects `temperature` ("deprecated for this model");
+                # omit it, matching the Opus 4.7+ pattern. amplifier-support#299.
+                supports_sampling=not is_5_plus,
                 supported_efforts=(
                     ("low", "medium", "high", "xhigh")
                     if is_5_plus

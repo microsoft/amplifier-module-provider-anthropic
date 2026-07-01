@@ -842,3 +842,73 @@ class TestTaskBudgets:
             base_caps, runtime_info
         )
         assert overridden.supports_task_budget is True
+
+
+# ---------------------------------------------------------------------------
+# TestSonnet5Temperature — temperature stripping for claude-sonnet-5
+# Regression guard for amplifier-support#299: sonnet-5 must NOT receive
+# `temperature` (Anthropic rejects it: "temperature is deprecated for this
+# model."). Mirrors TestOpus47Temperature; sonnet-4.x must be unaffected.
+# ---------------------------------------------------------------------------
+
+
+class TestSonnet5Temperature:
+    """Temperature stripping for claude-sonnet-5 (amplifier-support#299)."""
+
+    def test_sonnet_5_no_temperature_in_params(self):
+        """No-thinking sonnet-5 request (the session-naming call) omits temperature."""
+        provider = _make_provider(default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(messages=[Message(role="user", content="Name this session")])
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "temperature" not in params
+
+    def test_sonnet_5_explicit_temperature_ignored(self):
+        """Even if the caller sets temperature, sonnet-5 omits it."""
+        provider = _make_provider(default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            temperature=0.7,
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "temperature" not in params
+
+    def test_sonnet_5_thinking_does_not_force_temperature_1(self):
+        """With thinking on sonnet-5, temperature is omitted (not forced to 1.0)."""
+        provider = _make_provider(default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "temperature" not in params
+
+    def test_sonnet_46_temperature_still_sent(self):
+        """Regression guard: sonnet-4.6 still includes temperature (Anthropic accepts it)."""
+        provider = _make_provider(default_model="claude-sonnet-4-6")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "temperature" in params
+
+    def test_sonnet_5_supports_sampling_false(self):
+        caps = AnthropicProvider._get_capabilities("claude-sonnet-5")
+        assert caps.supports_sampling is False
+
+    def test_sonnet_46_supports_sampling_true(self):
+        caps = AnthropicProvider._get_capabilities("claude-sonnet-4-6")
+        assert caps.supports_sampling is True
