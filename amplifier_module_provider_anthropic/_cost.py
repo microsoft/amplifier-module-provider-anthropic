@@ -14,11 +14,29 @@ Usage
         output_tokens=200,
     )
     # Returns Decimal or None if the model is not recognised.
+
+Config-level rate overrides
+---------------------------
+Models absent from ``_RATES`` (private, brand-new, or fine-tuned models) would
+otherwise always yield ``None``.  The provider's ``rates`` config key lets a
+deployment supply rates for such models without a code change:
+
+    overrides = parse_rate_overrides({
+        "claude-fable-5": {"input": 10.00, "output": 50.00},
+    })
+    cost = compute_cost("claude-fable-5", input_tokens=1_000, rate_overrides=overrides)
+
+Overrides take precedence over ``_RATES``.  See :func:`parse_rate_overrides`.
 """
 
 from __future__ import annotations
 
-from decimal import Decimal
+import logging
+from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Internal constants
@@ -184,9 +202,153 @@ _FAST_ELIGIBLE_MODELS: set[str] = {
 }
 
 
+# Config field name → _RATES row key.  Config values are USD per 1M tokens,
+# the same units as _RATES.
+_OVERRIDE_FIELD_MAP: dict[str, str] = {
+    "input": "input_per_m",
+    "output": "output_per_m",
+    "cache_read": "cache_read_per_m",
+    "cache_write": "cache_write_per_m",
+}
+
+# Default cache rates as a fraction of the input rate.  Every row in _RATES
+# follows these ratios (cache_read = 10% of input, cache_write = 125% of
+# input), so derived defaults keep overrides consistent with the table.
+_CACHE_READ_RATIO = Decimal("0.10")
+_CACHE_WRITE_RATIO = Decimal("1.25")
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def parse_rate_overrides(raw: Any) -> dict[str, dict[str, Decimal]]:
+    """Parse the provider's ``rates`` config value into ``_RATES``-shaped rows.
+
+    Parameters
+    ----------
+    raw:
+        The value of the ``rates`` config key: a mapping of model id (exact,
+        or a trailing-``*`` glob such as ``"claude-fable-*"``) → mapping with
+        keys ``input``, ``output`` (required) and ``cache_read``,
+        ``cache_write`` (optional), all in USD per 1M tokens.  Values may be
+        int, float, or string; each is parsed via ``Decimal(str(value))`` so
+        no float arithmetic ever touches the cost path.
+
+    Returns
+    -------
+    dict[str, dict[str, Decimal]]
+        Mapping of model pattern → rate row with the same keys as ``_RATES``
+        rows (``input_per_m``, ``output_per_m``, ``cache_read_per_m``,
+        ``cache_write_per_m``).  Suitable for ``compute_cost``'s
+        ``rate_overrides`` parameter.
+
+    Notes
+    -----
+    * Missing ``cache_read`` defaults to 10% of ``input``; missing
+      ``cache_write`` defaults to 125% of ``input`` — the ratios every
+      ``_RATES`` row uses.
+    * Invalid entries (missing ``input``/``output``, non-numeric or negative
+      values, unknown field names) are skipped with a warning; they never
+      raise, matching the provider's lenient config parsing.
+    """
+    overrides: dict[str, dict[str, Decimal]] = {}
+    if raw is None:
+        return overrides
+    if not isinstance(raw, Mapping):
+        logger.warning(
+            "[PROVIDER] Invalid 'rates' config value %r (expected mapping); ignoring",
+            raw,
+        )
+        return overrides
+
+    for model_pattern, fields in raw.items():
+        if not isinstance(model_pattern, str) or not model_pattern:
+            logger.warning(
+                "[PROVIDER] Invalid model pattern %r in 'rates' config; skipping",
+                model_pattern,
+            )
+            continue
+        if not isinstance(fields, Mapping):
+            logger.warning(
+                "[PROVIDER] Invalid rates entry for %r (expected mapping, got %r); skipping",
+                model_pattern,
+                fields,
+            )
+            continue
+
+        unknown = set(fields) - set(_OVERRIDE_FIELD_MAP)
+        if unknown:
+            logger.warning(
+                "[PROVIDER] Unknown field(s) %s in 'rates' entry for %r; skipping",
+                sorted(unknown),
+                model_pattern,
+            )
+            continue
+
+        row: dict[str, Decimal] = {}
+        valid = True
+        for field, row_key in _OVERRIDE_FIELD_MAP.items():
+            if field not in fields:
+                continue
+            value = fields[field]
+            try:
+                parsed = Decimal(str(value))
+            except (InvalidOperation, ValueError, TypeError):
+                parsed = None
+            if parsed is None or not parsed.is_finite() or parsed < 0:
+                logger.warning(
+                    "[PROVIDER] Invalid %r value %r in 'rates' entry for %r; skipping entry",
+                    field,
+                    value,
+                    model_pattern,
+                )
+                valid = False
+                break
+            row[row_key] = parsed
+        if not valid:
+            continue
+
+        if "input_per_m" not in row or "output_per_m" not in row:
+            logger.warning(
+                "[PROVIDER] 'rates' entry for %r must define both 'input' and 'output'; skipping",
+                model_pattern,
+            )
+            continue
+
+        row.setdefault("cache_read_per_m", row["input_per_m"] * _CACHE_READ_RATIO)
+        row.setdefault("cache_write_per_m", row["input_per_m"] * _CACHE_WRITE_RATIO)
+        overrides[model_pattern] = row
+
+    return overrides
+
+
+def _resolve_rates(
+    model: str,
+    rate_overrides: Mapping[str, Mapping[str, Decimal]] | None,
+) -> Mapping[str, Decimal] | None:
+    """Resolve the rate row for *model*: overrides first, then ``_RATES``.
+
+    Override precedence: exact model id, then trailing-``*`` glob patterns
+    (longest matching prefix wins), then the built-in ``_RATES`` table.
+    """
+    if rate_overrides:
+        exact = rate_overrides.get(model)
+        if exact is not None:
+            return exact
+        best: Mapping[str, Decimal] | None = None
+        best_len = -1
+        for pattern, row in rate_overrides.items():
+            if not pattern.endswith("*"):
+                continue
+            prefix = pattern[:-1]
+            if model.startswith(prefix) and len(prefix) > best_len:
+                best = row
+                best_len = len(prefix)
+        if best is not None:
+            return best
+    return _RATES.get(model)
 
 
 def compute_cost(
@@ -197,6 +359,7 @@ def compute_cost(
     cache_read_input_tokens: int = 0,
     cache_creation_input_tokens: int = 0,
     speed: str | None = None,
+    rate_overrides: Mapping[str, Mapping[str, Decimal]] | None = None,
 ) -> Decimal | None:
     """Return the USD cost for an Anthropic API call as a :class:`~decimal.Decimal`.
 
@@ -218,14 +381,19 @@ def compute_cost(
     speed:
         When ``'fast'`` AND *model* is in :data:`_FAST_ELIGIBLE_MODELS` a 2x
         multiplier is applied; any other value leaves cost unchanged.
+    rate_overrides:
+        Optional config-supplied rate rows keyed by exact model id or
+        trailing-``*`` glob, as produced by :func:`parse_rate_overrides`.
+        Overrides take precedence over ``_RATES``.
 
     Returns
     -------
     Decimal | None
-        The computed cost in USD, or ``None`` if *model* is not recognised.
-        ``None`` is semantically distinct from ``Decimal('0')`` (a free call).
+        The computed cost in USD, or ``None`` if *model* is not recognised
+        in either *rate_overrides* or ``_RATES``.  ``None`` is semantically
+        distinct from ``Decimal('0')`` (a free call).
     """
-    rates = _RATES.get(model)
+    rates = _resolve_rates(model, rate_overrides)
     if rates is None:
         return None
 

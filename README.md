@@ -100,6 +100,43 @@ chain is what enables thinking.
 - This key is exposed through `amplifier provider use` (shown for thinking-capable
   models), so it can be set interactively without hand-editing YAML.
 
+### Cost Rate Overrides
+
+The `rates` config key supplies cost rates for models missing from the built-in
+pricing table. Without it, calls to an unlisted model (private, brand-new, or
+fine-tuned) always report `usage.cost_usd: null`. Config rates take precedence
+over the built-in table, so they can also correct a stale built-in rate without
+a code change.
+
+```yaml
+providers:
+  - module: provider-anthropic
+    config:
+      default_model: claude-fable-5
+      rates:
+        claude-fable-5:
+          input: 10.00        # USD per 1M fresh input tokens
+          output: 50.00       # USD per 1M output tokens
+          cache_read: 1.00    # USD per 1M cache-read tokens (optional)
+          cache_write: 12.50  # USD per 1M cache-write tokens (optional)
+        claude-fable-*:       # trailing-* glob covers dated ids
+          input: 10.00
+          output: 50.00
+```
+
+**Semantics:**
+
+- Keys are exact model ids or trailing-`*` globs. Lookup order: exact override →
+  longest matching glob override → built-in table. A model matching none of
+  these still yields `cost_usd: null` (unknown is never silently zero).
+- `input` and `output` are required. `cache_read` defaults to 10% of `input`
+  and `cache_write` to 125% of `input` — the same ratios every row of the
+  built-in table uses.
+- Values may be numbers or strings; each is parsed as a `Decimal` from its
+  string form, so costs stay exact (no float arithmetic).
+- Invalid entries (missing `input`/`output`, negative or non-numeric values,
+  unknown field names) are skipped with a warning; they never fail the mount.
+
 ### Debug Configuration
 
 **Standard Debug** (`debug: true`):
