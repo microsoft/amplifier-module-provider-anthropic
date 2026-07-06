@@ -192,15 +192,20 @@ def test_llm_response_event_cost_usd_round_trips_through_json():
 # ---------------------------------------------------------------------------
 
 
-def test_usage_model_stores_decimal_internally():
-    """Internal cost_usd on Usage is Decimal (correct for monetary precision).
+def test_usage_model_direct_access_is_decimal_but_model_dump_is_str():
+    """result.usage.cost_usd is Decimal via direct attribute access, but
+    model_dump() always stringifies it — even in plain (non-JSON) mode.
 
-    The fix converts to str only at the *emission boundary* (line 2686/2687).
-    The Pydantic model continues to hold a raw Decimal so that arithmetic
-    (e.g. cost accumulation in _add_cost) keeps full precision.
+    The Usage model (amplifier_core.message_models.Usage) carries a
+    `field_serializer("cost_usd", when_used="always")` that converts
+    Decimal -> str on every model_dump() call, not just mode="json". This
+    is deliberate (amplifier-core commit 91fa469, "required for M2 cost
+    stamping (#73)") so that Decimal can never leak through a plain
+    model_dump() anywhere downstream.
 
-    This test documents that invariant: _convert_to_chat_response stamps a
-    Decimal, and the Usage model stores it as-is via model_copy(extra="allow").
+    Direct attribute access (`result.usage.cost_usd`) bypasses serialization
+    entirely and keeps full Decimal precision, which is what internal
+    arithmetic (e.g. cost accumulation in _add_cost) relies on.
     """
     from amplifier_module_provider_anthropic._cost import compute_cost
 
@@ -226,9 +231,11 @@ def test_usage_model_stores_decimal_internally():
         "Internal cost_usd must remain Decimal; conversion only at emission boundary"
     )
 
-    # model_dump() also surfaces Decimal (latent: callers must not json.dumps directly)
+    # model_dump() always stringifies cost_usd via the shared Usage model's
+    # field_serializer(when_used="always") — in BOTH plain and JSON mode.
+    # Only direct attribute access (above) preserves Decimal.
     usage_dict = result.usage.model_dump()
-    assert isinstance(usage_dict.get("cost_usd"), Decimal), (
-        "model_dump() returns raw Decimal — the emission boundary (line 2687) "
-        "is where the str conversion must occur"
+    assert isinstance(usage_dict.get("cost_usd"), str), (
+        "model_dump() must stringify cost_usd (Usage.serialize_cost_usd runs "
+        "with when_used='always'); only direct attribute access stays Decimal"
     )
