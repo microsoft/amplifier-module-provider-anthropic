@@ -825,8 +825,8 @@ class AnthropicProvider:
         List available Claude models dynamically from Anthropic API.
 
         When filtered=True (default), returns only the latest version of each
-        model family (opus, haiku, sonnet). When filtered=False, returns all
-        available Claude models.
+        model family (e.g. fable, opus, sonnet, haiku). When filtered=False,
+        returns all available Claude models.
 
         Returns:
             List of ModelInfo for available Claude models.
@@ -834,25 +834,18 @@ class AnthropicProvider:
         response = await self.client.models.list()
         api_models = list(response.data)
 
-        # Group models by family (opus, haiku, sonnet)
-        families: dict[str, list[tuple[str, str, str]]] = {
-            "opus": [],
-            "haiku": [],
-            "sonnet": [],
-        }
-
+        # Group models by family using _detect_family() as the single source of
+        # truth for family classification. A previous version hardcoded a
+        # separate {opus, haiku, sonnet} map here, which silently dropped any
+        # family not in that list (e.g. fable) until it was updated by hand.
+        families: dict[str, list[tuple[str, str, str]]] = {}
         for model in api_models:
             model_id = model.id
             display_name = getattr(model, "display_name", model_id)
-
-            # Determine family from model ID
-            model_id_lower = model_id.lower()
-            for family in families:
-                if family in model_id_lower:
-                    families[family].append(
-                        (model_id, display_name, str(getattr(model, "created_at", "")))
-                    )
-                    break
+            family = self._detect_family(model_id)
+            families.setdefault(family, []).append(
+                (model_id, display_name, str(getattr(model, "created_at", "")))
+            )
 
         result: list[ModelInfo] = []
 
