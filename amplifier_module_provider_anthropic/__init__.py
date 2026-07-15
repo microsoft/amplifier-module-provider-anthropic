@@ -230,7 +230,17 @@ BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
 BETA_HEADER_FAST_MODE = "fast-mode-2026-02-01"
 PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
+PROVIDER_THINKING_BLOCKS_SANITIZED = "provider:thinking_blocks_sanitized"
 FALLBACK_STATE_VERSION = 1
+
+# Placeholder inserted when sanitizing thinking blocks leaves an assistant
+# message with an empty content array. Anthropic rejects empty content
+# arrays just as it rejects invalid-signature thinking blocks, so a message
+# that becomes empty after stripping needs a minimal well-formed stand-in.
+_THINKING_SANITIZE_PLACEHOLDER: dict[str, Any] = {
+    "type": "text",
+    "text": "[thinking content omitted]",
+}
 
 # ---------------------------------------------------------------------------
 # Deprecated model retirement dates — warn once per process per model
@@ -1376,6 +1386,95 @@ class AnthropicProvider:
         return stripped
 
     @staticmethod
+    def _sanitize_thinking_blocks(
+        messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Strip thinking blocks with invalid signatures from assistant messages.
+
+        Anthropic's API strict-validates `thinking.signature` as a non-empty
+        string and rejects the ENTIRE request with a 400 if any block fails
+        that check. On session resume, assistant turns produced by other
+        providers (or persisted before this provider's normal serialization
+        runs) can carry thinking-shaped blocks that don't meet this bar.
+        Two real-world shapes have been observed:
+
+          - chat-completions producer: {"type": "thinking", ...,
+            "signature": None}
+          - OpenAI Responses producer: {"type": "thinking", ...} with the
+            "signature" key ABSENT entirely, and "content" holding
+            provider-internal strings (encrypted blob + response item id).
+
+        Forwarding either shape gets the whole request rejected, bricking
+        the session on every subsequent resume attempt. Strip them here,
+        in the shared request-construction path, so every subclass
+        (including the Fable provider) inherits the protection.
+
+        `redacted_thinking` blocks are never touched: they legitimately
+        carry no `signature` field (they carry `data` instead), and Anthropic
+        accepts them as-is.
+
+        If stripping empties an assistant message's content array, a
+        minimal placeholder block is inserted -- Anthropic also rejects
+        messages with an empty content array.
+
+        Defensive: this must never raise. A message that can't be
+        interpreted is passed through unchanged rather than aborting the
+        request; a malformed history block is a data-quality problem to
+        clean up, not a crash to propagate.
+
+        Args:
+            messages: Anthropic-formatted message list (post-_convert_messages).
+
+        Returns:
+            (sanitized_messages, stripped_count) -- a new list; the input
+            list and its unaffected message dicts are not mutated.
+        """
+        sanitized: list[dict[str, Any]] = []
+        stripped_count = 0
+
+        for msg in messages:
+            try:
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    sanitized.append(msg)
+                    continue
+
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    sanitized.append(msg)
+                    continue
+
+                kept_blocks = []
+                message_stripped = 0
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "thinking":
+                        signature = block.get("signature")
+                        if not isinstance(signature, str) or not signature.strip():
+                            message_stripped += 1
+                            continue
+                    kept_blocks.append(block)
+
+                if message_stripped == 0:
+                    sanitized.append(msg)
+                    continue
+
+                stripped_count += message_stripped
+                new_msg = dict(msg)
+                if not kept_blocks:
+                    # Emptying the array entirely would itself trigger a
+                    # 400 -- keep the message well-formed.
+                    kept_blocks = [dict(_THINKING_SANITIZE_PLACEHOLDER)]
+                new_msg["content"] = kept_blocks
+                sanitized.append(new_msg)
+            except Exception:
+                logger.exception(
+                    "[PROVIDER] Error sanitizing thinking blocks for a message; "
+                    "passing it through unmodified"
+                )
+                sanitized.append(msg)
+
+        return sanitized, stripped_count
+
+    @staticmethod
     def _is_overload_fallback_error(error: KernelLLMError) -> bool:
         """Return True when the error indicates model overload, not generic throttling."""
         status_code = getattr(error, "status_code", None)
@@ -2205,6 +2304,16 @@ class AnthropicProvider:
 
         # Combine: context THEN conversation
         all_messages = context_user_msgs + conversation_msgs
+
+        # Sanitize thinking blocks BEFORE cache control so cache_control lands
+        # on the correct (post-sanitization) final block. This runs for every
+        # request in the shared base path, so the Fable subclass inherits it.
+        # See _sanitize_thinking_blocks() for the malformed shapes this guards
+        # against (fixes amplifier-support#207).
+        all_messages, _thinking_blocks_stripped = self._sanitize_thinking_blocks(
+            all_messages
+        )
+
         # Apply cache control to last message for incremental context caching
         all_messages = self._apply_message_cache_control(all_messages)
         logger.info(f"[PROVIDER] Final message count for API: {len(all_messages)}")
@@ -2214,6 +2323,25 @@ class AnthropicProvider:
         effective_model = kwargs.get("model", self.default_model)
         request_caps = await self._get_request_capabilities(effective_model)
         model_ceiling = request_caps.max_output_tokens
+
+        if _thinking_blocks_stripped:
+            logger.warning(
+                "[PROVIDER] Stripped %d thinking block(s) with invalid or "
+                "missing signature from assistant message history before "
+                "sending to the Anthropic API (model=%s). This happens when "
+                "a session resumes across a provider that doesn't produce "
+                "Anthropic-signed thinking blocks.",
+                _thinking_blocks_stripped,
+                effective_model,
+            )
+            await self._emit_provider_event(
+                PROVIDER_THINKING_BLOCKS_SANITIZED,
+                {
+                    "provider": "anthropic",
+                    "model": effective_model,
+                    "stripped_count": _thinking_blocks_stripped,
+                },
+            )
 
         # Emit once-per-process deprecation warning for models nearing retirement
         if (
