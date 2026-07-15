@@ -10,11 +10,14 @@ Verifies:
 """
 
 import asyncio
+import logging
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message
+import amplifier_module_provider_anthropic as anthropic_module
 from amplifier_module_provider_anthropic import AnthropicProvider
 
 from tests._helpers import DummyResponse, FakeCoordinator
@@ -586,3 +589,285 @@ class TestSpeedConfigEndToEnd:
         assert params.get("speed") == "fast"
         beta_header = params.get("extra_headers", {}).get("anthropic-beta", "")
         assert "fast-mode-2026-02-01" in beta_header
+
+
+# ---------------------------------------------------------------------------
+# Effort clamping (amplifier-support#289 follow-up)
+#
+# When a configured/requested effort exceeds a resolved model's ceiling, the
+# provider must CLAMP to the highest tier the model supports instead of
+# omitting output_config.effort entirely. Models that fully support the
+# requested tier must see zero behavior change.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_effort_downgrade_state():
+    """Each test starts with a clean one-time-notice cache."""
+    anthropic_module._clear_effort_downgrade_notices()
+    yield
+    anthropic_module._clear_effort_downgrade_notices()
+
+
+class TestEffortClampingPerModel:
+    """Parametrized model-family x requested-effort clamp verification."""
+
+    @pytest.mark.parametrize(
+        ("default_model", "requested_effort", "expected_effort"),
+        [
+            # Sonnet 5+: ceiling is xhigh (no "max" tier) -> max clamps down.
+            ("claude-sonnet-5", "max", "xhigh"),
+            ("claude-sonnet-5", "xhigh", "xhigh"),  # exact, unchanged
+            ("claude-sonnet-5", "high", "high"),  # exact, unchanged
+            ("claude-sonnet-5", "low", "low"),  # exact, unchanged
+            # Fable 5: supports every tier including "max" -> always passes
+            # through untouched (zero behavior change).
+            ("claude-fable-5", "max", "max"),
+            ("claude-fable-5", "xhigh", "xhigh"),
+            ("claude-fable-5", "high", "high"),
+            # Opus 4.8+: supports every tier including "max" -> passthrough.
+            ("claude-opus-4-8", "max", "max"),
+            ("claude-opus-4-8", "xhigh", "xhigh"),
+            # Opus 4.7: ceiling is xhigh (pre-4.8 "max" tier not yet added).
+            ("claude-opus-4-7-20260416", "max", "xhigh"),
+            ("claude-opus-4-7-20260416", "xhigh", "xhigh"),
+        ],
+    )
+    def test_effort_clamps_to_expected_tier(
+        self, default_model: str, requested_effort: str, expected_effort: str
+    ):
+        provider = _make_provider_with_effort(
+            requested_effort, default_model=default_model
+        )
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params.get("output_config", {}).get("effort") == expected_effort
+
+    def test_max_on_sonnet_5_never_omits_output_config(self):
+        """Regression guard: max->xhigh clamp must still populate output_config,
+        never fall back to the old omit-entirely behavior."""
+        provider = _make_provider_with_effort("max", default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "output_config" in params
+        assert "effort" in params["output_config"]
+
+
+class TestEffortDowngradeOneTimeLogging:
+    """The downgrade notice is INFO-level and fires once per (model, effort)."""
+
+    def test_downgrade_notice_is_info_not_warning(self, caplog):
+        provider = _make_provider_with_effort("max", default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+
+        with caplog.at_level(logging.INFO):
+            asyncio.run(provider.complete(request))
+
+        info_notices = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO and "xhigh" in r.message
+        ]
+        warning_notices = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert info_notices, "expected an INFO downgrade notice"
+        assert not warning_notices, "must not warn per-request on a known clamp"
+
+    def test_second_identical_request_does_not_repeat_notice(self, caplog):
+        """Two requests, same model + same effort -> exactly one notice."""
+        provider = _make_provider_with_effort("max", default_model="claude-sonnet-5")
+
+        def _notice_count() -> int:
+            return sum(
+                1
+                for r in caplog.records
+                if r.levelno == logging.INFO and "'max'" in r.message
+            )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+
+        with caplog.at_level(logging.INFO):
+            provider.client.messages.with_raw_response.create = AsyncMock(
+                return_value=_make_raw_mock()
+            )
+            asyncio.run(provider.complete(request))
+            first_count = _notice_count()
+
+            caplog.clear()
+            provider.client.messages.with_raw_response.create = AsyncMock(
+                return_value=_make_raw_mock()
+            )
+            asyncio.run(provider.complete(request))
+            second_count = _notice_count()
+
+        assert first_count == 1
+        assert second_count == 0
+
+    def test_different_requested_effort_gets_its_own_notice(self, caplog):
+        """Same model, different requested effort -> separate notice fires."""
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+
+        provider_max = _make_provider_with_effort(
+            "max", default_model="claude-sonnet-5"
+        )
+        provider_max.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        with caplog.at_level(logging.INFO):
+            asyncio.run(provider_max.complete(request))
+        max_notices = [
+            r for r in caplog.records if "'max'" in r.message and "xhigh" in r.message
+        ]
+        assert len(max_notices) == 1
+
+        caplog.clear()
+
+        # A different model+effort pair not previously seen must still notify.
+        provider_opus47_max = _make_provider_with_effort(
+            "max", default_model="claude-opus-4-7-20260416"
+        )
+        provider_opus47_max.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        with caplog.at_level(logging.INFO):
+            asyncio.run(provider_opus47_max.complete(request))
+        opus_notices = [
+            r for r in caplog.records if "'max'" in r.message and "xhigh" in r.message
+        ]
+        assert len(opus_notices) == 1
+
+    def test_different_model_gets_its_own_notice(self, caplog):
+        """Same requested effort, different model -> separate notice fires."""
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+
+        provider_sonnet = _make_provider_with_effort(
+            "max", default_model="claude-sonnet-5"
+        )
+        provider_sonnet.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        with caplog.at_level(logging.INFO):
+            asyncio.run(provider_sonnet.complete(request))
+        sonnet_notices = [
+            r
+            for r in caplog.records
+            if "claude-sonnet-5" in r.message and "supported range" in r.message
+        ]
+        assert len(sonnet_notices) == 1
+
+        caplog.clear()
+
+        provider_opus47 = _make_provider_with_effort(
+            "max", default_model="claude-opus-4-7-20260416"
+        )
+        provider_opus47.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        with caplog.at_level(logging.INFO):
+            asyncio.run(provider_opus47.complete(request))
+        opus_notices = [
+            r
+            for r in caplog.records
+            if "claude-opus-4-7-20260416" in r.message
+            and "supported range" in r.message
+        ]
+        assert len(opus_notices) == 1
+
+
+class TestClampEffortToSupportedHelper:
+    """Direct unit tests for the _clamp_effort_to_supported helper.
+
+    Covers the below-floor edge case (item 2 in the spec) which no current
+    model capability table entry exercises end-to-end -- every real
+    ``supported_efforts`` tuple today starts at "low", so we simulate a
+    hypothetical model with a raised floor to prove the "up" branch works.
+    """
+
+    def test_exact_match_returns_exact(self):
+        clamped, kind = anthropic_module._clamp_effort_to_supported(
+            "high", ("low", "medium", "high", "xhigh")
+        )
+        assert (clamped, kind) == ("high", "exact")
+
+    def test_above_ceiling_clamps_down(self):
+        clamped, kind = anthropic_module._clamp_effort_to_supported(
+            "max", ("low", "medium", "high", "xhigh")
+        )
+        assert (clamped, kind) == ("xhigh", "down")
+
+    def test_below_floor_clamps_up(self):
+        """Hypothetical model whose floor is 'high' -- 'low' clamps UP to 'high'."""
+        clamped, kind = anthropic_module._clamp_effort_to_supported(
+            "low", ("high", "xhigh", "max")
+        )
+        assert (clamped, kind) == ("high", "up")
+
+    def test_below_floor_never_returns_none_when_supported_nonempty(self):
+        """User intent is preserved -- never silently None when there's SOMETHING
+        to clamp to, even in the below-floor case."""
+        clamped, kind = anthropic_module._clamp_effort_to_supported(
+            "medium", ("xhigh", "max")
+        )
+        assert clamped is not None
+        assert kind == "up"
+        assert clamped == "xhigh"
+
+    def test_empty_supported_set_returns_none_unsupported(self):
+        clamped, kind = anthropic_module._clamp_effort_to_supported("high", ())
+        assert (clamped, kind) == (None, "unsupported")
+
+    def test_unrecognized_effort_string_falls_back_to_highest_supported(self):
+        clamped, kind = anthropic_module._clamp_effort_to_supported(
+            "ultra", ("low", "medium", "high")
+        )
+        assert (clamped, kind) == ("high", "down")
+
+
+class TestModelsFullySupportedEffortPassthrough:
+    """Zero behavior change for models that fully support the requested tier.
+
+    These mirror the existing test_config_effort_max_on_opus_48_sets_output_config
+    test but add fable and confirm no downgrade notice fires when nothing was
+    clamped.
+    """
+
+    @pytest.mark.parametrize(
+        ("default_model", "effort"),
+        [
+            ("claude-opus-4-8", "max"),
+            ("claude-fable-5", "max"),
+            ("claude-sonnet-5", "xhigh"),
+        ],
+    )
+    def test_no_downgrade_notice_when_fully_supported(
+        self, default_model: str, effort: str, caplog
+    ):
+        provider = _make_provider_with_effort(effort, default_model=default_model)
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+
+        with caplog.at_level(logging.INFO):
+            asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"]["effort"] == effort
+        assert not any(
+            "supported range" in r.message or "exceeds" in r.message
+            for r in caplog.records
+        )

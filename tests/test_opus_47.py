@@ -371,8 +371,14 @@ class TestOpus47OutputConfig:
         caps = AnthropicProvider._get_capabilities("claude-opus-4-6-20260101")
         assert "xhigh" not in caps.supported_efforts
 
-    def test_opus_47_invalid_effort_omits_output_config(self):
-        """Unknown effort level → output_config omitted (not a hard error)."""
+    def test_opus_47_unsupported_effort_clamps_to_highest_supported(self):
+        """Effort above 4.7's ceiling clamps to the highest supported tier.
+
+        amplifier-support#289: this used to omit output_config entirely
+        (silently dropping user intent). It now clamps 'max' -> 'xhigh',
+        the highest tier Opus 4.7 supports, rather than a hard error or a
+        silent drop.
+        """
         provider = _make_provider(default_model="claude-opus-4-7-20260416")
         provider.client.messages.with_raw_response.create = AsyncMock(
             return_value=_make_raw_mock()
@@ -383,7 +389,7 @@ class TestOpus47OutputConfig:
         )
         asyncio.run(provider.complete(request))
         params = _get_api_params(provider.client.messages.with_raw_response.create)
-        assert "output_config" not in params
+        assert params["output_config"] == {"effort": "xhigh"}
 
 
 # ---------------------------------------------------------------------------
