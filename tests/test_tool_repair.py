@@ -34,6 +34,16 @@ class MockStreamManager:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         return False
 
+    def __aiter__(self):
+        # The provider iterates the stream (`async for event in stream:`)
+        # before calling get_final_message(). The real SDK's MessageStream is
+        # async-iterable; emit zero events so the loop drains immediately and
+        # the final (already-assembled) message is returned below.
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
     async def get_final_message(self):
         return self._api_response
 
