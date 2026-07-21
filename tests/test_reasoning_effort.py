@@ -459,6 +459,25 @@ class TestConfigEffortDefault:
         assert params.get("output_config", {}).get("effort") == "max"
         assert params["thinking"]["type"] == "adaptive"
 
+    def test_config_effort_max_on_sonnet_5_sets_output_config(self):
+        """config effort='max' on Sonnet 5 → output_config.effort=max + adaptive.
+
+        Regression guard: Sonnet 5 accepts the 'max' effort tier (confirmed
+        2026-07-20). Previously 'max' was omitted from supported_efforts, so the
+        provider dropped output_config.effort and logged a warning.
+        """
+        provider = _make_provider_with_effort("max", default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params.get("output_config", {}).get("effort") == "max"
+        assert params["thinking"]["type"] == "adaptive"
+
     def test_config_effort_xhigh_unsupported_on_sonnet_omits_output_config(self):
         """config effort='xhigh' on a model that lacks output_config → omitted.
 
