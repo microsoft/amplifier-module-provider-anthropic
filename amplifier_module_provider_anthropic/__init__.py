@@ -588,6 +588,7 @@ class AnthropicProvider:
             "filtered", True
         )  # Filter to curated model list by default
         self.enable_prompt_caching = self.config.get("enable_prompt_caching", True)
+        self._cache_ttl = str(self.config.get("cache_ttl", "") or "")
         self.enable_web_search = self.config.get(
             "enable_web_search", False
         )  # Enable native web search tool
@@ -1248,6 +1249,8 @@ class AnthropicProvider:
     ) -> list[str]:
         """Build the anthropic-beta header set for a specific effective model."""
         headers = list(self._beta_headers)
+        if getattr(self, "_cache_ttl", "") == "1h":
+            headers.append("extended-cache-ttl-2025-04-11")
         if self._should_add_context_1m_beta(model_id, request_caps):
             headers.append(BETA_HEADER_1M_CONTEXT)
         if self._should_add_interleaved_beta(
@@ -2133,7 +2136,7 @@ class AnthropicProvider:
 
         # Add cache_control if enabled
         if self.enable_prompt_caching:
-            block["cache_control"] = {"type": "ephemeral"}
+            block["cache_control"] = ({"type": "ephemeral", "ttl": self._cache_ttl} if getattr(self, "_cache_ttl", "") in ("1h",) else {"type": "ephemeral"})
 
         return [block]
 
@@ -3716,7 +3719,7 @@ class AnthropicProvider:
             return tools
 
         # Add cache_control to last tool
-        tools[-1]["cache_control"] = {"type": "ephemeral"}
+        tools[-1]["cache_control"] = ({"type": "ephemeral", "ttl": self._cache_ttl} if getattr(self, "_cache_ttl", "") in ("1h",) else {"type": "ephemeral"})
         return tools
 
     def _apply_message_cache_control(
@@ -3742,14 +3745,14 @@ class AnthropicProvider:
         # Handle different content formats
         if isinstance(content, list) and content:
             # Array of content blocks - mark last block
-            content[-1]["cache_control"] = {"type": "ephemeral"}
+            content[-1]["cache_control"] = ({"type": "ephemeral", "ttl": self._cache_ttl} if getattr(self, "_cache_ttl", "") in ("1h",) else {"type": "ephemeral"})
         elif isinstance(content, str):
             # String content - convert to block array with cache marker
             last_msg["content"] = [
                 {
                     "type": "text",
                     "text": content,
-                    "cache_control": {"type": "ephemeral"},
+                    "cache_control": ({"type": "ephemeral", "ttl": self._cache_ttl} if getattr(self, "_cache_ttl", "") in ("1h",) else {"type": "ephemeral"}),
                 }
             ]
 
