@@ -933,7 +933,8 @@ class AnthropicProvider:
         Version requirements
         --------------------
         * **Fable 5** — always-on adaptive thinking, 128K output, no manual thinking
-        * **Opus 4.6+** — 1M context, adaptive thinking, 128K output
+        * **Opus 4.6+** (incl. Opus 5 — confirmed via numeric version-gate, verified
+          2026-07-24) — 1M context, adaptive thinking, 128K output
         * **Sonnet 4.5+** — 1M context, extended thinking, 64K output
         * **Haiku 4.5+** — fast inference, extended thinking, no adaptive, no 1M
 
