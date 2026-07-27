@@ -495,7 +495,8 @@ class AnthropicProvider:
         # Effort-family config keys. Canonical key: "reasoning_effort" (matches
         # the kernel's portable request.reasoning_effort). Legacy alias:
         # "effort". Both are consumed in _build_params; when both are set the
-        # canonical key wins — warn once here so precedence is never silent.
+        # canonical key wins — warn at construction so precedence is never
+        # silent.
         if (
             self.config.get("reasoning_effort") is not None
             and self.config.get("effort") is not None
@@ -506,16 +507,6 @@ class AnthropicProvider:
                 "is ignored.",
                 self.config.get("effort"),
             )
-        # Loudness guard against silently-inert config: warn about
-        # effort-family keys this provider does NOT consume.
-        for _inert_key in ("reasoning",):
-            if _inert_key in self.config:
-                logger.warning(
-                    "[PROVIDER] Config key '%s' is not consumed by "
-                    "provider-anthropic and has no effect. Accepted effort "
-                    "keys: 'reasoning_effort' (canonical), 'effort' (alias).",
-                    _inert_key,
-                )
         self.max_tokens = self.config.get(
             "max_tokens", self._default_caps.max_output_tokens
         )
@@ -752,7 +743,12 @@ class AnthropicProvider:
                     default="true",
                 ),
                 ConfigField(
-                    id="effort",
+                    # Canonical key — matches the kernel's portable
+                    # request.reasoning_effort and the key used by the shipped
+                    # routing matrices. ConfigField.id is written verbatim into
+                    # settings.yaml, so this must be the canonical name, never
+                    # the legacy "effort" alias.
+                    id="reasoning_effort",
                     display_name="Reasoning Effort",
                     field_type="choice",
                     choices=["low", "medium", "high", "xhigh", "max"],

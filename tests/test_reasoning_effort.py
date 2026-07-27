@@ -635,29 +635,32 @@ class TestCanonicalReasoningEffortConfigKey:
         assert "thinking" in params
 
 
-class TestInertEffortKeyWarning:
-    """Effort-family keys the provider does NOT consume must warn loudly."""
+class TestEffortConfigFieldIsCanonical:
+    """get_info() must advertise the canonical key.
 
-    def test_unconsumed_reasoning_key_warns_at_init(self, caplog):
-        """config 'reasoning' (OpenAI-style) is inert here -> warning at init."""
-        import logging
+    ConfigField.id is written verbatim into settings.yaml by the app-CLI
+    (provider install wizard and routing-matrix editor), so advertising the
+    legacy "effort" alias would make the CLI generate the deprecated key.
+    """
 
-        with caplog.at_level(logging.WARNING):
-            provider = _make_provider_with_config({"reasoning": "high"})
+    def test_config_field_id_is_reasoning_effort(self):
+        provider = _make_provider()
+        field_ids = {f.id for f in provider.get_info().config_fields}
 
-        assert any(
-            "'reasoning'" in r.message and "not consumed" in r.message
-            for r in caplog.records
+        assert "reasoning_effort" in field_ids
+        assert "effort" not in field_ids
+
+    def test_config_field_still_offers_all_effort_tiers(self):
+        provider = _make_provider()
+        field = next(
+            f for f in provider.get_info().config_fields if f.id == "reasoning_effort"
         )
 
-        # And it must stay inert: no thinking is enabled by it.
-        provider.client.messages.with_raw_response.create = AsyncMock(
-            return_value=_make_raw_mock()
-        )
-        request = ChatRequest(messages=[Message(role="user", content="Hello")])
-        asyncio.run(provider.complete(request))
-        params = _get_api_params(provider.client.messages.with_raw_response.create)
-        assert "thinking" not in params
+        assert field.choices == ["low", "medium", "high", "xhigh", "max"]
+
+
+class TestNoSpuriousEffortWarnings:
+    """A config without effort-family keys must emit no effort warnings."""
 
     def test_no_warning_when_no_effort_keys_set(self, caplog):
         """A config without effort-family keys emits no effort warnings."""
