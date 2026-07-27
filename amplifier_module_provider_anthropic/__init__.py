@@ -491,6 +491,31 @@ class AnthropicProvider:
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "claude-sonnet-4-5")
         self._default_caps = self._get_capabilities(self.default_model)
+
+        # Effort-family config keys. Canonical key: "reasoning_effort" (matches
+        # the kernel's portable request.reasoning_effort). Legacy alias:
+        # "effort". Both are consumed in _build_params; when both are set the
+        # canonical key wins — warn once here so precedence is never silent.
+        if (
+            self.config.get("reasoning_effort") is not None
+            and self.config.get("effort") is not None
+        ):
+            logger.warning(
+                "[PROVIDER] Both 'reasoning_effort' and 'effort' are set in "
+                "config; 'reasoning_effort' (canonical) wins and 'effort'=%r "
+                "is ignored.",
+                self.config.get("effort"),
+            )
+        # Loudness guard against silently-inert config: warn about
+        # effort-family keys this provider does NOT consume.
+        for _inert_key in ("reasoning",):
+            if _inert_key in self.config:
+                logger.warning(
+                    "[PROVIDER] Config key '%s' is not consumed by "
+                    "provider-anthropic and has no effect. Accepted effort "
+                    "keys: 'reasoning_effort' (canonical), 'effort' (alias).",
+                    _inert_key,
+                )
         self.max_tokens = self.config.get(
             "max_tokens", self._default_caps.max_output_tokens
         )
@@ -2304,7 +2329,15 @@ class AnthropicProvider:
         #       later (see the output_config block).  It does NOT feed this
         #       thinking path and does NOT enable thinking on its own.
         if reasoning_effort is None:
-            config_effort = self.config.get("effort")
+            # Canonical config key first ("reasoning_effort", matching the
+            # kernel's portable request.reasoning_effort), then the legacy
+            # "effort" alias. When both are set the canonical key wins (a
+            # one-time warning is emitted in __init__).
+            config_key = "reasoning_effort"
+            config_effort = self.config.get("reasoning_effort")
+            if config_effort is None:
+                config_key = "effort"
+                config_effort = self.config.get("effort")
             if config_effort is not None:
                 # Validate/normalise the config value so a typo (e.g. "ultra",
                 # "High", "EXTRA HIGH") can't silently flip thinking on with a
@@ -2315,8 +2348,8 @@ class AnthropicProvider:
                     reasoning_effort = normalized
                 else:
                     logger.warning(
-                        "[PROVIDER] Ignoring invalid config 'effort'=%r "
-                        "(valid values: %s)",
+                        "[PROVIDER] Ignoring invalid config '%s'=%r (valid values: %s)",
+                        config_key,
                         config_effort,
                         ", ".join(valid_efforts),
                     )
