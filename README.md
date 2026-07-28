@@ -97,8 +97,13 @@ chain is what enables thinking.
   models the extended-thinking mapping still applies. Broadening this to
   Sonnet 4.6 and Opus 4.5/4.6 (which Anthropic also supports) is tracked as a
   follow-up.
-- `xhigh`/`max` are omitted from `output_config.effort` on models whose capability
-  matrix doesn't list them (a warning is logged), falling back to adaptive thinking.
+- If `xhigh`/`max` isn't supported by the model actually handling the request,
+  it is **clamped** to that model's highest supported tier (e.g. `max` → `xhigh`
+  on `claude-sonnet-5`) rather than omitted — a provider-level `effort` default
+  is model-agnostic by design, so this mismatch is the normal case when one
+  config block serves multiple models via routing/fallback. The downgrade is
+  logged once per (model, requested-effort) pair at INFO, not on every request.
+  See amplifier-support#289.
 - This key is exposed through `amplifier provider use` (shown for thinking-capable
   models), so it can be set interactively without hand-editing YAML.
 

@@ -10,11 +10,13 @@ Verifies:
 """
 
 import asyncio
+import logging
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message
+import amplifier_module_provider_anthropic as anthropic_module
 from amplifier_module_provider_anthropic import AnthropicProvider
 
 from tests._helpers import DummyResponse, FakeCoordinator
@@ -753,6 +755,202 @@ class TestTemperatureOverride:
 # ---------------------------------------------------------------------------
 # Speed config plumbing — end-to-end request param and beta header
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Effort clamping to the model's highest supported tier (amplifier-support#289)
+#
+# Root cause: config['effort'] / request.reasoning_effort is validated
+# against the GLOBAL legal ladder (every value in EFFORT_ORDER), not against
+# the ACTIVE model's capability tier. A value that passed global validation
+# (e.g. "max") can still be unsupported by the model actually handling the
+# request -- provider config is intentionally model-agnostic, so this
+# mismatch is the NORMAL case in routing-matrix / mid-session model-switch
+# deployments, not an edge case. Before this fix, the provider warned on
+# EVERY request and omitted output_config.effort entirely, silently letting
+# the API apply its own server-side default effort instead of the model's
+# actual ceiling. The fix clamps to the highest supported tier <= what was
+# requested (e.g. "max" -> "xhigh" on claude-sonnet-5) and only logs the
+# downgrade once per (model, requested-effort) pair.
+# ---------------------------------------------------------------------------
+
+
+class TestEffortClampToSupportedTier:
+    """output_config.effort clamps to the model's ceiling instead of being
+    omitted when the requested/configured effort exceeds it."""
+
+    def test_sonnet_5_max_clamps_to_xhigh(self):
+        """Headline case from amplifier-support#289: effort='max' on
+        claude-sonnet-5 clamps to 'xhigh' (sonnet-5's actual ceiling)
+        instead of being omitted."""
+        provider = _make_provider(default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="max",
+        )
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"]["effort"] == "xhigh"
+
+    def test_fable_5_max_passes_through_unchanged(self):
+        """Fable 5 declares 'max' in supported_efforts -- no clamping, the
+        happy-path pass-through branch is untouched by this fix."""
+        provider = _make_provider(default_model="claude-fable-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="max",
+        )
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"]["effort"] == "max"
+
+    def test_opus_48_max_passes_through_unchanged(self):
+        """Opus 4.8+ declares 'max' in supported_efforts -- no clamping."""
+        provider = _make_provider(default_model="claude-opus-4-8-20260101")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="max",
+        )
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"]["effort"] == "max"
+
+    def test_model_without_output_config_support_still_omits_key(self):
+        """Models that don't support output_config AT ALL (e.g. sonnet-4-6)
+        must never gain an output_config key -- clamping only kicks in when
+        supports_output_config is already True for the model."""
+        provider = _make_provider(default_model="claude-sonnet-4-6")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "output_config" not in params
+
+    def test_unknown_effort_string_is_omitted_not_clamped(self, caplog):
+        """A value that isn't on the EFFORT_ORDER ladder at all (typo/unknown)
+        is NOT guessed at -- preserve the original warn-and-omit behavior
+        rather than clamping to an arbitrary tier."""
+        provider = _make_provider(default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="ultra",
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "output_config" not in params
+        assert any("not supported by" in r.message for r in caplog.records)
+
+    def test_kwargs_effort_precedence_is_also_clamped(self):
+        """kwargs['effort'] overrides reasoning_effort for output_config
+        purposes (see the precedence comment above the block) -- an
+        unsupported kwargs value must be clamped too, not just values that
+        arrive via reasoning_effort."""
+        provider = _make_provider(default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="low",  # would stay "low" if kwargs didn't win
+        )
+        asyncio.run(provider.complete(request, effort="max"))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"]["effort"] == "xhigh"
+
+
+class TestEffortDowngradeLoggedOnce:
+    """The clamp-downgrade notice logs once per (model, requested-effort)
+    pair at INFO level, not as a per-request WARNING (the original bug
+    report: an identical warning line on every single sonnet-5 request)."""
+
+    def setup_method(self):
+        """Clear the seen-pairs set before each test so prior tests/classes
+        (e.g. TestEffortClampToSupportedTier, which also triggers clamping)
+        can't leave state that makes the "logs on first use" assertion below
+        flaky. Mirrors _clear_deprecated_model_warnings() in test_opus_47.py.
+        """
+        anthropic_module._clear_effort_downgrade_notices()
+
+    def test_downgrade_logged_once_for_repeated_requests(self, caplog):
+        """Two consecutive requests with the same (model, requested effort)
+        log the downgrade notice exactly once."""
+        provider = _make_provider(default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="max",
+        )
+
+        with caplog.at_level(logging.INFO):
+            asyncio.run(provider.complete(request))
+        first_count = sum(1 for r in caplog.records if "clamp" in r.message.lower())
+        assert first_count == 1
+
+        caplog.clear()
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        with caplog.at_level(logging.INFO):
+            asyncio.run(provider.complete(request))
+        second_count = sum(1 for r in caplog.records if "clamp" in r.message.lower())
+        assert second_count == 0
+
+    def test_downgrade_logged_again_for_a_different_pair(self, caplog):
+        """A different (model, effort) pair logs its own downgrade notice
+        even though a prior pair was already logged and suppressed."""
+        provider = _make_provider(default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request_max = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="max",
+        )
+        with caplog.at_level(logging.INFO):
+            asyncio.run(provider.complete(request_max))
+        caplog.clear()
+
+        # Different model family (Opus 4.7 also lacks "max") -> a distinct
+        # (model, effort) pair, so it must log again despite the sonnet-5
+        # pair above already being marked as seen.
+        provider2 = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider2.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request2 = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="max",
+        )
+        with caplog.at_level(logging.INFO):
+            asyncio.run(provider2.complete(request2))
+        second_count = sum(1 for r in caplog.records if "clamp" in r.message.lower())
+        assert second_count == 1
 
 
 class TestSpeedConfigEndToEnd:

@@ -371,15 +371,43 @@ class TestOpus47OutputConfig:
         caps = AnthropicProvider._get_capabilities("claude-opus-4-6-20260101")
         assert "xhigh" not in caps.supported_efforts
 
-    def test_opus_47_invalid_effort_omits_output_config(self):
-        """Unknown effort level → output_config omitted (not a hard error)."""
+    def test_opus_47_max_effort_clamps_to_xhigh(self):
+        """effort='max' on Opus 4.7 is CLAMPED to 'xhigh' (its ceiling), not
+        omitted (amplifier-support#289). 'max' is a recognized value on the
+        EFFORT_ORDER ladder (Opus 4.8+ and Fable 5 support it) -- Opus 4.7
+        just doesn't have that tier yet, so the highest tier <= 'max' that
+        4.7 DOES support ("xhigh") is used instead of silently dropping
+        output_config.effort and letting the API apply its own default.
+
+        UPDATED CONTRACT (was test_opus_47_invalid_effort_omits_output_config):
+        prior to the amplifier-support#289 clamp fix this asserted
+        'output_config' not in params for the same input -- that omit-on-
+        mismatch behavior was exactly the silent-downgrade bug being fixed.
+        """
         provider = _make_provider(default_model="claude-opus-4-7-20260416")
         provider.client.messages.with_raw_response.create = AsyncMock(
             return_value=_make_raw_mock()
         )
         request = ChatRequest(
             messages=[Message(role="user", content="Hello")],
-            reasoning_effort="max",  # not in supported_efforts for 4.7
+            reasoning_effort="max",  # not in supported_efforts for 4.7 -> clamped
+        )
+        asyncio.run(provider.complete(request))
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"] == {"effort": "xhigh"}
+
+    def test_opus_47_unknown_effort_string_omits_output_config(self):
+        """A genuinely unrecognized effort value (not anywhere on the
+        EFFORT_ORDER ladder) is still omitted with a warning -- clamping
+        only applies to recognized values the ACTIVE model doesn't support,
+        never to values the provider doesn't understand at all."""
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="ultra",  # not a real effort value at all
         )
         asyncio.run(provider.complete(request))
         params = _get_api_params(provider.client.messages.with_raw_response.create)

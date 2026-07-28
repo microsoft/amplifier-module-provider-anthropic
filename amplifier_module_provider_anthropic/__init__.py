@@ -233,6 +233,75 @@ PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
 FALLBACK_STATE_VERSION = 1
 
 # ---------------------------------------------------------------------------
+# Canonical reasoning-effort ladder — single source of truth for effort rank
+# order (low < medium < high < xhigh < max). Previously duplicated as literal
+# tuples in three unrelated places (the "effort" ConfigField's choices, the
+# config-level `effort` validation, and per-model ModelCapabilities.supported_
+# efforts) with no shared constant tying them together. That drift is exactly
+# how amplifier-support#289 happened: "max" is legal in the GLOBAL list used
+# to validate config/request values, but the per-model gate at request-build
+# time only ever checked membership in a model's OWN supported_efforts tuple,
+# with no notion of "close enough" — so a legal-but-unsupported value was
+# simply dropped. Reusing EFFORT_ORDER everywhere the ladder's ORDER matters
+# (not its per-model membership, which stays on ModelCapabilities) lets the
+# clamp logic below reason about "closest supported tier" generically instead
+# of hardcoding a fourth copy of the same five strings.
+# ---------------------------------------------------------------------------
+EFFORT_ORDER: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+
+def _clamp_effort_to_supported(
+    effort: str, supported_efforts: tuple[str, ...]
+) -> str | None:
+    """Return the highest tier in *supported_efforts* whose rank is <= *effort*.
+
+    This is the amplifier-support#289 fix: rather than a hard membership test
+    that either passes an effort through unchanged or omits output_config.effort
+    entirely, walk EFFORT_ORDER downward from the requested rank and return the
+    first tier the model actually supports (e.g. "max" -> "xhigh" on a model
+    whose ceiling is "xhigh"). This preserves as much of the user's requested
+    intent as the model can honor, instead of silently falling back to
+    whatever the API's server-side default effort happens to be.
+
+    Returns ``None`` — signaling "can't clamp, caller should fall back to the
+    original warn-and-omit path" — in two cases:
+      * *effort* is not a recognized value on the ladder at all (a typo like
+        "ultra"). Guessing a fallback for a value we don't understand would
+        be worse than surfacing the mismatch.
+      * No tier in *supported_efforts* has rank <= the requested rank. This
+        should not happen in practice — "low" is the universal floor across
+        every model that sets supports_output_config — but the ladder and
+        the per-model tuples are declared independently, so this is a
+        defensive guard against that invariant ever being violated rather
+        than an assumption baked into the control flow.
+    """
+    if effort not in EFFORT_ORDER:
+        return None
+    requested_rank = EFFORT_ORDER.index(effort)
+    for candidate in reversed(EFFORT_ORDER[: requested_rank + 1]):
+        if candidate in supported_efforts:
+            return candidate
+    return None
+
+
+# Tracks (model, requested_effort) pairs already logged so the clamp-downgrade
+# notice fires once per distinct pair instead of on every single request —
+# the original bug report was exactly this WARNING repeating on every call.
+# Module-level (not instance-level) to match the existing _warned_deprecated_
+# models convention just below, including its test-clearing helper pattern.
+_effort_downgrade_logged: set[tuple[str, str]] = set()
+
+
+def _clear_effort_downgrade_notices() -> None:
+    """Clear the effort-downgrade seen-pairs set.
+
+    Internal helper for tests. Follows the same pattern as
+    _clear_deprecated_model_warnings() below.
+    """
+    _effort_downgrade_logged.clear()
+
+
+# ---------------------------------------------------------------------------
 # Deprecated model retirement dates — warn once per process per model
 # ---------------------------------------------------------------------------
 _DEPRECATED_MODELS: dict[str, str] = {
@@ -751,7 +820,7 @@ class AnthropicProvider:
                     id="reasoning_effort",
                     display_name="Reasoning Effort",
                     field_type="choice",
-                    choices=["low", "medium", "high", "xhigh", "max"],
+                    choices=list(EFFORT_ORDER),
                     prompt=(
                         "Default reasoning effort applied to every request. Like "
                         "request.reasoning_effort, this ENABLES extended thinking "
@@ -2339,7 +2408,7 @@ class AnthropicProvider:
                 # "High", "EXTRA HIGH") can't silently flip thinking on with a
                 # value the ladder/output_config don't understand.
                 normalized = str(config_effort).strip().lower()
-                valid_efforts = ("low", "medium", "high", "xhigh", "max")
+                valid_efforts = EFFORT_ORDER
                 if normalized in valid_efforts:
                     reasoning_effort = normalized
                 else:
@@ -2537,6 +2606,8 @@ class AnthropicProvider:
             # but effort="xhigh" for output config intensity).
             effort = kwargs.get("effort", reasoning_effort)
             if effort in request_caps.supported_efforts:
+                # Happy path, unchanged: the model declares this exact tier,
+                # so pass it through untouched.
                 params["output_config"] = {"effort": effort}
                 logger.info(
                     "[PROVIDER] output_config.effort=%s for %s",
@@ -2544,13 +2615,53 @@ class AnthropicProvider:
                     params["model"],
                 )
             else:
-                logger.warning(
-                    "[PROVIDER] Effort level '%s' not supported by %s "
-                    "(supported: %s) — omitting output_config.effort",
-                    effort,
-                    params["model"],
-                    request_caps.supported_efforts,
+                # amplifier-support#289: `effort` was already validated against
+                # the GLOBAL ladder (EFFORT_ORDER) above -- either as config
+                # default or request.reasoning_effort -- so it's a legal value
+                # in general, just not one THIS model declares. Provider config
+                # is intentionally model-agnostic (one block can serve many
+                # models via a routing matrix / mid-session switch), so this
+                # mismatch is the NORMAL case, not an edge case. Clamp to the
+                # model's highest supported tier <= what was requested (e.g.
+                # "max" -> "xhigh" on claude-sonnet-5) instead of omitting
+                # output_config.effort entirely -- omitting it lets the API
+                # apply its own server-side default effort, which silently
+                # downgrades the user's intent below even the model's OWN
+                # ceiling.
+                clamped = _clamp_effort_to_supported(
+                    effort, request_caps.supported_efforts
                 )
+                if clamped is not None:
+                    params["output_config"] = {"effort": clamped}
+                    # Log the downgrade once per (model, requested-effort) pair
+                    # at INFO, not on every request. The prior behavior was a
+                    # per-request WARNING -- an identical line on every single
+                    # call once a session settled on a mismatched model, which
+                    # is the field-reported symptom in amplifier-support#289.
+                    log_key = (params["model"], effort)
+                    if log_key not in _effort_downgrade_logged:
+                        _effort_downgrade_logged.add(log_key)
+                        logger.info(
+                            "[PROVIDER] Clamping effort '%s' to '%s' for %s "
+                            "(model maximum; supported: %s)",
+                            effort,
+                            clamped,
+                            params["model"],
+                            request_caps.supported_efforts,
+                        )
+                else:
+                    # effort isn't a recognized value at all (e.g. a typo like
+                    # "ultra"), or -- defensively -- no supported tier has rank
+                    # <= it. Preserve the original warn-and-omit behavior; we
+                    # should not guess a fallback for a value we don't
+                    # understand.
+                    logger.warning(
+                        "[PROVIDER] Effort level '%s' not supported by %s "
+                        "(supported: %s) — omitting output_config.effort",
+                        effort,
+                        params["model"],
+                        request_caps.supported_efforts,
+                    )
 
         # Task budget (beta): output_config.task_budget for Opus 4.7+
         # COE CONSTRAINT: Use `is not None` (not `or`) to avoid falsy-zero bug.
