@@ -407,6 +407,27 @@ class TestThinkingAlwaysOn:
         caps = AnthropicProvider._get_capabilities("claude-sonnet-4-6")
         assert caps.thinking_always_on is False
 
+    def test_opus_5_capabilities_match_opus_48_gate(self):
+        """claude-opus-5 must match claude-opus-4-8's capability matrix.
+
+        This is a regression guard proving the existing numeric version-gate
+        (is_48_plus = not version_known or (major, minor) >= (4, 8)) already
+        handles Opus 5 correctly, since (5, 0) >= (4, 8). No code change is
+        required for Opus 5 capability detection.
+        """
+        caps_5 = AnthropicProvider._get_capabilities("claude-opus-5")
+        caps_48 = AnthropicProvider._get_capabilities("claude-opus-4-8")
+
+        assert caps_5.family == "opus"
+        assert caps_5.max_output_tokens == 128000
+        assert caps_5.supports_1m is True
+        assert caps_5.supports_adaptive_thinking is True
+        assert caps_5.supports_manual_thinking is False
+        assert caps_5.supported_efforts == ("low", "medium", "high", "xhigh", "max")
+        assert caps_5.supports_speed is True
+        assert caps_5.supports_inline_system is True
+        assert caps_5 == caps_48
+
 
 class TestGetCapabilitiesFable5:
     """Fable 5 capability matrix."""
@@ -500,18 +521,18 @@ class TestThinkingAlwaysOnRequestBehavior:
 
 
 class TestGetCapabilitiesSonnet5:
-    """Sonnet 5 (Jun 2026): output_config effort API through xhigh, adaptive-only
+    """Sonnet 5 (Jun 2026): output_config effort API through xhigh/max, adaptive-only
     thinking (manual type='enabled' -> HTTP 400), displayed thinking, task budget.
-    Modeled on the Opus 4.7+ surface + the Sonnet 5 launch; no 'max', no fast mode."""
+    Modeled on the Opus 4.7+ surface + the Sonnet 5 launch; no fast mode."""
 
     def test_sonnet_5_supports_output_config(self):
         caps = AnthropicProvider._get_capabilities("claude-sonnet-5")
         assert caps.supports_output_config is True
 
-    def test_sonnet_5_efforts_through_xhigh(self):
+    def test_sonnet_5_efforts_through_max(self):
         caps = AnthropicProvider._get_capabilities("claude-sonnet-5")
-        assert caps.supported_efforts == ("low", "medium", "high", "xhigh")
-        assert "max" not in caps.supported_efforts
+        assert caps.supported_efforts == ("low", "medium", "high", "xhigh", "max")
+        assert "max" in caps.supported_efforts
 
     def test_sonnet_5_thinking_surface(self):
         caps = AnthropicProvider._get_capabilities("claude-sonnet-5")
@@ -556,7 +577,7 @@ class TestGetCapabilitiesSonnet5:
             base, _RuntimeModelInfo()
         )
         assert overridden.supports_output_config is True
-        assert overridden.supported_efforts == ("low", "medium", "high", "xhigh")
+        assert overridden.supported_efforts == ("low", "medium", "high", "xhigh", "max")
         assert overridden.supports_manual_thinking is False
         assert overridden.supports_task_budget is True
         assert overridden.thinking_display_required is True

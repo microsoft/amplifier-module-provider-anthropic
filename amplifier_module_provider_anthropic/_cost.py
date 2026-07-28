@@ -126,6 +126,16 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_write_per_m": Decimal("6.25"),
     },
     # ------------------------------------------------------------------
+    # Claude Opus 5  ($5 / $25 / $0.50 / $6.25 — same rates as Opus 4.8)
+    # Source: docs.anthropic.com/en/docs/about-claude/pricing (verified 2026-07-24)
+    # ------------------------------------------------------------------
+    "claude-opus-5": {
+        "input_per_m": Decimal("5.00"),
+        "output_per_m": Decimal("25.00"),
+        "cache_read_per_m": Decimal("0.50"),
+        "cache_write_per_m": Decimal("6.25"),
+    },
+    # ------------------------------------------------------------------
     # Claude Fable 5  ($10 / $50 / $1.00 / $12.50)
     # Exactly 2x Opus 4.8 on every rate.
     # NOTE: A 1-hour cache write tier exists at $20.00/MTok but Anthropic's
@@ -194,6 +204,7 @@ _FAST_ELIGIBLE_MODELS: set[str] = {
     "claude-opus-4-6",
     "claude-opus-4-7",
     "claude-opus-4-8",
+    "claude-opus-5",
 }
 
 

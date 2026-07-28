@@ -120,16 +120,18 @@ config = {
 
 ### Reasoning Effort
 
-The `effort` config key sets a session-level default reasoning effort applied to
-**every** request, so you can opt into stronger reasoning once instead of
-supplying it per-request.
+The `reasoning_effort` config key (canonical — it matches the kernel's portable
+`request.reasoning_effort` field) sets a session-level default reasoning effort
+applied to **every** request, so you can opt into stronger reasoning once
+instead of supplying it per-request. The legacy `effort` key remains a working
+alias; when both are set, `reasoning_effort` wins (a warning is logged).
 
 ```yaml
 providers:
   - module: provider-anthropic
     config:
       default_model: claude-opus-4-8
-      effort: xhigh
+      reasoning_effort: xhigh  # legacy alias: effort
 ```
 
 **This enables extended thinking.** In this provider, `effort` (like the kernel's

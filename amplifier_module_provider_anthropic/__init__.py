@@ -548,6 +548,22 @@ class AnthropicProvider:
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "claude-sonnet-4-5")
         self._default_caps = self._get_capabilities(self.default_model)
+
+        # Effort-family config keys. Canonical key: "reasoning_effort" (matches
+        # the kernel's portable request.reasoning_effort). Legacy alias:
+        # "effort". Both are consumed in _build_params; when both are set the
+        # canonical key wins — warn at construction so precedence is never
+        # silent.
+        if (
+            self.config.get("reasoning_effort") is not None
+            and self.config.get("effort") is not None
+        ):
+            logger.warning(
+                "[PROVIDER] Both 'reasoning_effort' and 'effort' are set in "
+                "config; 'reasoning_effort' (canonical) wins and 'effort'=%r "
+                "is ignored.",
+                self.config.get("effort"),
+            )
         self.max_tokens = self.config.get(
             "max_tokens", self._default_caps.max_output_tokens
         )
@@ -832,7 +848,12 @@ class AnthropicProvider:
                     default="true",
                 ),
                 ConfigField(
-                    id="effort",
+                    # Canonical key — matches the kernel's portable
+                    # request.reasoning_effort and the key used by the shipped
+                    # routing matrices. ConfigField.id is written verbatim into
+                    # settings.yaml, so this must be the canonical name, never
+                    # the legacy "effort" alias.
+                    id="reasoning_effort",
                     display_name="Reasoning Effort",
                     field_type="choice",
                     choices=["low", "medium", "high", "xhigh", "max"],
@@ -1039,7 +1060,8 @@ class AnthropicProvider:
         Version requirements
         --------------------
         * **Fable 5** — always-on adaptive thinking, 128K output, no manual thinking
-        * **Opus 4.6+** — 1M context, adaptive thinking, 128K output
+        * **Opus 4.6+** (incl. Opus 5 — confirmed via numeric version-gate, verified
+          2026-07-24) — 1M context, adaptive thinking, 128K output
         * **Sonnet 4.5+** — 1M context, extended thinking, 64K output
         * **Haiku 4.5+** — fast inference, extended thinking, no adaptive, no 1M
 
@@ -1115,12 +1137,13 @@ class AnthropicProvider:
             is_46_plus = not version_known or (major, minor) >= (4, 6)
             is_45_plus = is_46_plus or (major, minor) >= (4, 5)
             # Sonnet 5 (Jun 2026) gains the output_config effort API through the
-            # "xhigh" tier and the same thinking surface as Opus 4.7+: adaptive
-            # thinking only (manual type="enabled" returns HTTP 400), thinking
-            # block displayed by default, and task-budget support. Verified live
-            # against claude-sonnet-5 (2026-07-01): output_config.effort=xhigh
-            # -> 200; thinking.type=enabled -> 400. Sonnet has no "max" effort
-            # and no Opus-only fast mode.
+            # "xhigh"/"max" tiers and the same thinking surface as Opus 4.7+:
+            # adaptive thinking only (manual type="enabled" returns HTTP 400),
+            # thinking block displayed by default, and task-budget support.
+            # Verified live against claude-sonnet-5 (2026-07-01):
+            # output_config.effort=xhigh -> 200; thinking.type=enabled -> 400.
+            # Sonnet 5 also accepts the "max" effort tier (confirmed 2026-07-20);
+            # it has no Opus-only fast mode.
             is_5_plus = not version_known or (major, minor) >= (5, 0)
             return ModelCapabilities(
                 family="sonnet",
@@ -1135,7 +1158,7 @@ class AnthropicProvider:
                 # omit it, matching the Opus 4.7+ pattern. amplifier-support#299.
                 supports_sampling=not is_5_plus,
                 supported_efforts=(
-                    ("low", "medium", "high", "xhigh")
+                    ("low", "medium", "high", "xhigh", "max")
                     if is_5_plus
                     else ("low", "medium", "high")
                 ),
@@ -2442,7 +2465,15 @@ class AnthropicProvider:
         #       later (see the output_config block).  It does NOT feed this
         #       thinking path and does NOT enable thinking on its own.
         if reasoning_effort is None:
-            config_effort = self.config.get("effort")
+            # Canonical config key first ("reasoning_effort", matching the
+            # kernel's portable request.reasoning_effort), then the legacy
+            # "effort" alias. When both are set the canonical key wins (a
+            # one-time warning is emitted in __init__).
+            config_key = "reasoning_effort"
+            config_effort = self.config.get("reasoning_effort")
+            if config_effort is None:
+                config_key = "effort"
+                config_effort = self.config.get("effort")
             if config_effort is not None:
                 # Validate/normalise the config value so a typo (e.g. "ultra",
                 # "High", "EXTRA HIGH") can't silently flip thinking on with a
@@ -2453,8 +2484,8 @@ class AnthropicProvider:
                     reasoning_effort = normalized
                 else:
                     logger.warning(
-                        "[PROVIDER] Ignoring invalid config 'effort'=%r "
-                        "(valid values: %s)",
+                        "[PROVIDER] Ignoring invalid config '%s'=%r (valid values: %s)",
+                        config_key,
                         config_effort,
                         ", ".join(valid_efforts),
                     )

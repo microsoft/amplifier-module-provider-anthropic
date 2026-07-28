@@ -385,3 +385,24 @@ def test_sonnet_5_cache_write_cost():
     """claude-sonnet-5: 1M cache-write -> $3.75 (125% of input)."""
     result = compute_cost("claude-sonnet-5", cache_creation_input_tokens=1_000_000)
     assert result == Decimal("3.75"), f"Expected Decimal('3.75'), got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# Claude Opus 5 pricing: same rates as Opus 4.8, and fast-mode eligible
+# ---------------------------------------------------------------------------
+def test_opus_5_standard_rate():
+    cost = compute_cost("claude-opus-5", input_tokens=1_000_000, output_tokens=1_000_000)
+    assert cost == Decimal("5.00") + Decimal("25.00")
+
+
+def test_opus_5_fast_mode_multiplier():
+    standard = compute_cost(
+        "claude-opus-5", input_tokens=1_000_000, output_tokens=1_000_000
+    )
+    fast = compute_cost(
+        "claude-opus-5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        speed="fast",
+    )
+    assert fast == standard * 2

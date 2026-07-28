@@ -459,6 +459,25 @@ class TestConfigEffortDefault:
         assert params.get("output_config", {}).get("effort") == "max"
         assert params["thinking"]["type"] == "adaptive"
 
+    def test_config_effort_max_on_sonnet_5_sets_output_config(self):
+        """config effort='max' on Sonnet 5 → output_config.effort=max + adaptive.
+
+        Regression guard: Sonnet 5 accepts the 'max' effort tier (confirmed
+        2026-07-20). Previously 'max' was omitted from supported_efforts, so the
+        provider dropped output_config.effort and logged a warning.
+        """
+        provider = _make_provider_with_effort("max", default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params.get("output_config", {}).get("effort") == "max"
+        assert params["thinking"]["type"] == "adaptive"
+
     def test_config_effort_xhigh_unsupported_on_sonnet_omits_output_config(self):
         """config effort='xhigh' on a model that lacks output_config → omitted.
 
@@ -478,6 +497,182 @@ class TestConfigEffortDefault:
         params = _get_api_params(provider.client.messages.with_raw_response.create)
         assert "output_config" not in params
         assert "thinking" in params
+
+
+# ---------------------------------------------------------------------------
+# Canonical `reasoning_effort` config key (portable kernel key)
+# ---------------------------------------------------------------------------
+
+
+def _make_provider_with_config(
+    config_overrides: dict[str, Any],
+    default_model: str = "claude-sonnet-4-5-20250929",
+) -> AnthropicProvider:
+    """Provider with arbitrary effort-family config keys."""
+    provider = AnthropicProvider(
+        api_key="test-key",
+        config={
+            "use_streaming": False,
+            "max_retries": 0,
+            "default_model": default_model,
+            **config_overrides,
+        },
+    )
+    provider.coordinator = cast(ModuleCoordinator, FakeCoordinator())
+    return provider
+
+
+class TestCanonicalReasoningEffortConfigKey:
+    """config['reasoning_effort'] is the canonical effort key (matches the
+    kernel's portable request.reasoning_effort). config['effort'] remains a
+    working alias; when both are set, 'reasoning_effort' wins.
+    """
+
+    def test_canonical_key_enables_thinking(self):
+        """config reasoning_effort='high' + no request effort -> thinking enabled."""
+        provider = _make_provider_with_config({"reasoning_effort": "high"})
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" in params
+
+    def test_canonical_key_low_maps_to_small_budget(self):
+        """config reasoning_effort='low' -> type='enabled', budget_tokens=4096."""
+        provider = _make_provider_with_config({"reasoning_effort": "low"})
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["thinking"]["type"] == "enabled"
+        assert params["thinking"]["budget_tokens"] == 4096
+
+    def test_canonical_key_wins_over_effort_alias(self):
+        """Both set: reasoning_effort='low' beats effort='high' (budget=4096)."""
+        provider = _make_provider_with_config(
+            {"reasoning_effort": "low", "effort": "high"}
+        )
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        # 'low' wins -> enabled + 4096; would be default budget if 'high' leaked
+        assert params["thinking"]["type"] == "enabled"
+        assert params["thinking"]["budget_tokens"] == 4096
+
+    def test_both_keys_set_warns_at_init(self, caplog):
+        """Setting both keys logs a precedence warning once at provider init."""
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            _make_provider_with_config({"reasoning_effort": "low", "effort": "high"})
+
+        assert any(
+            "reasoning_effort" in r.message and "effort" in r.message
+            for r in caplog.records
+        )
+
+    def test_request_effort_wins_over_canonical_config_key(self):
+        """request.reasoning_effort='low' overrides config reasoning_effort='high'."""
+        provider = _make_provider_with_config({"reasoning_effort": "high"})
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="low",
+        )
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["thinking"]["type"] == "enabled"
+        assert params["thinking"]["budget_tokens"] == 4096
+
+    def test_invalid_canonical_key_is_ignored_with_warning(self, caplog):
+        """Invalid reasoning_effort ('ultra') warns naming the key, no thinking."""
+        import logging
+
+        provider = _make_provider_with_config({"reasoning_effort": "ultra"})
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" not in params
+        assert any(
+            "reasoning_effort" in r.message and "ultra" in r.message
+            for r in caplog.records
+        )
+
+    def test_effort_alias_still_works_alone(self):
+        """Legacy config effort='high' alone still enables thinking (unchanged)."""
+        provider = _make_provider_with_config({"effort": "high"})
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" in params
+
+
+class TestEffortConfigFieldIsCanonical:
+    """get_info() must advertise the canonical key.
+
+    ConfigField.id is written verbatim into settings.yaml by the app-CLI
+    (provider install wizard and routing-matrix editor), so advertising the
+    legacy "effort" alias would make the CLI generate the deprecated key.
+    """
+
+    def test_config_field_id_is_reasoning_effort(self):
+        provider = _make_provider()
+        field_ids = {f.id for f in provider.get_info().config_fields}
+
+        assert "reasoning_effort" in field_ids
+        assert "effort" not in field_ids
+
+    def test_config_field_still_offers_all_effort_tiers(self):
+        provider = _make_provider()
+        field = next(
+            f for f in provider.get_info().config_fields if f.id == "reasoning_effort"
+        )
+
+        assert field.choices == ["low", "medium", "high", "xhigh", "max"]
+
+
+class TestNoSpuriousEffortWarnings:
+    """A config without effort-family keys must emit no effort warnings."""
+
+    def test_no_warning_when_no_effort_keys_set(self, caplog):
+        """A config without effort-family keys emits no effort warnings."""
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            _make_provider()
+
+        assert not any(
+            "not consumed" in r.message or "canonical" in r.message
+            for r in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------
