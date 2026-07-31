@@ -139,7 +139,7 @@ SDK exceptions are translated to kernel errors before the retry loop sees them. 
 | `OverloadedError` | 529 | `ProviderUnavailableError` | 529 | Yes (10× backoff) |
 | `InternalServerError` | 5xx | `ProviderUnavailableError` | 5xx | Yes |
 | `AuthenticationError` | 401 | `AuthenticationError` | 401 | No |
-| `BadRequestError` | context length / too many tokens | `ContextLengthError` | 400 | No |
+| `BadRequestError` | prompt/context window overflow (e.g. `prompt is too long: ... tokens > ... maximum`) | `ContextLengthError` | 400 | No |
 | `BadRequestError` | safety / content filter / blocked | `ContentFilterError` | 400 | No |
 | `BadRequestError` | other | `InvalidRequestError` | 400 | No |
 | `APIStatusError` | 403 | `AccessDeniedError` | 403 | No |

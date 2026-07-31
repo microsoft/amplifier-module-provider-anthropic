@@ -233,6 +233,32 @@ PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
 FALLBACK_STATE_VERSION = 1
 
 # ---------------------------------------------------------------------------
+# Context-overflow detection markers
+# ---------------------------------------------------------------------------
+# Anthropic returns context-window overflow as HTTP 400
+# invalid_request_error. There is no machine-readable code for it -- the
+# error.type is the generic "invalid_request_error" shared with every other
+# 400 -- so the message is the only discriminator. Two shapes exist:
+#   "prompt is too long: 208310 tokens > 200000 maximum"
+#   "input length and `max_tokens` exceed context limit: 189127 + 16000 > 200000, ..."
+# The legacy markers are retained so gateways that rewrite the message
+# (and other providers' phrasing) still classify correctly.
+_CONTEXT_OVERFLOW_MESSAGE_MARKERS = (
+    "prompt is too long",
+    "exceed context limit",
+    "context length",
+    "too many tokens",
+    "maximum context",
+    "context window",
+)
+
+
+def _is_context_overflow(raw_msg: str) -> bool:
+    """True when an Anthropic 400 denotes context-window overflow."""
+    return any(m in raw_msg for m in _CONTEXT_OVERFLOW_MESSAGE_MARKERS)
+
+
+# ---------------------------------------------------------------------------
 # Deprecated model retirement dates — warn once per process per model
 # ---------------------------------------------------------------------------
 _DEPRECATED_MODELS: dict[str, str] = {
@@ -2864,7 +2890,7 @@ class AnthropicProvider:
                 raw_msg = str(e).lower()
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
-                if "context length" in raw_msg or "too many tokens" in raw_msg:
+                if _is_context_overflow(raw_msg):
                     raise KernelContextLengthError(
                         error_msg,
                         provider="anthropic",

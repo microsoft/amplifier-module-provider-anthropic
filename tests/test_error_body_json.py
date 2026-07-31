@@ -153,12 +153,12 @@ class TestBadRequestErrorUsesBodyJson:
             "type": "error",
             "error": {
                 "type": "invalid_request_error",
-                "message": "prompt is too long: context length exceeded",
+                "message": "prompt is too long: 208310 tokens > 200000 maximum",
             },
         }
         sdk_error = _make_anthropic_error_with_body(
             anthropic.BadRequestError,
-            "prompt is too long: context length exceeded",
+            "prompt is too long: 208310 tokens > 200000 maximum",
             status_code=400,
             body=body,
         )
@@ -223,7 +223,7 @@ class TestBadRequestErrorUsesBodyJson:
         provider = _make_provider()
         sdk_error = _make_anthropic_error_with_body(
             anthropic.BadRequestError,
-            "prompt is too long: context length exceeded",
+            "prompt is too long: 208310 tokens > 200000 maximum",
             status_code=400,
             body=None,
         )
@@ -234,7 +234,7 @@ class TestBadRequestErrorUsesBodyJson:
         with pytest.raises(KernelContextLengthError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        assert "context length exceeded" in str(exc_info.value)
+        assert "prompt is too long" in str(exc_info.value)
 
     def test_content_filter_error_falls_back_to_str_when_body_none(self):
         provider = _make_provider()
