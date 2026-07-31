@@ -128,7 +128,7 @@ class TestBadRequestErrorTranslation:
         provider = _make_provider()
         sdk_error = _make_anthropic_error(
             anthropic.BadRequestError,
-            "prompt is too long: context length exceeded",
+            "prompt is too long: 208310 tokens > 200000 maximum",
             status_code=400,
         )
         provider.client.messages.with_raw_response.create = AsyncMock(
@@ -354,7 +354,7 @@ class TestModelPassthrough:
         provider = _make_provider()
         sdk_error = _make_anthropic_error(
             anthropic.BadRequestError,
-            "prompt is too long: context length exceeded",
+            "prompt is too long: 208310 tokens > 200000 maximum",
             status_code=400,
         )
         provider.client.messages.with_raw_response.create = AsyncMock(
