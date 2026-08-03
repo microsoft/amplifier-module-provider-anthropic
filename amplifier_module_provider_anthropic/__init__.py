@@ -224,6 +224,27 @@ async def _get_process_semaphore(max_concurrent: int) -> asyncio.Semaphore | Non
 
 
 # Beta header constants — single source of truth for experimental feature headers
+# Model-native (server-side) tool types that require an anthropic-beta header.
+#
+# A native tool is declared on the wire as {"type": "<tool_type>", ...} rather
+# than as a function schema. Anthropic gates several of these behind a beta
+# header, and omitting it makes the API reject the whole request. The tool type
+# is the only thing that determines which header is needed, so the provider can
+# derive it rather than requiring every caller to know the mapping and inject
+# the header itself.
+#
+# Without this, a caller that wants a beta-gated native tool has to reach into
+# the provider's private `_beta_headers` to add the header - a pattern that
+# breaks whenever the attribute is renamed and fails silently when it does.
+#
+# Tool types absent from this map need no beta header (e.g. web_search_20250305,
+# which is generally available) and are passed through unchanged.
+NATIVE_TOOL_BETA_HEADERS: dict[str, str] = {
+    "computer_20241022": "computer-use-2024-10-22",
+    "computer_20250124": "computer-use-2025-01-24",
+    "computer_20251124": "computer-use-2025-11-24",
+}
+
 BETA_HEADER_1M_CONTEXT = "context-1m-2025-08-07"
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
 BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
@@ -1285,6 +1306,34 @@ class AnthropicProvider:
             return False
         return resolved_thinking_type is not None
 
+    def _derive_native_tool_betas(
+        self, tools: list[dict[str, Any]] | None
+    ) -> list[str]:
+        """Return the beta headers required by native tool types in `tools`.
+
+        A model-native tool declares itself on the wire as
+        ``{"type": "<tool_type>", ...}``. Several are gated behind an
+        anthropic-beta header, and omitting it makes the API reject the entire
+        request. The tool type fully determines the header, so deriving it here
+        means a caller can declare a native tool without also knowing which
+        header it needs.
+
+        Unknown types are ignored rather than guessed at: a type absent from
+        `NATIVE_TOOL_BETA_HEADERS` either needs no header or is one this
+        provider version has not seen, and inventing a header string would turn
+        a working request into a rejected one.
+        """
+        if not tools:
+            return []
+        derived: list[str] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            beta = NATIVE_TOOL_BETA_HEADERS.get(tool.get("type") or "")
+            if beta and beta not in derived:
+                derived.append(beta)
+        return derived
+
     def _build_request_beta_headers(
         self,
         *,
@@ -1294,9 +1343,17 @@ class AnthropicProvider:
         resolved_thinking_type: str | None,
         has_task_budget: bool = False,
         fast_mode: bool = False,
+        tools: list[dict[str, Any]] | None = None,
     ) -> list[str]:
-        """Build the anthropic-beta header set for a specific effective model."""
+        """Build the anthropic-beta header set for a specific effective model.
+
+        `tools` is the wire-format tool list. When supplied, any beta headers
+        required by model-native tool types present in it are derived here (see
+        `NATIVE_TOOL_BETA_HEADERS`), so a caller declaring a beta-gated native
+        tool does not also have to know - and inject - the matching header.
+        """
         headers = list(self._beta_headers)
+        headers.extend(self._derive_native_tool_betas(tools))
         if self._should_add_context_1m_beta(model_id, request_caps):
             headers.append(BETA_HEADER_1M_CONTEXT)
         if self._should_add_interleaved_beta(
@@ -2630,6 +2687,7 @@ class AnthropicProvider:
             resolved_thinking_type=resolved_thinking_type,
             has_task_budget=has_task_budget,
             fast_mode=fast_mode_enabled,
+            tools=params.get("tools"),
         )
         if request_beta_headers:
             extra_headers = dict(params.get("extra_headers", {}))
@@ -3758,22 +3816,43 @@ class AnthropicProvider:
     def _apply_tool_cache_control(
         self, tools: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Add cache_control to the last tool definition.
+        """Add cache_control to the last *function* tool definition.
 
-        Per Anthropic spec: cache breakpoint on last tool creates
-        checkpoint for entire tool list.
+        Per Anthropic spec: a cache breakpoint on the last tool creates a
+        checkpoint for the entire tool list.
+
+        Model-native tools (``web_search_20250305``, ``computer_20251124``,
+        ...) are server-side definitions whose schema is fixed by Anthropic
+        and does not accept ``cache_control``. Stamping one is rejected by
+        the API, so the breakpoint goes on the last tool that can carry it -
+        a function tool. Because the breakpoint still covers everything
+        declared before it, and native tools are appended after the
+        function tools, the caching benefit is unchanged.
+
+        This mirrors what the native web-search path already does when it
+        appends its own tool.
 
         Args:
             tools: List of Anthropic-formatted tool definitions
 
         Returns:
-            Same list with cache_control on last tool (if caching enabled)
+            Same list with cache_control on the last function tool (if
+            caching is enabled and at least one function tool is present)
         """
         if not tools or not self.enable_prompt_caching:
             return tools
 
-        # Add cache_control to last tool
-        tools[-1]["cache_control"] = {"type": "ephemeral"}
+        # Walk backwards to the last tool that can carry a cache breakpoint.
+        # A tool is a function tool when it has no "type" (the classic shape)
+        # or explicitly declares type == "function".
+        for tool in reversed(tools):
+            tool_type = tool.get("type")
+            if tool_type is None or tool_type == "function":
+                tool["cache_control"] = {"type": "ephemeral"}
+                break
+        # No function tool present (native tools only) - nothing can carry the
+        # breakpoint. Return unstamped rather than sending a request the API
+        # will reject.
         return tools
 
     def _apply_message_cache_control(
