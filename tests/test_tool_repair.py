@@ -5,13 +5,10 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
-
 from amplifier_core import ModuleCoordinator
-from amplifier_core.message_models import ChatRequest
-from amplifier_core.message_models import Message
-from amplifier_core.message_models import ToolCallBlock
-from amplifier_module_provider_anthropic import AnthropicProvider
+from amplifier_core.message_models import ChatRequest, Message, ToolCallBlock
 
+from amplifier_module_provider_anthropic import AnthropicProvider
 from tests._helpers import DummyResponse, FakeCoordinator
 
 
@@ -33,6 +30,28 @@ class MockStreamManager:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         return False
+
+    def __aiter__(self):
+        """Yield no events, matching a stream whose content is already final.
+
+        The real SDK stream manager is an async iterator: the provider does
+        `async for event in stream` to observe deltas and emit hooks, then
+        calls `get_final_message()` for the assembled result. This mock
+        previously implemented only the context-manager half, so the
+        `async for` raised TypeError -- surfacing as an LLMError that the
+        provider then retried 5 times, which reads as a provider bug rather
+        than an incomplete mock.
+
+        These tests exercise tool-call repair on the *final* message, not
+        incremental delta handling, so an empty event stream is the accurate
+        shape: nothing streamed, `get_final_message()` supplies the response.
+        """
+
+        async def _events():
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        return _events()
 
     async def get_final_message(self):
         return self._api_response
@@ -547,7 +566,10 @@ def test_resume_end_to_end_synthetic_results_reach_anthropic_api():
     for msg in api_messages:
         if msg.get("role") == "assistant":
             for block in msg.get("content", []):
-                if isinstance(block, dict) and block.get("type") in ("tool_use", "tool_call"):
+                if isinstance(block, dict) and block.get("type") in (
+                    "tool_use",
+                    "tool_call",
+                ):
                     tool_call_ids.add(block["id"])
         if msg.get("role") == "user":
             for block in msg.get("content", []):
