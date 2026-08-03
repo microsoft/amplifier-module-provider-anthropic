@@ -1124,6 +1124,12 @@ class AnthropicProvider:
 
         if family == "sonnet":
             is_46_plus = not version_known or (major, minor) >= (4, 6)
+            # TODO(verify-live): haiku has no 4.6+ branch. opus and sonnet both flip to
+            # computer_20251124 at 4.6 - if that threshold is an org-wide API rollout
+            # rather than per-family, the next haiku release gets the WRONG (older)
+            # type here. It fails loud (the two generations mutually reject), but this
+            # is the one spot that ASSERTS rather than returning None like every other
+            # unverified case. Re-probe when a haiku 4.6+ ships.
             is_45_plus = is_46_plus or (major, minor) >= (4, 5)
             # Sonnet 5 (Jun 2026) gains the output_config effort API through the
             # "xhigh"/"max" tiers and the same thinking surface as Opus 4.7+:
