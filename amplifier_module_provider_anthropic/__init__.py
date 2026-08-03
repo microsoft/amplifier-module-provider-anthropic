@@ -337,6 +337,14 @@ class ModelCapabilities:
     thinking_always_on: bool = (
         False  # True = thinking is always active; NEVER send thinking:{type:disabled}
     )
+    supports_native_computer_use: bool = False  # True = model accepts a "computer_*" native tool type (see computer_use_tool_type)
+    computer_use_tool_type: str | None = (
+        None  # Which "computer_*" wire type this model accepts -- Anthropic's versioned
+        # computer-use tool has three incompatible generations (computer_20241022,
+        # computer_20250124, computer_20251124) and a model paired with the wrong one
+        # is rejected outright (HTTP 400), unlike OpenAI's single bare "computer" type.
+        # None means this model does not support the tool at all.
+    )
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
 
 
@@ -1006,6 +1014,18 @@ class AnthropicProvider:
         * **Sonnet 4.5+** — 1M context, extended thinking, 64K output
         * **Haiku 4.5+** — fast inference, extended thinking, no adaptive, no 1M
 
+        Computer-use wire type (``computer_use_tool_type``) — live-probed against
+        api.anthropic.com 2026-08-03, see per-family comments below for the full
+        evidence table:
+
+        * **Opus 4.1-4.5** / **Sonnet/Haiku 4.5** — ``computer_20250124``
+        * **Opus/Sonnet 4.6+** (incl. Opus/Sonnet 5) — ``computer_20251124``
+        * Everything else (below the verified floor, or an unreachable/unverified
+          model such as Fable) — unsupported (``None``)
+
+        These two generations are NOT interchangeable: pairing a model with the
+        wrong one returns HTTP 400, not a graceful fallback.
+
         When the version cannot be parsed from the model ID we assume the
         *latest* capabilities for that family so newly released models work
         out-of-the-box.
@@ -1031,6 +1051,11 @@ class AnthropicProvider:
                 supports_speed=False,
                 supports_inline_system=True,
                 default_thinking_budget=0,  # not used — adaptive only
+                # NOT verified: claude-fable-5 rejects every request in this
+                # workspace ("organization or workspace must have data retention
+                # enabled", HTTP 400, 2026-08-03) — the tool-support question
+                # itself could not be asked live. Left at the conservative
+                # dataclass default (False/None) rather than assumed.
                 capability_tags=(
                     "tools",
                     "thinking",
@@ -1044,6 +1069,27 @@ class AnthropicProvider:
             is_46_plus = not version_known or (major, minor) >= (4, 6)
             is_47_plus = not version_known or (major, minor) >= (4, 7)
             is_48_plus = not version_known or (major, minor) >= (4, 8)
+            # Computer-use wire type, live-probed against api.anthropic.com
+            # 2026-08-03 (bare {"type": ..., "name": "computer", "display_width_px":
+            # 1024, "display_height_px": 768} declarations, matching anthropic-beta
+            # header per NATIVE_TOOL_BETA_HEADERS):
+            #   claude-opus-4-1-20250805 + computer_20250124 -> 200
+            #   claude-opus-4-1-20250805 + computer_20241022/computer_20251124 -> 400
+            #   claude-opus-4-5-20251101 + computer_20250124 -> 200 (also 20251124 -> 200;
+            #     4.5 shipped the same day as the 20251124 generation and accepts both —
+            #     20250124 is returned as the canonical answer since it is the one that
+            #     works across the whole 4.1-4.5 range, not just this one model)
+            #   claude-opus-4-6/4-7/4-8, claude-opus-5 + computer_20251124 -> 200
+            #     (computer_20250124 -> 400 on all of these — the newer generation
+            #     supersedes rather than extends the older one)
+            # Below 4.1 is unverified: the only pre-4.1 opus model (claude-opus-4-20250514)
+            # is retired (HTTP 404) in this workspace, so it could not be probed either way.
+            if is_46_plus:
+                computer_use_tool_type = "computer_20251124"
+            elif version_known and (major, minor) >= (4, 1):
+                computer_use_tool_type = "computer_20250124"
+            else:
+                computer_use_tool_type = None
             return ModelCapabilities(
                 family="opus",
                 max_output_tokens=128000 if is_46_plus else 64000,
@@ -1065,6 +1111,8 @@ class AnthropicProvider:
                 supports_speed=is_48_plus,
                 supports_inline_system=is_48_plus,
                 default_thinking_budget=64000 if is_46_plus else 32000,
+                supports_native_computer_use=computer_use_tool_type is not None,
+                computer_use_tool_type=computer_use_tool_type,
                 capability_tags=(
                     "tools",
                     "thinking",
@@ -1076,6 +1124,12 @@ class AnthropicProvider:
 
         if family == "sonnet":
             is_46_plus = not version_known or (major, minor) >= (4, 6)
+            # TODO(verify-live): haiku has no 4.6+ branch. opus and sonnet both flip to
+            # computer_20251124 at 4.6 - if that threshold is an org-wide API rollout
+            # rather than per-family, the next haiku release gets the WRONG (older)
+            # type here. It fails loud (the two generations mutually reject), but this
+            # is the one spot that ASSERTS rather than returning None like every other
+            # unverified case. Re-probe when a haiku 4.6+ ships.
             is_45_plus = is_46_plus or (major, minor) >= (4, 5)
             # Sonnet 5 (Jun 2026) gains the output_config effort API through the
             # "xhigh"/"max" tiers and the same thinking surface as Opus 4.7+:
@@ -1086,6 +1140,23 @@ class AnthropicProvider:
             # Sonnet 5 also accepts the "max" effort tier (confirmed 2026-07-20);
             # it has no Opus-only fast mode.
             is_5_plus = not version_known or (major, minor) >= (5, 0)
+            # Computer-use wire type, live-probed 2026-08-03 (same method as opus,
+            # above):
+            #   claude-sonnet-4-5-20250929 + computer_20250124 -> 200
+            #   claude-sonnet-4-5-20250929 + computer_20241022/computer_20251124 -> 400
+            #   claude-sonnet-4-6, claude-sonnet-5 + computer_20251124 -> 200
+            #     (computer_20250124 -> 400 on both)
+            # Below 4.5 is unverified for sonnet specifically: claude-sonnet-4-20250514
+            # is retired (HTTP 404) in this workspace and no live sonnet model between
+            # 4.1 and 4.4 exists to probe. Unlike opus (confirmed live down to 4.1), the
+            # sonnet floor is set at the lowest version this evidence actually covers
+            # (4.5) rather than extrapolated down to match opus's threshold.
+            if is_46_plus:
+                computer_use_tool_type = "computer_20251124"
+            elif is_45_plus:
+                computer_use_tool_type = "computer_20250124"
+            else:
+                computer_use_tool_type = None
             return ModelCapabilities(
                 family="sonnet",
                 supports_1m=is_46_plus,
@@ -1104,6 +1175,8 @@ class AnthropicProvider:
                     else ("low", "medium", "high")
                 ),
                 default_thinking_budget=32000,
+                supports_native_computer_use=computer_use_tool_type is not None,
+                computer_use_tool_type=computer_use_tool_type,
                 capability_tags=(
                     "tools",
                     "thinking",
@@ -1115,11 +1188,23 @@ class AnthropicProvider:
 
         if family == "haiku":
             is_45_plus = not version_known or (major, minor) >= (4, 5)
+            # Computer-use wire type, live-probed 2026-08-03 (same method as opus,
+            # above): claude-haiku-4-5-20251001 + computer_20250124 -> 200;
+            # computer_20241022/computer_20251124 -> 400. No haiku model at 4.6+
+            # exists live to test whether haiku ever adopts computer_20251124 the
+            # way opus/sonnet do at that threshold, so that jump is NOT assumed
+            # here — is_45_plus (which also covers "unknown version") maps to the
+            # one wire type actually confirmed for this family. Below 4.5
+            # (e.g. the retired claude-haiku-3-5) is unverified — HTTP 404 in
+            # this workspace — and left unsupported.
+            computer_use_tool_type = "computer_20250124" if is_45_plus else None
             return ModelCapabilities(
                 family="haiku",
                 supports_thinking=is_45_plus,
                 supports_adaptive_thinking=False,
                 default_thinking_budget=32000 if is_45_plus else 0,
+                supports_native_computer_use=computer_use_tool_type is not None,
+                computer_use_tool_type=computer_use_tool_type,
                 capability_tags=("tools", "streaming", "json_mode", "fast", "vision")
                 + (("thinking",) if is_45_plus else ()),
             )
@@ -1231,6 +1316,15 @@ class AnthropicProvider:
             supports_inline_system=base_caps.supports_inline_system,
             thinking_always_on=base_caps.thinking_always_on,
             default_thinking_budget=default_thinking_budget,
+            # Not derived from the Models API — Anthropic's model metadata carries
+            # no computer-use signal, so the family/version-gated static value is
+            # always the source of truth here. Must still be forwarded explicitly
+            # or a live-request override silently resets it to the dataclass
+            # default (False/None), the same class of bug the sonnet-5 override
+            # regression guard (test_sonnet_5_caps_survive_runtime_override) exists
+            # to catch.
+            supports_native_computer_use=base_caps.supports_native_computer_use,
+            computer_use_tool_type=base_caps.computer_use_tool_type,
             capability_tags=tuple(capability_tags),
         )
 
