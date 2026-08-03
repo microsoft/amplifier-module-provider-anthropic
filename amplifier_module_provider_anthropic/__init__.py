@@ -3688,9 +3688,28 @@ class AnthropicProvider:
             # Native tools like web_search_20250305 are passed through unchanged
             tool_type = getattr(tool, "type", None)
             if tool_type and tool_type != "function":
-                # Model-native tool - pass through as-is (converted to dict if needed)
+                # Model-native tool - pass through, minus the function-tool-only
+                # fields.
+                #
+                # A native tool's schema is fixed server-side by Anthropic, so it
+                # accepts only its own keys (`type`, `name`, and per-tool config
+                # like `display_width_px`). `parameters` and `description` are
+                # function-tool concepts and the API rejects them outright:
+                #
+                #   invalid_request_error
+                #   tools.0.computer_20251124.parameters: Extra inputs are not permitted
+                #
+                # These two keys are hard to avoid upstream: `ToolSpec.parameters`
+                # is a required dict (it rejects `None`), so any caller building a
+                # native ToolSpec is forced to carry a value that must not reach
+                # the wire. Dropping them here - where we already know the tool is
+                # native - is the one place that knowledge lives, rather than
+                # requiring every caller to know which keys are illegal.
                 if hasattr(tool, "model_dump"):
-                    anthropic_tools.append(tool.model_dump(exclude_none=True))
+                    native = tool.model_dump(exclude_none=True)
+                    for function_only_key in ("parameters", "description"):
+                        native.pop(function_only_key, None)
+                    anthropic_tools.append(native)
                 elif isinstance(tool, dict):
                     anthropic_tools.append(tool)
                 else:
