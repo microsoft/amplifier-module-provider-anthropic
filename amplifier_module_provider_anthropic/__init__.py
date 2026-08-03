@@ -3462,7 +3462,7 @@ class AnthropicProvider:
 
         return valid_calls
 
-    def _clean_content_block(self, block: dict[str, Any]) -> dict[str, Any]:
+    def _clean_content_block(self, block: dict[str, Any]) -> dict[str, Any] | None:
         """Clean a content block for API by removing fields not accepted by Anthropic API.
 
         Anthropic API may include extra fields (like 'visibility') in responses,
@@ -3472,17 +3472,33 @@ class AnthropicProvider:
             block: Raw content block dict (may include visibility, etc.)
 
         Returns:
-            Cleaned content block dict with only API-accepted fields
+            Cleaned content block dict with only API-accepted fields, or None
+            if the block must be dropped entirely (thinking block without a
+            valid signature -- Anthropic rejects those with HTTP 400)
         """
         block_type = block.get("type")
 
         if block_type == "text":
             return {"type": "text", "text": block.get("text", "")}
         if block_type == "thinking":
-            cleaned = {"type": "thinking", "thinking": block.get("thinking", "")}
-            if "signature" in block:
-                cleaned["signature"] = block["signature"]
-            return cleaned
+            # Anthropic requires a valid non-empty signature string on every
+            # thinking block sent as input. Thinking blocks persisted by other
+            # providers (e.g. OpenAI reasoning turns in a mixed-provider
+            # session) carry no signature; sending signature=None bricks the
+            # session with invalid_request_error on every resume, so drop the
+            # block entirely. See microsoft/amplifier#330.
+            signature = block.get("signature")
+            if not isinstance(signature, str) or not signature:
+                logger.debug(
+                    "Dropping thinking block without valid signature "
+                    "(likely from a non-Anthropic provider in session history)"
+                )
+                return None
+            return {
+                "type": "thinking",
+                "thinking": block.get("thinking", ""),
+                "signature": signature,
+            }
         if block_type == "tool_use":
             return {
                 "type": "tool_use",
@@ -3614,10 +3630,12 @@ class AnthropicProvider:
                     has_thinking = "thinking_block" in msg and msg["thinking_block"]
                     if has_thinking:
                         # Clean thinking block (remove visibility field not accepted by API)
+                        # May return None for unsigned thinking blocks - skip those
                         cleaned_thinking = self._clean_content_block(
                             msg["thinking_block"]
                         )
-                        content_blocks.append(cleaned_thinking)
+                        if cleaned_thinking is not None:
+                            content_blocks.append(cleaned_thinking)
 
                     # Add text content if present, BUT skip when we have thinking + tool_calls
                     # When all three are present (thinking + text + tool_use), the text was generated
@@ -3666,8 +3684,11 @@ class AnthropicProvider:
                 elif "thinking_block" in msg and msg["thinking_block"]:
                     # Assistant message with thinking block
                     # Clean thinking block (remove visibility field not accepted by API)
+                    # May return None for unsigned thinking blocks - skip those
                     cleaned_thinking = self._clean_content_block(msg["thinking_block"])
-                    content_blocks = [cleaned_thinking]
+                    content_blocks = (
+                        [cleaned_thinking] if cleaned_thinking is not None else []
+                    )
                     if content:
                         if isinstance(content, list):
                             # Content is a list of blocks - extract text blocks only
@@ -3693,6 +3714,13 @@ class AnthropicProvider:
                         else:
                             # Content is a simple string
                             content_blocks.append({"type": "text", "text": content})
+                    if not content_blocks:
+                        # All content was dropped (e.g. only unsigned thinking
+                        # blocks) - Anthropic rejects empty content arrays, so
+                        # emit a minimal placeholder instead
+                        content_blocks = [
+                            {"type": "text", "text": "(internal reasoning omitted)"}
+                        ]
                     anthropic_messages.append(
                         {"role": "assistant", "content": content_blocks}
                     )
@@ -3700,9 +3728,18 @@ class AnthropicProvider:
                     # Regular assistant message - may have structured content blocks
                     if isinstance(content, list):
                         # Content is a list of blocks - clean each block
-                        cleaned_blocks = [
-                            self._clean_content_block(block) for block in content
-                        ]
+                        # (None means the block was dropped, e.g. unsigned thinking)
+                        cleaned_blocks = []
+                        for block in content:
+                            cleaned_block = self._clean_content_block(block)
+                            if cleaned_block is not None:
+                                cleaned_blocks.append(cleaned_block)
+                        if not cleaned_blocks:
+                            # All content was dropped - Anthropic rejects empty
+                            # content arrays, so emit a minimal placeholder
+                            cleaned_blocks = [
+                                {"type": "text", "text": "(internal reasoning omitted)"}
+                            ]
                         anthropic_messages.append(
                             {"role": "assistant", "content": cleaned_blocks}
                         )
@@ -4033,13 +4070,22 @@ class AnthropicProvider:
                 text_accumulator.append(block.text)
                 event_blocks.append(TextContent(text=block.text))
             elif block.type == "thinking":
-                content_blocks.append(
-                    ThinkingBlock(
-                        thinking=block.thinking,
-                        signature=getattr(block, "signature", None),
-                        visibility="internal",
+                # Only persist thinking blocks that carry a valid signature -
+                # an unsigned block persisted to history would be rejected by
+                # the API on every resume (microsoft/amplifier#330)
+                signature = getattr(block, "signature", None)
+                if isinstance(signature, str) and signature:
+                    content_blocks.append(
+                        ThinkingBlock(
+                            thinking=block.thinking,
+                            signature=signature,
+                            visibility="internal",
+                        )
                     )
-                )
+                else:
+                    logger.debug(
+                        "Skipping thinking block without valid signature in response"
+                    )
                 event_blocks.append(ThinkingContent(text=block.thinking))
                 # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
             elif block.type == "tool_use":
