@@ -26,7 +26,7 @@ from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
 from anthropic import APIStatusError as AnthropicAPIStatusError
 
-from tests._helpers import DummyResponse, FakeCoordinator, FakeHooks
+from tests._helpers import DummyResponse, FakeCoordinator
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +77,6 @@ class MockStreamManager:
 
     async def get_final_message(self):
         return self._api_response
-
 
 
 # ============================================================================
@@ -148,6 +147,63 @@ class TestIsCloudflareChallenge:
             status_code=403,
             body={"type": "error"},  # SDK parsed this → real API error
             content_type="text/html",  # Unusual but body wins
+        )
+        assert AnthropicProvider._is_cloudflare_challenge(error) is False
+
+
+class TestCloudflareDetectionIsCaseInsensitive:
+    """Neither the content-type value nor the page text has guaranteed casing.
+
+    Detection used to compare raw strings against a mixed-case marker list,
+    so any challenge page whose casing differed from the hardcoded literals
+    was missed -- and a missed challenge is a permanent AccessDeniedError
+    raised for a condition that would have cleared on retry. The sibling
+    providers (openai, vllm) case-fold both sides; this pins the same
+    behaviour here.
+    """
+
+    @pytest.mark.parametrize(
+        "content_type",
+        [
+            "text/html",
+            "TEXT/HTML",
+            "Text/HTML; charset=UTF-8",
+            "text/HTML;charset=utf-8",
+        ],
+    )
+    def test_content_type_casing_does_not_change_detection(self, content_type):
+        error = _make_api_status_error(
+            status_code=403, body=None, content_type=content_type
+        )
+        assert AnthropicProvider._is_cloudflare_challenge(error) is True
+
+    @pytest.mark.parametrize(
+        "page_text",
+        [
+            # Cloudflare renders "Cloudflare" capitalised in its own footer,
+            # while the marker list is lowercase.
+            "Attention Required! Performance &amp; security by Cloudflare",
+            "<title>JUST A MOMENT...</title>CLOUDFLARE",
+            "<title>Just A Moment</title>Checking If The Site Connection Is Secure",
+            "<div id='CF-Browser-Verification'>",
+        ],
+    )
+    def test_marker_casing_does_not_change_detection(self, page_text):
+        error = _make_api_status_error(
+            status_code=403,
+            body=None,
+            content_type="",  # force the marker-scan path
+            response_text=page_text,
+        )
+        assert AnthropicProvider._is_cloudflare_challenge(error) is True
+
+    def test_unrelated_html_error_page_is_still_not_a_challenge(self):
+        """Case-folding must not turn the marker scan into a catch-all."""
+        error = _make_api_status_error(
+            status_code=403,
+            body=None,
+            content_type="",
+            response_text="<html><h1>403 Forbidden</h1><hr>nginx/1.24.0</html>",
         )
         assert AnthropicProvider._is_cloudflare_challenge(error) is False
 
