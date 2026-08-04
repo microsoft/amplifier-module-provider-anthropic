@@ -1486,17 +1486,23 @@ class AnthropicProvider:
         if response is None:
             return False
 
-        content_type = getattr(response, "headers", {}).get("content-type", "")
+        # Case-fold before matching: neither the header value nor the page
+        # text has a guaranteed casing. Cloudflare's own block pages render
+        # "Cloudflare" capitalised in the footer while the marker below is
+        # lowercase, so a case-sensitive scan misses real challenge pages --
+        # and a missed challenge is a permanent AccessDeniedError raised for
+        # a condition that would have cleared on retry.
+        content_type = getattr(response, "headers", {}).get("content-type", "").lower()
         if "text/html" in content_type:
             return True
 
         # Fallback: scan response text for Cloudflare markers
-        text = getattr(response, "text", "") or ""
+        text = (getattr(response, "text", "") or "").lower()
         cf_markers = (
-            "Just a moment",
+            "just a moment",
             "cf-browser-verification",
             "cloudflare",
-            "Checking if the site connection is secure",
+            "checking if the site connection is secure",
         )
         return any(marker in text for marker in cf_markers)
 
