@@ -781,3 +781,164 @@ class TestSpeedConfigEndToEnd:
         assert params.get("speed") == "fast"
         beta_header = params.get("extra_headers", {}).get("anthropic-beta", "")
         assert "fast-mode-2026-02-01" in beta_header
+
+
+# ---------------------------------------------------------------------------
+# Undifferentiated effort warning (xhigh/max degenerate to 'high' when the
+# model has no output_config support) -- warn-and-continue, params unchanged.
+# ---------------------------------------------------------------------------
+
+
+class TestUndifferentiatedEffortWarning:
+    """On models without output_config support, the effort ladder maps
+    'high', 'xhigh', and 'max' to identical thinking params -- the only thing
+    that differentiates them (output_config.effort) never gets set. This is a
+    silent no-op for both the request path (request.reasoning_effort) and the
+    config path (config['reasoning_effort']/['effort']). The fix is a single
+    warn-and-continue check, placed after reasoning_effort is fully resolved
+    from either source, so it covers both paths without changing any params.
+    """
+
+    def test_xhigh_produces_byte_identical_params_to_high_on_sonnet_4_5(self):
+        """Pins the degeneracy: xhigh and high produce identical wire params
+        on a model without output_config support."""
+        provider_high = _make_provider(default_model="claude-sonnet-4-5-20250929")
+        provider_high.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request_high = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        asyncio.run(provider_high.complete(request_high))
+        params_high = _get_api_params(
+            provider_high.client.messages.with_raw_response.create
+        )
+
+        provider_xhigh = _make_provider(default_model="claude-sonnet-4-5-20250929")
+        provider_xhigh.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request_xhigh = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="xhigh",
+        )
+        asyncio.run(provider_xhigh.complete(request_xhigh))
+        params_xhigh = _get_api_params(
+            provider_xhigh.client.messages.with_raw_response.create
+        )
+
+        assert params_high == params_xhigh
+        assert "output_config" not in params_high
+        assert "output_config" not in params_xhigh
+
+    def test_xhigh_logs_warning_on_sonnet_4_5(self, caplog):
+        """xhigh on a model without output_config support logs the new
+        warn-and-continue message."""
+        import logging
+
+        provider = _make_provider(default_model="claude-sonnet-4-5-20250929")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="xhigh",
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request))
+
+        assert any(
+            "has no effect on" in r.message and "xhigh" in r.message
+            for r in caplog.records
+        )
+
+    def test_max_logs_warning_on_sonnet_4_5(self, caplog):
+        """max on a model without output_config support logs the new
+        warn-and-continue message."""
+        import logging
+
+        provider = _make_provider(default_model="claude-sonnet-4-5-20250929")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="max",
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request))
+
+        assert any(
+            "has no effect on" in r.message and "max" in r.message
+            for r in caplog.records
+        )
+
+    def test_high_does_not_log_warning_on_sonnet_4_5(self, caplog):
+        """'high' is the actual ceiling on this model -- no surprise, no warning."""
+        import logging
+
+        provider = _make_provider(default_model="claude-sonnet-4-5-20250929")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request))
+
+        assert not any("has no effect on" in r.message for r in caplog.records)
+
+    def test_xhigh_on_sonnet_5_does_not_warn_and_still_sets_output_config(
+        self, caplog
+    ):
+        """Regression guard: on a model WITH output_config support, xhigh is
+        NOT degenerate -- no new warning, and output_config.effort is still
+        set (behavior unchanged)."""
+        import logging
+
+        provider = _make_provider(default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="xhigh",
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request))
+
+        assert not any("has no effect on" in r.message for r in caplog.records)
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"] == {"effort": "xhigh"}
+
+    def test_opus_47_max_still_logs_original_gate_b_warning_only(self, caplog):
+        """Regression guard: Opus 4.7 supports output_config, so the NEW
+        warning must not fire. The ORIGINAL Gate B warning ('max' not in
+        Opus 4.7's supported_efforts) must still fire, and output_config must
+        still be omitted -- no double-warning."""
+        import logging
+
+        provider = _make_provider(default_model="claude-opus-4-7-20260416")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="max",  # not in supported_efforts for 4.7
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "output_config" not in params
+
+        # Original Gate B warning still fires unchanged
+        assert any(
+            "not supported by" in r.message and "omitting output_config" in r.message
+            for r in caplog.records
+        )
+        # New warn-and-continue must NOT double-fire (4.7 supports output_config)
+        assert not any("has no effect on" in r.message for r in caplog.records)

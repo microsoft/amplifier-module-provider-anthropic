@@ -2532,6 +2532,26 @@ class AnthropicProvider:
                         config_effort,
                         ", ".join(valid_efforts),
                     )
+
+        # reasoning_effort is now fully resolved (kwargs precedence is applied
+        # further up the call chain via request.reasoning_effort; config was
+        # just resolved above). Warn here \u2014 covering BOTH the request path and
+        # the config path \u2014 when the caller asked for more than "high" on a
+        # model that has no output_config support. The effort ladder above
+        # maps "high", "xhigh", and "max" to identical thinking params on
+        # these models (see :2580-2600), so "xhigh"/"max" silently resolve to
+        # exactly "high" with no way for the caller to tell. This is a
+        # warn-and-continue: params are not changed.
+        if reasoning_effort in ("xhigh", "max") and not request_caps.supports_output_config:
+            logger.warning(
+                "[PROVIDER] reasoning_effort=%r has no effect on %s (no output_config "
+                "support) \u2014 resolves identically to 'high'. Supported efforts for this "
+                "model: %s",
+                reasoning_effort,
+                effective_model,
+                request_caps.supported_efforts,
+            )
+
         if "extended_thinking" not in kwargs and reasoning_effort is not None:
             # reasoning_effort implies extended_thinking=True. This is a
             # deliberate Amplifier mapping (commit bc026a43): the portable
