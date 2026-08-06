@@ -251,6 +251,21 @@ BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
 BETA_HEADER_FAST_MODE = "fast-mode-2026-02-01"
 PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
+
+# Emitted by _sanitize_thinking_blocks (amplifier-support#207) whenever a
+# thinking/redacted_thinking block with an invalid or missing signature is
+# stripped from outgoing history. Kept as a module-level constant so tests
+# and other observers can reference it instead of a magic string.
+PROVIDER_THINKING_SIGNATURE_STRIPPED = "provider:thinking_signature_stripped"
+
+# Neutral, non-empty placeholder used by _sanitize_thinking_blocks when
+# stripping invalid thinking blocks would otherwise leave an assistant
+# message with an empty content array -- Anthropic rejects empty content
+# arrays just as strictly as it rejects unsigned thinking blocks.
+_THINKING_PLACEHOLDER_BLOCK: dict[str, str] = {
+    "type": "text",
+    "text": "[thinking omitted: signature unavailable after provider switch]",
+}
 FALLBACK_STATE_VERSION = 1
 
 # ---------------------------------------------------------------------------
@@ -2411,6 +2426,15 @@ class AnthropicProvider:
 
         # Combine: context THEN conversation
         all_messages = context_user_msgs + conversation_msgs
+        # DEFENSIVE: strip thinking blocks with invalid/missing signatures before
+        # anything else touches the final message list. See _sanitize_thinking_blocks
+        # for the full rationale (fixes amplifier-support#207). Run this BEFORE
+        # cache control so the cache breakpoint lands on the truly-final content
+        # array (including any placeholder inserted here), not on a block that
+        # gets stripped a moment later.
+        all_messages = await self._sanitize_thinking_blocks(
+            all_messages, model=kwargs.get("model", self.default_model)
+        )
         # Apply cache control to last message for incremental context caching
         all_messages = self._apply_message_cache_control(all_messages)
         logger.info(f"[PROVIDER] Final message count for API: {len(all_messages)}")
@@ -3785,6 +3809,148 @@ class AnthropicProvider:
                 i += 1
 
         return anthropic_messages
+
+    async def _sanitize_thinking_blocks(
+        self, messages: list[dict[str, Any]], model: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Strip thinking/redacted_thinking blocks with invalid signatures.
+
+        Fixes amplifier-support#207.
+
+        Anthropic strict-validates ``thinking.signature`` as a non-empty
+        string on EVERY replay request. Sessions that switch providers
+        mid-conversation (e.g. some turns handled by provider-chat-completions
+        or provider-openai, interleaved with anthropic turns) can persist
+        thinking blocks whose signature is ``null``, absent entirely, or
+        otherwise not something Anthropic minted -- the signing/verification
+        scheme is provider-specific and cannot be retrofitted onto a block
+        another provider produced. A single such block anywhere in history is
+        enough for Anthropic to reject the ENTIRE request, e.g.::
+
+            messages.51.content[0].thinking.signature.str: Input should be a valid string
+
+        ...which bricks the session on every subsequent resume attempt, even
+        though only one of many messages is at fault.
+
+        This is a defensive, chokepoint pass over the fully-assembled message
+        list. It runs ONCE in ``_complete_chat_request`` on ``all_messages``,
+        which both the streaming transport (``client.messages.stream``) and
+        the non-streaming transport (``client.messages.with_raw_response.create``)
+        consume via the same ``params`` dict -- as does the refusal-fallback
+        retry path. One sanitize pass here covers all three.
+
+        Two malformed shapes are handled by the SAME check (both reduce to
+        "signature is not a valid non-empty string" once read via
+        ``dict.get``, which returns None whether a key is missing or present
+        with a None value):
+          (a) ``{"type": "thinking", "thinking": "...", "signature": None}``
+              -- produced when provider-chat-completions round-trips a
+              thinking block through its own (non-Anthropic) history format.
+          (b) ``{"type": "thinking", "content": ["<encrypted>", "rs_..."]}``
+              with no ``signature`` key at all -- provider-openai's Responses
+              API persists encrypted reasoning content plus a reasoning-item
+              id instead of an Anthropic-style signature.
+
+        ``redacted_thinking`` blocks are left alone unless some upstream
+        producer attached an (invalid) ``signature`` key to one -- Anthropic
+        doesn't require a signature on redacted_thinking at all; its ``data``
+        field is the whole payload.
+
+        Non-dict entries in a content array (e.g. a raw string surviving a
+        corrupted/partial transcript) are tolerated, not dropped: this method
+        only removes blocks it can positively identify as invalid thinking
+        blocks, and must never raise on malformed input it merely can't
+        interpret.
+
+        Args:
+            messages: Anthropic-formatted messages -- the output of
+                ``_convert_messages``, i.e. plain ``role``/``content`` dicts
+                that have already been run through ``_clean_content_block``.
+            model: The model this request targets, used only for the warning
+                log / observability event. Falls back to ``self.default_model``
+                when the caller didn't override the model via kwargs.
+
+        Returns:
+            The same list, mutated in place. Assistant messages have any
+            invalid thinking/redacted_thinking blocks removed. If stripping
+            would leave a message's content array empty, a minimal
+            placeholder text block is inserted instead -- Anthropic rejects
+            empty content arrays just as strictly as it rejects unsigned
+            thinking blocks.
+        """
+        total_stripped = 0
+
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+
+            kept: list[Any] = []
+            msg_stripped = 0
+            for block in content:
+                if isinstance(block, dict) and self._is_invalid_thinking_block(block):
+                    msg_stripped += 1
+                    continue
+                kept.append(block)
+
+            if not msg_stripped:
+                continue
+
+            if not kept:
+                # Anthropic rejects empty content arrays just as strictly as it
+                # rejects unsigned thinking blocks -- insert a neutral,
+                # non-empty placeholder so the turn stays a well-formed (if
+                # content-free) assistant message rather than an invalid one.
+                kept.append(dict(_THINKING_PLACEHOLDER_BLOCK))
+
+            msg["content"] = kept
+            total_stripped += msg_stripped
+
+        if total_stripped:
+            # One aggregate warning + event per request (matching the
+            # tool_sequence_repaired precedent), not one per affected message --
+            # a session with many mid-conversation provider switches could
+            # otherwise spam the log/event bus with one line per turn.
+            effective_model = model or self.default_model
+            logger.warning(
+                "[PROVIDER] Stripped %d thinking block(s) with invalid/missing "
+                "signature from assistant message history before sending to "
+                "Anthropic (model=%s). This is expected after a session "
+                "switched providers mid-conversation; see amplifier-support#207.",
+                total_stripped,
+                effective_model,
+            )
+            await self._emit_provider_event(
+                PROVIDER_THINKING_SIGNATURE_STRIPPED,
+                {
+                    "provider": self.name,
+                    "model": effective_model,
+                    "stripped_count": total_stripped,
+                },
+            )
+
+        return messages
+
+    @staticmethod
+    def _is_invalid_thinking_block(block: dict[str, Any]) -> bool:
+        """True if `block` is a thinking-family block Anthropic will reject.
+
+        Anthropic requires `signature` to be a non-empty string on `thinking`
+        blocks. `redacted_thinking` blocks don't normally carry a signature at
+        all (their `data` field is the whole payload) -- only treat one as
+        invalid if some upstream producer attached a `signature` key to it and
+        that value fails the same non-empty-string check.
+        """
+        block_type = block.get("type")
+        if block_type == "thinking":
+            signature = block.get("signature")
+            return not isinstance(signature, str) or not signature.strip()
+        if block_type == "redacted_thinking" and "signature" in block:
+            signature = block.get("signature")
+            return not isinstance(signature, str) or not signature.strip()
+        return False
 
     def _convert_tools_from_request(self, tools: list) -> list[dict[str, Any]]:
         """Convert ToolSpec objects from ChatRequest to Anthropic format.
