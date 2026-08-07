@@ -682,7 +682,26 @@ class AnthropicProvider:
         )
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
-        self._base_url = self.config.get("base_url")
+        #
+        # GAP-016: settings.yaml commonly stores this as an env-var template
+        # (e.g. ``base_url: ${ANTHROPIC_BASE_URL}``). amplifier-app-cli's
+        # expand_env_vars() substitutes an *unset* referenced variable with
+        # "" (empty string), not None -- by design, so that provider
+        # instances the user isn't actively using this session don't crash
+        # config loading just because one of their optional env vars isn't
+        # set. But "" is never a valid base_url: passed straight to
+        # AsyncAnthropic(base_url=""), httpx/httpcore raises
+        # `UnsupportedProtocol: Request URL is missing an 'http://' or
+        # 'https://' protocol`, which the SDK re-wraps as a generic
+        # `APIConnectionError("Connection error.")` -- indistinguishable
+        # from a real network failure and hitting every call this client
+        # makes (list_models() preflight *and* the primary completion).
+        # An empty string is never a meaningful custom endpoint, so treat it
+        # the same as "not configured" and fall back to the SDK's real
+        # default (https://api.anthropic.com), exactly as if base_url had
+        # never been set at all.
+        raw_base_url = self.config.get("base_url")
+        self._base_url = raw_base_url if raw_base_url else None
 
         # Beta headers support for enabling experimental features
         # Store as instance variable so we can merge with per-request headers later
@@ -3310,6 +3329,23 @@ class AnthropicProvider:
                     if body is not None
                     else (str(e) or f"{type(e).__name__}: (no message)")
                 )
+                # GAP-016: the Anthropic SDK's own APIConnectionError carries a
+                # fixed, generic message ("Connection error.") regardless of
+                # *why* the underlying httpx/httpcore call failed -- DNS
+                # failure, TLS failure, a malformed base_url producing
+                # `UnsupportedProtocol`, etc. all look identical to a user or
+                # to logs, and are indistinguishable from real transient
+                # network flakiness. The SDK chains the real exception via
+                # `raise APIConnectionError(...) from err`, so it's available
+                # on `__cause__` -- surface it instead of silently dropping it,
+                # so "Connection error." becomes something a user can actually
+                # act on (e.g. "caused by UnsupportedProtocol: Request URL is
+                # missing an 'http://' or 'https://' protocol" directly names
+                # a misconfigured base_url instead of looking like the network
+                # is down).
+                cause = e.__cause__
+                if cause is not None and str(cause) not in error_msg:
+                    error_msg = f"{error_msg} (caused by {type(cause).__name__}: {cause})"
                 raise KernelLLMError(
                     error_msg,
                     provider="anthropic",
