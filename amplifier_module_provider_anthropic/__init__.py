@@ -663,6 +663,24 @@ class AnthropicProvider:
             "enable_web_search", False
         )  # Enable native web search tool
 
+        # Extended (1-hour) TTL for the stable system/tools cache breakpoints.
+        #
+        # Default OFF. The system prompt + tool definitions are the most stable,
+        # least-often-changing part of the request, so a 1h TTL is *structurally*
+        # justified for them (unlike the conversation region, which changes most
+        # turns). But it is not free: (a) Anthropic bills 1h-TTL cache *writes*
+        # at a higher multiplier than the 5m default, and (b) it requires opting
+        # in to the `extended-cache-ttl-2025-04-11` beta header. Rather than
+        # silently changing billing behavior, this stays opt-in until a
+        # deployment has measured that its system prompt is stable long enough
+        # (and reused often enough) for the longer TTL to pay for itself.
+        #
+        # NOTE: the beta header this requires is registered just below, once
+        # `self._beta_headers` exists (see "Beta headers support").
+        self.cache_stable_region_ttl_1h = self._config_bool(
+            self.config.get("cache_stable_region_ttl_1h", False)
+        )
+
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
         self._base_url = self.config.get("base_url")
 
@@ -678,6 +696,13 @@ class AnthropicProvider:
                 if isinstance(beta_headers_config, str)
                 else list(beta_headers_config)
             )
+
+        if self.cache_stable_region_ttl_1h:
+            _ttl_beta = "extended-cache-ttl-2025-04-11"
+            if _ttl_beta not in self._beta_headers:
+                self._beta_headers.append(_ttl_beta)
+
+        if self._beta_headers:
             # Build anthropic-beta header value (comma-separated)
             beta_header_value = ",".join(self._beta_headers)
             self._default_headers = {"anthropic-beta": beta_header_value}
@@ -2337,9 +2362,15 @@ class AnthropicProvider:
 
         block: dict[str, Any] = {"type": "text", "text": combined}
 
-        # Add cache_control if enabled
+        # Add cache_control if enabled. The system prompt is the most stable
+        # part of the request (rebuilt from on-disk bundle content, not from
+        # per-turn conversation), so it optionally gets the extended 1h TTL --
+        # see `cache_stable_region_ttl_1h` (opt-in, default off).
         if self.enable_prompt_caching:
-            block["cache_control"] = {"type": "ephemeral"}
+            cache_control: dict[str, Any] = {"type": "ephemeral"}
+            if self.cache_stable_region_ttl_1h:
+                cache_control["ttl"] = "1h"
+            block["cache_control"] = cache_control
 
         return [block]
 
@@ -2375,8 +2406,22 @@ class AnthropicProvider:
             f"Separated: {len(system_msgs)} system, {len(developer_msgs)} developer, {len(conversation)} conversation"
         )
 
+        # Determine ephemeral status BEFORE conversion -- Message.metadata is
+        # only available on the original Message objects; _convert_messages
+        # discards unrecognized keys when it rebuilds Anthropic-format dicts.
+        trailing_ephemeral_count, has_ephemeral_signal = (
+            self._count_trailing_ephemeral_messages(conversation)
+        )
+
+        # Track how many of the 4 Anthropic cache breakpoints are used, so we
+        # never exceed the API's hard limit (a 5th cache_control is a request
+        # error, not a soft failure).
+        breakpoints_used = 0
+
         # Format system messages as content block array (required for caching)
         system_blocks = self._format_system_with_cache(system_msgs)
+        if system_blocks and self.enable_prompt_caching:
+            breakpoints_used += 1
 
         if system_blocks:
             logger.info(
@@ -2411,8 +2456,27 @@ class AnthropicProvider:
 
         # Combine: context THEN conversation
         all_messages = context_user_msgs + conversation_msgs
-        # Apply cache control to last message for incremental context caching
-        all_messages = self._apply_message_cache_control(all_messages)
+
+        # Apply up to 2 rolling cache breakpoints over STABLE conversation
+        # content (never on the trailing ephemeral messages identified
+        # above). Budget is whatever remains of the 4-breakpoint API limit
+        # after system (0 or 1) and tools (0 or 1, applied below) -- tools
+        # hasn't run yet at this point, so reserve its slot conservatively.
+        _tools_will_use_a_slot = bool(
+            request.tools and self.enable_prompt_caching
+        )
+        conversation_budget = 4 - breakpoints_used - (
+            1 if _tools_will_use_a_slot else 0
+        )
+        all_messages, conversation_breakpoints_used = (
+            self._apply_conversation_cache_control(
+                all_messages,
+                trailing_ephemeral_count,
+                has_ephemeral_signal,
+                conversation_budget,
+            )
+        )
+        breakpoints_used += conversation_breakpoints_used
         logger.info(f"[PROVIDER] Final message count for API: {len(all_messages)}")
 
         # Resolve model and capabilities BEFORE building params dict,
@@ -2466,7 +2530,10 @@ class AnthropicProvider:
         # Add tools if provided
         if request.tools:
             tools = self._convert_tools_from_request(request.tools)
-            params["tools"] = self._apply_tool_cache_control(tools)
+            tools, tool_breakpoint_used = self._apply_tool_cache_control(tools)
+            params["tools"] = tools
+            if tool_breakpoint_used:
+                breakpoints_used += 1
             # Add tool_choice if specified
             if tool_choice := kwargs.get("tool_choice"):
                 params["tool_choice"] = tool_choice
@@ -3954,7 +4021,7 @@ class AnthropicProvider:
 
     def _apply_tool_cache_control(
         self, tools: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], bool]:
         """Add cache_control to the last *function* tool definition.
 
         Per Anthropic spec: a cache breakpoint on the last tool creates a
@@ -3975,11 +4042,21 @@ class AnthropicProvider:
             tools: List of Anthropic-formatted tool definitions
 
         Returns:
-            Same list with cache_control on the last function tool (if
-            caching is enabled and at least one function tool is present)
+            Tuple of (same list, mutated in place with cache_control on the
+            last function tool if caching is enabled and a function tool is
+            present; whether a breakpoint was actually placed). The caller
+            needs the boolean to keep an accurate running count against the
+            4-breakpoint API hard limit.
         """
         if not tools or not self.enable_prompt_caching:
-            return tools
+            return tools, False
+
+        # The tool list is part of the same "stable region" as the system
+        # prompt (rarely changes turn-to-turn within a session), so it shares
+        # the opt-in extended TTL setting.
+        cache_control: dict[str, Any] = {"type": "ephemeral"}
+        if self.cache_stable_region_ttl_1h:
+            cache_control["ttl"] = "1h"
 
         # Walk backwards to the last tool that can carry a cache breakpoint.
         # A tool is a function tool when it has no "type" (the classic shape)
@@ -3987,48 +4064,272 @@ class AnthropicProvider:
         for tool in reversed(tools):
             tool_type = tool.get("type")
             if tool_type is None or tool_type == "function":
-                tool["cache_control"] = {"type": "ephemeral"}
-                break
+                tool["cache_control"] = dict(cache_control)
+                return tools, True
         # No function tool present (native tools only) - nothing can carry the
         # breakpoint. Return unstamped rather than sending a request the API
         # will reject.
-        return tools
+        return tools, False
 
-    def _apply_message_cache_control(
-        self, messages: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Add cache_control to last content block of last message.
+    @staticmethod
+    def _is_tool_use_message(msg: dict[str, Any]) -> bool:
+        """True if an assistant message's content contains a tool_use block."""
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return False
+        return any(
+            isinstance(block, dict) and block.get("type") == "tool_use"
+            for block in content
+        )
 
-        Per Anthropic spec: this creates a checkpoint at the end of
-        conversation history, caching the full context.
+    @staticmethod
+    def _is_tool_result_message(msg: dict[str, Any]) -> bool:
+        """True if a message's content is (only) tool_result blocks.
 
-        Args:
-            messages: Anthropic-formatted message list
+        This is exactly the shape ``_convert_messages`` produces when it
+        batches consecutive ``role: tool`` messages into a single Anthropic
+        user message (see ``_convert_messages``).
+        """
+        content = msg.get("content")
+        if not isinstance(content, list) or not content:
+            return False
+        return all(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in content
+        )
+
+    def _last_safe_breakpoint_index(
+        self, messages: list[dict[str, Any]], start_idx: int
+    ) -> int | None:
+        """Walk backward from ``start_idx`` to a message boundary that does
+        not split a tool_use/tool_result pair.
+
+        A cache_control marker never removes or reorders messages -- it only
+        marks a prefix boundary -- so it cannot literally "break" a pair.
+        But ending a cached checkpoint precisely between a tool_use and its
+        own tool_result is a confusing, easy-to-misread boundary and is
+        avoided defensively here: if ``messages[idx]`` is an assistant
+        message containing a tool_use and the very next message is that
+        tool_use's tool_result batch, the candidate is rejected and the
+        search continues one message earlier.
+
+        Returns the safe index, or ``None`` if no safe index exists at or
+        before ``start_idx`` (e.g. everything from 0..start_idx is one
+        unresolved tool round).
+        """
+        idx = start_idx
+        while idx >= 0:
+            msg = messages[idx]
+            splits_pair = (
+                idx + 1 < len(messages)
+                and self._is_tool_use_message(msg)
+                and self._is_tool_result_message(messages[idx + 1])
+            )
+            if not splits_pair:
+                return idx
+            idx -= 1
+        return None
+
+    def _count_trailing_ephemeral_messages(
+        self, conversation: list[Message]
+    ) -> tuple[int, bool]:
+        """Count how many trailing conversation messages are ephemeral.
+
+        Ephemeral status is read from ``Message.metadata["ephemeral"]`` --
+        the same contract ``HookResult.ephemeral`` is meant to carry through
+        to the provider (see ``amplifier_core.models.HookResult``). Walking
+        from the end, the count stops at the first message that is either
+        not marked ephemeral, or has ``role == "tool"``: tool-role messages
+        can be batched together by ``_convert_messages`` (many input
+        messages -> one output message), which would break the 1:1 index
+        correspondence this count relies on. Ephemeral injections are never
+        tool-role in the current architecture (HookResult.context_injection_role
+        is one of "system"/"user"/"assistant"), so this is a hard stop, not a
+        heuristic guess.
 
         Returns:
-            Same list with cache_control on last message's last block
+            (trailing_ephemeral_count, has_any_metadata_signal). The second
+            value tells the caller whether *any* message in the conversation
+            carries a metadata dict at all -- i.e. whether "not marked
+            ephemeral" is a trustworthy negative, or simply means nothing in
+            this deployment ever populates the field.
         """
-        if not messages or not self.enable_prompt_caching:
-            return messages
+        has_any_metadata_signal = any(bool(m.metadata) for m in conversation)
 
-        last_msg = messages[-1]
-        content = last_msg.get("content")
+        count = 0
+        for msg in reversed(conversation):
+            if msg.role == "tool":
+                break
+            if bool((msg.metadata or {}).get("ephemeral")):
+                count += 1
+                continue
+            break
+        return count, has_any_metadata_signal
 
-        # Handle different content formats
+    def _apply_conversation_cache_control(
+        self,
+        all_messages: list[dict[str, Any]],
+        trailing_ephemeral_count: int,
+        has_ephemeral_signal: bool,
+        remaining_budget: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Place up to 2 rolling cache breakpoints over stable conversation
+        content, per Anthropic's documented multi-turn caching pattern.
+
+        This replaces the old single "cache_control on messages[-1]" logic.
+        That approach silently broke the moment the orchestrator started
+        appending an ephemeral, regenerated-per-turn tail message (a
+        `<system-reminder>` block with a live timestamp/git-status) after
+        every ``context.get_messages_for_request()`` call: the cached
+        prefix always ended in content that could never be reproduced on the
+        next request, so it was written every turn and never re-read.
+        Measured impact: cache_read frozen at a single constant for the
+        whole session in 22/31 (71%) sampled sessions; aggregate
+        write:read ratio 5.96x.
+
+        The fix has two parts:
+
+        1. Never place a breakpoint on a message known to be ephemeral --
+           walk backward past ``trailing_ephemeral_count`` messages first.
+        2. Use the *two* breakpoints Anthropic's docs describe for
+           multi-turn conversations: one at the current stable boundary
+           ("primary") and one right before the previous real user turn
+           began ("secondary"). Because each new turn's primary breakpoint
+           becomes the point right before the *next* turn's most recent user
+           message, next turn's secondary lands exactly on this turn's
+           primary -- giving a cache hit even as the conversation grows.
+
+        Args:
+            all_messages: Anthropic-formatted message array (context-prefix
+                messages followed by conversation messages), mutated in
+                place.
+            trailing_ephemeral_count: number of trailing entries of the
+                conversation region known to be ephemeral (see
+                ``_count_trailing_ephemeral_messages``).
+            has_ephemeral_signal: whether ephemeral status could be
+                determined at all for this request (see above). If False,
+                "not marked ephemeral" cannot be trusted as a real signal,
+                and placing breakpoints on unverified content would risk
+                repeating the exact bug this method exists to fix.
+            remaining_budget: cache breakpoints left before hitting
+                Anthropic's 4-breakpoint hard limit (system + tools may
+                already have consumed some).
+
+        Returns:
+            (all_messages, breakpoints_used) -- never places more
+            breakpoints than ``remaining_budget`` allows.
+        """
+        if not all_messages or not self.enable_prompt_caching or remaining_budget <= 0:
+            return all_messages, 0
+
+        if not has_ephemeral_signal:
+            # No message anywhere in this request carries a `metadata` dict,
+            # so there is no basis for distinguishing stable history from a
+            # regenerated-per-turn tail. Rather than silently reverting to
+            # the old (measurably broken) "cache_control on messages[-1]"
+            # placement, this is loud and skips conversation-region caching
+            # for this call. See amplifier_module_loop_streaming's ephemeral
+            # injection append sites (around the `inject_context` handling
+            # in the main orchestrator loop) -- the appended message dict
+            # must include `metadata={"ephemeral": True}` for this method to
+            # ever place a conversation-region breakpoint.
+            logger.warning(
+                "[PROVIDER] Prompt caching: no message in this request carries "
+                "a `metadata` dict, so ephemeral (regenerated-per-turn) "
+                "messages cannot be distinguished from stable history. "
+                "Skipping the conversation-region cache breakpoint(s) rather "
+                "than risking a breakpoint on unstable content -- the "
+                "orchestrator/context manager must stamp "
+                "metadata={'ephemeral': True} on ephemeral injections for "
+                "conversation-region prompt caching to take effect."
+            )
+            return all_messages, 0
+
+        eligible_upper = len(all_messages) - trailing_ephemeral_count
+        if eligible_upper <= 0:
+            logger.warning(
+                "[PROVIDER] Prompt caching: every message in this request is "
+                "marked ephemeral -- no stable content available for a "
+                "conversation-region cache breakpoint this turn."
+            )
+            return all_messages, 0
+
+        cache_control: dict[str, Any] = {"type": "ephemeral"}
+
+        primary_idx = self._last_safe_breakpoint_index(
+            all_messages, eligible_upper - 1
+        )
+        if primary_idx is None:
+            logger.warning(
+                "[PROVIDER] Prompt caching: could not find a stable message "
+                "boundary that doesn't split a tool_use/tool_result pair -- "
+                "skipping conversation-region cache breakpoint(s)."
+            )
+            return all_messages, 0
+
+        breakpoints_used = 0
+        self._stamp_last_block(all_messages[primary_idx], cache_control)
+        breakpoints_used += 1
+
+        if remaining_budget >= 2:
+            secondary_idx = self._find_rolling_secondary_index(
+                all_messages, primary_idx, eligible_upper
+            )
+            if secondary_idx is not None and secondary_idx != primary_idx:
+                self._stamp_last_block(all_messages[secondary_idx], cache_control)
+                breakpoints_used += 1
+
+        return all_messages, breakpoints_used
+
+    def _find_rolling_secondary_index(
+        self,
+        all_messages: list[dict[str, Any]],
+        primary_idx: int,
+        eligible_upper: int,
+    ) -> int | None:
+        """Find the rolling second breakpoint: the stable message right
+        before the most recent *real* user turn began.
+
+        A "real" user turn is a user message that is not purely a
+        tool_result batch (i.e. an actual new user query, not tool output
+        being fed back). Placing the second breakpoint one message before
+        that turn's start means: next turn, once a new user message and its
+        round-trip are appended, this same index becomes the boundary
+        "right before the [new] most recent real user turn" that the
+        primary breakpoint would have used last time -- so one of the two
+        breakpoints keeps landing on a previously-cached boundary as the
+        conversation grows, per Anthropic's documented multi-turn caching
+        pattern.
+        """
+        last_user_turn_idx: int | None = None
+        for idx in range(min(primary_idx, eligible_upper - 1), -1, -1):
+            msg = all_messages[idx]
+            if msg.get("role") == "user" and not self._is_tool_result_message(msg):
+                last_user_turn_idx = idx
+                break
+
+        if last_user_turn_idx is None or last_user_turn_idx == 0:
+            return None  # first turn in the conversation - nothing earlier
+
+        return self._last_safe_breakpoint_index(
+            all_messages, last_user_turn_idx - 1
+        )
+
+    @staticmethod
+    def _stamp_last_block(msg: dict[str, Any], cache_control: dict[str, Any]) -> None:
+        """Add cache_control to the last content block of a message,
+        converting string content to a block array first if needed."""
+        content = msg.get("content")
         if isinstance(content, list) and content:
-            # Array of content blocks - mark last block
-            content[-1]["cache_control"] = {"type": "ephemeral"}
+            content[-1]["cache_control"] = dict(cache_control)
         elif isinstance(content, str):
-            # String content - convert to block array with cache marker
-            last_msg["content"] = [
+            msg["content"] = [
                 {
                     "type": "text",
                     "text": content,
-                    "cache_control": {"type": "ephemeral"},
+                    "cache_control": dict(cache_control),
                 }
             ]
-
-        return messages
 
     def _convert_to_chat_response(self, response: Any) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
