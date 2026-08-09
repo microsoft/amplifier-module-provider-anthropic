@@ -422,6 +422,116 @@ def test_prompt_caching_disabled_places_no_breakpoints_at_all():
 
 
 # ---------------------------------------------------------------------------
+# Single-message request: no conversation region at all -- vacuous input
+# ---------------------------------------------------------------------------
+#
+# Real-world source of this shape: one-shot utility provider calls that never
+# go through the main conversation loop at all, e.g. hooks-session-naming's
+# `_generate_name`, which sends a single user message with no history and no
+# metadata on *every* turn of *every* session. Before this guard, that call
+# hit the `has_ephemeral_signal` branch below and fired the "no message ...
+# carries a metadata dict" warning twice per turn -- a false alarm for a
+# request that was never a caching candidate in the first place, and alarm
+# fatigue that would mask the real (multi-message, no metadata) case.
+
+
+def test_single_message_no_metadata_returns_silently_with_no_warning(caplog):
+    """A single-message request (no conversation region, nothing stable to
+    cache) must return early and silently -- no warning of any kind, at any
+    level -- rather than reaching the has_ephemeral_signal warning."""
+    provider = _make_provider()
+
+    messages = [Message(role="user", content="question")]
+    request = ChatRequest(messages=messages)
+
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="amplifier_module_provider_anthropic"):
+        params = _run(provider, request)
+
+    # No cache_control anywhere in the (single) sent message.
+    for msg in params["messages"]:
+        content = msg.get("content")
+        if isinstance(content, list):
+            assert all("cache_control" not in b for b in content)
+
+    # Nothing at all logged by _apply_conversation_cache_control -- not a
+    # warning, not even a debug-level message. A silent return, full stop.
+    assert not any(
+        "Prompt caching" in r.message for r in caplog.records
+    ), "single-message request must not log anything from the cache-control path"
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_multi_message_no_metadata_still_warns_loudly(caplog):
+    """Regression guard: the new single-message guard must NOT swallow the
+    real has_ephemeral_signal warning for a genuine multi-message request
+    that carries no metadata at all. That warning is the one this method
+    exists to surface and must keep firing exactly as before."""
+    provider = _make_provider()
+
+    messages = [
+        Message(role="system", content="System prompt."),
+        Message(role="user", content="question"),
+        Message(role="assistant", content="answer"),
+        Message(role="user", content="follow-up, still no metadata anywhere"),
+    ]
+    assert all(m.metadata is None for m in messages)
+
+    request = ChatRequest(messages=messages)
+
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="amplifier_module_provider_anthropic"):
+        params = _run(provider, request)
+
+    for msg in params["messages"]:
+        content = msg.get("content")
+        if isinstance(content, list):
+            assert all("cache_control" not in b for b in content)
+
+    assert any(
+        "cannot be distinguished from stable history" in r.message
+        for r in caplog.records
+    ), "multi-message request with no metadata must still warn loudly"
+
+
+def test_multi_message_with_ephemeral_metadata_places_breakpoints_as_before(caplog):
+    """Regression guard on placement: a genuine multi-message conversation
+    with proper `metadata={"ephemeral": True}` tagging must still get its
+    conversation-region cache breakpoint(s) placed exactly as before the
+    single-message guard was added -- the guard must only affect the
+    len(all_messages) < 2 vacuous case, nothing else."""
+    provider = _make_provider()
+
+    messages: list[Message] = [Message(role="system", content="System prompt.")]
+    for i in range(3):
+        messages.extend(_turn(f"question {i}", f"answer {i}"))
+    messages.append(_ephemeral_tail("<system-reminder>live status</system-reminder>"))
+
+    request = ChatRequest(messages=messages)
+
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="amplifier_module_provider_anthropic"):
+        params = _run(provider, request)
+
+    # No spurious warnings for this well-formed, multi-message, properly
+    # tagged request.
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    # At least one conversation-region cache breakpoint was placed -- the
+    # guard did not accidentally suppress placement for a real conversation.
+    found_breakpoint = False
+    for msg in params["messages"]:
+        content = msg.get("content")
+        if isinstance(content, list):
+            if any(isinstance(b, dict) and "cache_control" in b for b in content):
+                found_breakpoint = True
+    assert found_breakpoint, "expected at least one conversation-region cache breakpoint"
+
+
+# ---------------------------------------------------------------------------
 # Extended (1h) TTL opt-in for the stable system/tools region
 # ---------------------------------------------------------------------------
 

@@ -4222,6 +4222,25 @@ class AnthropicProvider:
         if not all_messages or not self.enable_prompt_caching or remaining_budget <= 0:
             return all_messages, 0
 
+        if len(all_messages) < 2:
+            # A single-message request has no conversation region at all: no
+            # recurring stable prefix exists for a later request to hit, so
+            # both a breakpoint and the "no metadata" warning below would be
+            # vacuous here. This is the normal shape of one-shot utility
+            # provider calls that bypass the main conversation entirely --
+            # e.g. hooks-session-naming's `_generate_name`, which sends a
+            # single user message with no history and no metadata on every
+            # turn. Without this guard, that call fires the
+            # has_ephemeral_signal warning below on every single turn of
+            # every session, for a "problem" that was never actually
+            # cacheable in the first place. Silent return (not even at
+            # `debug`): there is nothing informative to report about a
+            # request that was never a caching candidate. Do not remove this
+            # thinking it's redundant with `has_ephemeral_signal` -- that
+            # check is for genuine multi-message requests missing metadata,
+            # a real signal this method must keep surfacing loudly.
+            return all_messages, 0
+
         if not has_ephemeral_signal:
             # No message anywhere in this request carries a `metadata` dict,
             # so there is no basis for distinguishing stable history from a
