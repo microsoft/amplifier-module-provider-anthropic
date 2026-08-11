@@ -2600,25 +2600,6 @@ class AnthropicProvider:
                         ", ".join(valid_efforts),
                     )
 
-        # reasoning_effort is now fully resolved (kwargs precedence is applied
-        # further up the call chain via request.reasoning_effort; config was
-        # just resolved above). Warn here \u2014 covering BOTH the request path and
-        # the config path \u2014 when the caller asked for more than "high" on a
-        # model that has no output_config support. The effort ladder above
-        # maps "high", "xhigh", and "max" to identical thinking params on
-        # these models (see :2580-2600), so "xhigh"/"max" silently resolve to
-        # exactly "high" with no way for the caller to tell. This is a
-        # warn-and-continue: params are not changed.
-        if reasoning_effort in ("xhigh", "max") and not request_caps.supports_output_config:
-            logger.warning(
-                "[PROVIDER] reasoning_effort=%r has no effect on %s (no output_config "
-                "support) \u2014 resolves identically to 'high'. Supported efforts for this "
-                "model: %s",
-                reasoning_effort,
-                effective_model,
-                request_caps.supported_efforts,
-            )
-
         if "extended_thinking" not in kwargs and reasoning_effort is not None:
             # reasoning_effort implies extended_thinking=True. This is a
             # deliberate Amplifier mapping (commit bc026a43): the portable
@@ -2641,6 +2622,35 @@ class AnthropicProvider:
                     params["model"],
                 )
                 thinking_enabled = False
+
+        # reasoning_effort is now fully resolved, and thinking_enabled is now
+        # final (kwargs["extended_thinking"]=False forces it off above;
+        # request_caps.supports_thinking=False forces it off just above too).
+        # Warn here — covering BOTH the request path and the config path
+        # (PR #84's intent) — when the caller asked for more than "high" on a
+        # model that has no output_config support. This must run after
+        # thinking_enabled is final: when thinking is disabled (explicit
+        # extended_thinking=False, or a model with no thinking support at
+        # all, e.g. Haiku), reasoning_effort is not applied anywhere —
+        # output_config.effort is skipped by the inverse of this same
+        # capability check below, and the effort→thinking ladder is skipped
+        # entirely. In that case "resolves identically to 'high'" would be
+        # false; nothing is applied at all, so warning would be misleading.
+        # Only warn when thinking_enabled is True, i.e. the effort ladder
+        # below actually runs and collapses "xhigh"/"max" to "high".
+        if (
+            reasoning_effort in ("xhigh", "max")
+            and not request_caps.supports_output_config
+            and thinking_enabled
+        ):
+            logger.warning(
+                "[PROVIDER] reasoning_effort=%r has no effect on %s (no output_config "
+                "support) — resolves identically to 'high'. Supported efforts for this "
+                "model: %s",
+                reasoning_effort,
+                effective_model,
+                request_caps.supported_efforts,
+            )
 
         if thinking_enabled:
             # Fable 5: thinking is always on. Never inject a thinking

@@ -942,3 +942,75 @@ class TestUndifferentiatedEffortWarning:
         )
         # New warn-and-continue must NOT double-fire (4.7 supports output_config)
         assert not any("has no effect on" in r.message for r in caplog.records)
+
+    def test_xhigh_with_extended_thinking_false_does_not_warn(self, caplog):
+        """xhigh + kwargs extended_thinking=False on Sonnet 4.5 (no
+        output_config support): thinking ends up disabled, so
+        reasoning_effort is consumed by nothing at all -- not the effort
+        ladder, not output_config. The warning's claim ('resolves
+        identically to high') would be false here, so it must NOT fire."""
+        import logging
+
+        provider = _make_provider(default_model="claude-sonnet-4-5-20250929")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="xhigh",
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request, extended_thinking=False))
+
+        assert not any("has no effect on" in r.message for r in caplog.records)
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" not in params
+        assert "output_config" not in params
+
+    def test_xhigh_on_haiku_35_does_not_warn(self, caplog):
+        """xhigh on Haiku 3.5 (no thinking support at all, no output_config
+        support): reasoning_effort is consumed by nothing -- the effort
+        ladder never runs (thinking_enabled is forced False) and
+        output_config is unavailable. The warning must NOT fire."""
+        import logging
+
+        provider = _make_provider(default_model="claude-haiku-3-5-20250929")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="xhigh",
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request))
+
+        assert not any("has no effect on" in r.message for r in caplog.records)
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" not in params
+
+    def test_xhigh_with_thinking_active_still_warns_on_sonnet_4_5(self, caplog):
+        """Regression guard: xhigh with thinking actually active (explicit
+        extended_thinking=True) on Sonnet 4.5 still logs the warning -- proves
+        the thinking_enabled guard didn't just delete the feature, only
+        narrowed it to the case where the effort ladder actually runs."""
+        import logging
+
+        provider = _make_provider(default_model="claude-sonnet-4-5-20250929")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="xhigh",
+        )
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(provider.complete(request, extended_thinking=True))
+
+        assert any(
+            "has no effect on" in r.message and "xhigh" in r.message
+            for r in caplog.records
+        )
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "thinking" in params
+        assert "output_config" not in params
