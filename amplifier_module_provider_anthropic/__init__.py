@@ -3344,8 +3344,27 @@ class AnthropicProvider:
                 # a misconfigured base_url instead of looking like the network
                 # is down).
                 cause = e.__cause__
-                if cause is not None and str(cause) not in error_msg:
-                    error_msg = f"{error_msg} (caused by {type(cause).__name__}: {cause})"
+                if cause is not None:
+                    # redact_secrets before interpolating: this path is generic,
+                    # so ANY exception with a __cause__ gets its str() spliced
+                    # into a message that reaches logs and user-facing output.
+                    # A base_url carrying embedded basic-auth
+                    # (https://user:pass@proxy.internal/) would otherwise leak
+                    # those credentials on a connection error. Same treatment
+                    # the raw request/response payloads already get elsewhere in
+                    # this file.
+                    cause_text = redact_secrets(str(cause))
+                    # Compare on the redacted text -- comparing on the raw text
+                    # would suppress the suffix whenever the unredacted string
+                    # happened to appear, which is not the question being asked.
+                    #
+                    # `cause_text` is checked for truthiness explicitly: an
+                    # exception with an empty str() ("" in anything is True)
+                    # would otherwise silently drop the whole suffix, taking the
+                    # useful *type name* with it -- the one piece of diagnostic
+                    # value such a cause still has.
+                    if not cause_text or cause_text not in error_msg:
+                        error_msg = f"{error_msg} (caused by {type(cause).__name__}: {cause_text})"
                 raise KernelLLMError(
                     error_msg,
                     provider="anthropic",
