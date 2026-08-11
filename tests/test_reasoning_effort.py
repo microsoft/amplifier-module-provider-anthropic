@@ -1014,3 +1014,114 @@ class TestUndifferentiatedEffortWarning:
         params = _get_api_params(provider.client.messages.with_raw_response.create)
         assert "thinking" in params
         assert "output_config" not in params
+
+
+# ---------------------------------------------------------------------------
+# kwargs["extended_thinking"]=False must fully suppress output_config.effort
+# too, not just the `thinking` param block.
+#
+# Bug: an ambient/backfilled reasoning_effort (from provider config or
+# request.reasoning_effort) was leaking into output_config.effort even when
+# the caller explicitly opted out of thinking via extended_thinking=False.
+# On models with supports_output_config, output_config.effort IS the
+# thinking control surface, so this silently defeated the caller's explicit
+# "no reasoning on this call" opt-out. An explicit kwargs["effort"] override
+# still wins -- it's a deliberate per-call output_config-only request, not
+# an ambient default.
+# ---------------------------------------------------------------------------
+
+
+class TestExtendedThinkingFalseSuppressesOutputConfig:
+    """extended_thinking=False must omit output_config.effort too, unless
+    the caller also passed an explicit kwargs["effort"] override."""
+
+    def test_ambient_config_xhigh_with_extended_thinking_false_omits_output_config(
+        self,
+    ):
+        """Bug case: ambient config reasoning_effort='xhigh' + kwargs
+        extended_thinking=False on claude-sonnet-5 (supports_output_config)
+        -> output_config is ABSENT, not backfilled with 'xhigh'."""
+        provider = _make_provider_with_config(
+            {"reasoning_effort": "xhigh"}, default_model="claude-sonnet-5"
+        )
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request, extended_thinking=False))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "output_config" not in params
+        assert "thinking" not in params
+
+    def test_request_reasoning_effort_xhigh_with_extended_thinking_false_omits_output_config(
+        self,
+    ):
+        """Same bug via the request path: request.reasoning_effort='xhigh'
+        + kwargs extended_thinking=False -> output_config ABSENT."""
+        provider = _make_provider(default_model="claude-sonnet-5")
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="xhigh",
+        )
+        asyncio.run(provider.complete(request, extended_thinking=False))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert "output_config" not in params
+        assert "thinking" not in params
+
+    def test_explicit_effort_kwarg_still_wins_despite_thinking_opt_out(self):
+        """An explicit kwargs['effort'] is a deliberate output_config-only
+        override and must win even when extended_thinking=False."""
+        provider = _make_provider_with_config(
+            {"reasoning_effort": "xhigh"}, default_model="claude-sonnet-5"
+        )
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(
+            provider.complete(request, extended_thinking=False, effort="high")
+        )
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"] == {"effort": "high"}
+
+    def test_no_extended_thinking_kwarg_unchanged_behavior(self):
+        """Regression guard: without an explicit extended_thinking kwarg,
+        ambient reasoning_effort='xhigh' still sets output_config.effort
+        exactly as before this fix."""
+        provider = _make_provider_with_config(
+            {"reasoning_effort": "xhigh"}, default_model="claude-sonnet-5"
+        )
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"] == {"effort": "xhigh"}
+
+    def test_extended_thinking_true_unchanged_behavior(self):
+        """Regression guard: an explicit extended_thinking=True (opt-IN)
+        does not suppress output_config.effort."""
+        provider = _make_provider_with_config(
+            {"reasoning_effort": "xhigh"}, default_model="claude-sonnet-5"
+        )
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_mock()
+        )
+
+        request = ChatRequest(messages=[Message(role="user", content="Hello")])
+        asyncio.run(provider.complete(request, extended_thinking=True))
+
+        params = _get_api_params(provider.client.messages.with_raw_response.create)
+        assert params["output_config"] == {"effort": "xhigh"}
