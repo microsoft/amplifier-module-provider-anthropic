@@ -2574,6 +2574,19 @@ class AnthropicProvider:
         #   (2) kwargs["effort"] — an output_config.effort-ONLY override applied
         #       later (see the output_config block).  It does NOT feed this
         #       thinking path and does NOT enable thinking on its own.
+        #
+        # IMPORTANT — this is NOT a complete chain: output_config.effort is a
+        # *second*, independently-gated field (see the output_config block
+        # below), not merely a side effect of resolving reasoning_effort here.
+        # On models with supports_output_config, output_config.effort IS the
+        # thinking control surface, so kwargs["extended_thinking"]=False (an
+        # explicit "no reasoning on this call" opt-out) is honored there too:
+        # an ambient/ resolved reasoning_effort is NOT applied to
+        # output_config when the caller explicitly opted out of thinking,
+        # unless the caller ALSO passed an explicit kwargs["effort"]
+        # override (a deliberate output_config-only request that wins
+        # regardless of the opt-out). See the output_config block for the
+        # exact condition.
         if reasoning_effort is None:
             # Canonical config key first ("reasoning_effort", matching the
             # kernel's portable request.reasoning_effort), then the legacy
@@ -2811,7 +2824,24 @@ class AnthropicProvider:
         # Build output_config for models that support it (Opus 4.7+).
         # output_config.effort is the primary control surface for thinking
         # intensity on these models, replacing the budget_tokens approach.
-        if request_caps.supports_output_config and reasoning_effort is not None:
+        #
+        # kwargs["extended_thinking"]=False is an explicit, per-call "no
+        # reasoning on this call" opt-out (see thinking_enabled above). On
+        # supports_output_config models, output_config.effort IS the
+        # thinking control surface — so silently applying an ambient/
+        # resolved reasoning_effort here would reintroduce reasoning the
+        # caller explicitly turned off, defeating the opt-out. An explicit
+        # kwargs["effort"] still wins even when the caller opted out of
+        # thinking: it's a deliberate, per-call output_config-only override
+        # (not an ambient default), matching the existing precedence note
+        # below.
+        explicit_thinking_opt_out = kwargs.get("extended_thinking") is False
+        explicit_effort_override = "effort" in kwargs
+        if (
+            request_caps.supports_output_config
+            and reasoning_effort is not None
+            and not (explicit_thinking_opt_out and not explicit_effort_override)
+        ):
             # kwargs["effort"] allows overriding output_config.effort independently
             # of reasoning_effort (e.g. reasoning_effort="high" for thinking type,
             # but effort="xhigh" for output config intensity).
