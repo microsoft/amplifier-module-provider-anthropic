@@ -70,8 +70,10 @@ class TestCauseSurfacing:
         """
         from amplifier_core.utils import redact_secrets
 
+        from amplifier_module_provider_anthropic import _redact_url_credentials
+
         if cause is not None:
-            cause_text = redact_secrets(str(cause))
+            cause_text = redact_secrets(_redact_url_credentials(str(cause)))
             if not cause_text or cause_text not in error_msg:
                 error_msg = (
                     f"{error_msg} (caused by {type(cause).__name__}: {cause_text})"
@@ -116,17 +118,27 @@ class TestCauseSurfacing:
     def test_credentials_in_cause_are_redacted(self) -> None:
         """The enrichment is generic, so any cause's str() reaches the log.
 
-        A base_url carrying embedded basic-auth would otherwise leak those
-        credentials into a user-facing error on any connection failure.
+        A base_url carrying embedded basic-auth (https://user:pass@host/) is
+        echoed verbatim by httpx/httpcore's own exception text (e.g. the URL
+        is quoted back in "Request URL is missing/invalid ..."). That would
+        otherwise leak the credentials into a user-facing error on any
+        connection failure. redact_secrets() alone can't catch this -- it
+        only redacts dict values under a sensitive key, not a substring
+        embedded inside a plain string -- so the userinfo must be stripped
+        before the cause text is interpolated.
         """
-        from amplifier_core.utils import redact_secrets
-
-        secret = "sk-ant-api03-REDACTME000000000000000000000000"
-        cause = RuntimeError(f"failed calling with key {secret}")
+        secret_user, secret_pass = "svc-account", "hunter2-token"
+        cause = RuntimeError(
+            f"Request URL 'https://{secret_user}:{secret_pass}@proxy.internal/v1' "
+            "is missing an 'http://' or 'https://' protocol"
+        )
         out = self._enrich("Connection error.", cause)
 
-        if secret not in redact_secrets(str(cause)):
-            assert secret not in out, (
-                "redact_secrets scrubs this value, but the raw secret still "
-                f"reached the enriched message: {out!r}"
-            )
+        assert secret_user not in out and secret_pass not in out, (
+            f"credentials embedded in the cause's base_url leaked into the "
+            f"enriched message: {out!r}"
+        )
+        assert "proxy.internal" in out, (
+            "redaction should remove only the userinfo, not the rest of the "
+            f"diagnostic text: {out!r}"
+        )

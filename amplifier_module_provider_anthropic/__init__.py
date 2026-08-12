@@ -279,6 +279,20 @@ def _is_context_overflow(raw_msg: str) -> bool:
     return any(m in raw_msg for m in _CONTEXT_OVERFLOW_MESSAGE_MARKERS)
 
 
+# redact_secrets() (amplifier_core.utils) only redacts dict values keyed by a
+# sensitive name -- it passes plain strings straight through unchanged. The
+# httpx/httpcore exceptions surfaced via __cause__ are plain strings, and a
+# base_url with embedded basic-auth (https://user:pass@proxy.internal/) shows
+# up verbatim inside them (e.g. in the "Request URL is missing/invalid ..."
+# text). Strip that userinfo before it reaches a log line or KernelLLMError.
+_URL_CREDENTIALS_RE = re.compile(r"://[^/@\s]+:[^/@\s]+@")
+
+
+def _redact_url_credentials(text: str) -> str:
+    """Strip embedded basic-auth credentials (user:pass@) from any URL in text."""
+    return _URL_CREDENTIALS_RE.sub("://[REDACTED]@", text)
+
+
 # ---------------------------------------------------------------------------
 # Deprecated model retirement dates — warn once per process per model
 # ---------------------------------------------------------------------------
@@ -1870,7 +1884,7 @@ class AnthropicProvider:
     def _write_shared_rate_limit_state(self, rate_limit_info: dict[str, Any]) -> None:
         """Atomically write rate-limit header data to the shared cross-process file.
 
-        Uses write-to-tmp + os.rename() so concurrent readers never see a partial
+        Uses write-to-tmp + os.replace() so concurrent readers never see a partial
         file.  Only writes if the rate-limit data actually changed (debounce by
         content equality) to avoid excessive I/O on every response.
 
@@ -3359,15 +3373,20 @@ class AnthropicProvider:
                 # is down).
                 cause = e.__cause__
                 if cause is not None:
-                    # redact_secrets before interpolating: this path is generic,
-                    # so ANY exception with a __cause__ gets its str() spliced
-                    # into a message that reaches logs and user-facing output.
-                    # A base_url carrying embedded basic-auth
-                    # (https://user:pass@proxy.internal/) would otherwise leak
-                    # those credentials on a connection error. Same treatment
-                    # the raw request/response payloads already get elsewhere in
-                    # this file.
-                    cause_text = redact_secrets(str(cause))
+                    # Redact before interpolating: this path is generic, so ANY
+                    # exception with a __cause__ gets its str() spliced into a
+                    # message that reaches logs and user-facing output. A
+                    # base_url carrying embedded basic-auth
+                    # (https://user:pass@proxy.internal/) shows up verbatim in
+                    # httpx/httpcore's own exception text (e.g. the URL is
+                    # quoted back in "Request URL is missing/invalid ..."), so
+                    # redact_secrets() alone isn't enough -- it only redacts
+                    # dict values under a sensitive key, not credentials
+                    # embedded inside a plain string. Strip URL userinfo first,
+                    # then apply the same redact_secrets() treatment the raw
+                    # request/response payloads already get elsewhere in this
+                    # file.
+                    cause_text = redact_secrets(_redact_url_credentials(str(cause)))
                     # Compare on the redacted text -- comparing on the raw text
                     # would suppress the suffix whenever the unredacted string
                     # happened to appear, which is not the question being asked.
