@@ -1841,7 +1841,14 @@ class AnthropicProvider:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(tmp_path, "w") as f:
                 json.dump(state, f)
-            os.rename(tmp_path, path)
+            # os.replace(), NOT os.rename(): on POSIX rename() atomically
+            # replaces an existing target, but on Windows it raises
+            # FileExistsError when the target exists. Both call sites sit
+            # inside `except Exception: pass`, so on Windows every write
+            # after the first one failed SILENTLY and this file froze at
+            # its initial contents for the life of the process.
+            # os.replace() has rename()'s atomic-replace semantics on both.
+            os.replace(tmp_path, path)
         except Exception:
             pass  # Never crash on I/O errors
 
@@ -1906,7 +1913,14 @@ class AnthropicProvider:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(tmp_path, "w") as f:
                 json.dump(state, f)
-            os.rename(tmp_path, path)
+            # os.replace(), NOT os.rename(): on POSIX rename() atomically
+            # replaces an existing target, but on Windows it raises
+            # FileExistsError when the target exists. Both call sites sit
+            # inside `except Exception: pass`, so on Windows every write
+            # after the first one failed SILENTLY and this file froze at
+            # its initial contents for the life of the process.
+            # os.replace() has rename()'s atomic-replace semantics on both.
+            os.replace(tmp_path, path)
             self._last_written_state = comparable
         except Exception:
             pass  # Never crash on I/O errors
