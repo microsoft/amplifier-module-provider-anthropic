@@ -285,7 +285,7 @@ def _is_context_overflow(raw_msg: str) -> bool:
 # base_url with embedded basic-auth (https://user:pass@proxy.internal/) shows
 # up verbatim inside them (e.g. in the "Request URL is missing/invalid ..."
 # text). Strip that userinfo before it reaches a log line or KernelLLMError.
-_URL_CREDENTIALS_RE = re.compile(r"://[^/@\s]+:[^/@\s]+@")
+_URL_CREDENTIALS_RE = re.compile(r"://[^/@\s:]*(?::[^/@\s]*)?@")
 
 
 def _redact_url_credentials(text: str) -> str:

@@ -19,7 +19,11 @@ an opaque failure into an actionable one.
 
 from __future__ import annotations
 
-from amplifier_module_provider_anthropic import AnthropicProvider
+import pytest
+from amplifier_module_provider_anthropic import (
+    AnthropicProvider,
+    _redact_url_credentials,
+)
 
 
 class TestEmptyBaseUrlNormalisation:
@@ -69,7 +73,6 @@ class TestCauseSurfacing:
         it is exercised directly against the same logic.
         """
         from amplifier_core.utils import redact_secrets
-
         from amplifier_module_provider_anthropic import _redact_url_credentials
 
         if cause is not None:
@@ -142,3 +145,54 @@ class TestCauseSurfacing:
             "redaction should remove only the userinfo, not the rest of the "
             f"diagnostic text: {out!r}"
         )
+
+
+class TestRedactUrlCredentialsForms:
+    """``_redact_url_credentials`` must catch every real-world userinfo shape.
+
+    The original regex (``[^/@\\s]+:[^/@\\s]+@``) required both a non-empty
+    username *and* a non-empty password, so it only matched the classic
+    ``user:pass@`` form. Three other forms used in practice leaked the raw
+    secret verbatim: a bare token as username (the standard git-over-https /
+    API-proxy-token convention, no colon at all), an empty username with the
+    token as password, and a token as username with an empty password.
+    """
+
+    @pytest.mark.parametrize(
+        ("url", "secret"),
+        [
+            pytest.param(
+                "https://ghp_TOKEN@github.com/org/repo.git",
+                "ghp_TOKEN",
+                id="bare-token-username-no-colon",
+            ),
+            pytest.param(
+                "https://:ghp_TOKEN@proxy.internal/v1",
+                "ghp_TOKEN",
+                id="empty-username-token-password",
+            ),
+            pytest.param(
+                "https://sk-ant-KEY:@proxy.internal/v1",
+                "sk-ant-KEY",
+                id="token-username-empty-password",
+            ),
+            pytest.param(
+                "https://user:pass@proxy.internal/v1",
+                "pass",
+                id="user-and-password",
+            ),
+        ],
+    )
+    def test_credentials_are_redacted(self, url: str, secret: str) -> None:
+        out = _redact_url_credentials(url)
+        assert secret not in out, f"secret leaked in redacted output: {out!r}"
+        assert "[REDACTED]" in out
+
+    def test_url_without_credentials_is_unchanged(self) -> None:
+        url = "https://api.anthropic.com/v1"
+        assert _redact_url_credentials(url) == url
+
+    def test_at_sign_in_path_is_not_touched(self) -> None:
+        """An ``@`` appearing after the first ``/`` is part of the path, not userinfo."""
+        url = "https://host/a@b"
+        assert _redact_url_credentials(url) == url
