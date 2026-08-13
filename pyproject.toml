@@ -21,9 +21,6 @@ requires = [
 ]
 build-backend = "hatchling.build"
 
-[tool.uv.sources]
-amplifier-core = { git = "https://github.com/microsoft/amplifier-core", branch = "main" }
-
 [tool.uv]
 package = true
 
