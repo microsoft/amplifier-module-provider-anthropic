@@ -117,7 +117,26 @@ def _ephemeral_tail(text: str) -> Message:
 
 def _run(provider: AnthropicProvider, request: ChatRequest) -> dict:
     params = _capture_params(provider)
-    asyncio.run(provider.complete(request))
+
+    async def _complete_and_close() -> None:
+        # Close the provider's underlying async HTTP client before this
+        # event loop (created fresh by asyncio.run for every call to _run)
+        # is torn down. Every test in this module builds its own
+        # AnthropicProvider via _make_provider() and never closes it
+        # otherwise; the leaked client is later garbage-collected at an
+        # unpredictable point -- often during an unrelated *later* test --
+        # and its internal cleanup then fails with "Event loop is closed"
+        # (that loop already closed when *this* asyncio.run() returned).
+        # asyncio's default exception handler logs that failure at ERROR
+        # level via the "asyncio" logger, which can land inside whichever
+        # test's caplog window happens to be open at GC time. Closing here,
+        # inside the same loop the client was created in, prevents this
+        # module's own tests from contributing leaked clients to that
+        # cross-test noise.
+        await provider.complete(request)
+        await provider.close()
+
+    asyncio.run(_complete_and_close())
     return params
 
 
@@ -457,10 +476,31 @@ def test_single_message_no_metadata_returns_silently_with_no_warning(caplog):
 
     # Nothing at all logged by _apply_conversation_cache_control -- not a
     # warning, not even a debug-level message. A silent return, full stop.
-    assert not any(
-        "Prompt caching" in r.message for r in caplog.records
-    ), "single-message request must not log anything from the cache-control path"
-    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+    #
+    # Scoped to this module's own logger. Root cause of a flaky failure here
+    # (ubuntu/py3.11, observed in CI run 31654412681): a *different* test's
+    # AnthropicProvider (not this one's) leaks its httpx AsyncClient because
+    # nothing in this file closed it before this fix. When Python garbage
+    # collects that leaked client at some later, unpredictable point, its
+    # cleanup tries to run against the (now-closed) event loop that created
+    # it and fails with `RuntimeError("Event loop is closed")`. asyncio's
+    # default exception handler logs that failure at ERROR level via the
+    # "asyncio" logger -- unrelated to this module and to the cache-control
+    # code path this assertion exists to guard -- and it can land inside
+    # whichever test's caplog window happens to be open when the GC event
+    # fires, which is nondeterministic and version-sensitive (observed only
+    # on py3.11, never on py3.12/macOS in the same CI matrix). `_run()` now
+    # closes the client used by each test in this file, removing this file
+    # as a source of that noise; this scope narrowing additionally protects
+    # this specific assertion against equivalent noise from elsewhere in the
+    # (600+ test) suite that this file does not control.
+    own_records = [
+        r for r in caplog.records if r.name == "amplifier_module_provider_anthropic"
+    ]
+    assert not any("Prompt caching" in r.message for r in own_records), (
+        "single-message request must not log anything from the cache-control path"
+    )
+    assert not any(r.levelno >= logging.WARNING for r in own_records)
 
 
 def test_multi_message_no_metadata_still_warns_loudly(caplog):
