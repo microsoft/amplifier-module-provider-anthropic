@@ -285,12 +285,56 @@ def _is_context_overflow(raw_msg: str) -> bool:
 # base_url with embedded basic-auth (https://user:pass@proxy.internal/) shows
 # up verbatim inside them (e.g. in the "Request URL is missing/invalid ..."
 # text). Strip that userinfo before it reaches a log line or KernelLLMError.
-_URL_CREDENTIALS_RE = re.compile(r"://[^/@\s:]*(?::[^/@\s]*)?@")
+#
+# The scheme prefix ("://") is OPTIONAL, not required: GAP-016's whole reason
+# for existing is a malformed/missing-protocol base_url, and that is exactly
+# the case where httpx's own "Request URL ... is missing an 'http://' or
+# 'https://' protocol" text echoes the configured value back with NO "://" in
+# front of it. A pattern anchored on "://" never fires for the one input this
+# redaction exists to catch.
+#
+# Making "://" optional everywhere would also swallow an ordinary bare email
+# address (e.g. "contact admin@example.com") appearing in unrelated
+# diagnostic text -- that's over-redaction, destroying diagnostic value for
+# no security benefit. So the no-scheme branch additionally REQUIRES a colon
+# in the userinfo (user:pass@, :pass@, user:@). An email's local part never
+# contains a colon, so this cleanly separates "credentials" from "email"
+# without needing scheme context. A bare token with no colon AND no scheme
+# (e.g. "token@host") is genuinely ambiguous -- it looks exactly like an
+# email's user@host shape -- and is deliberately left unredacted rather than
+# risk destroying real diagnostic text on a guess; the scheme-present form of
+# the same bare-token case (https://token@host) is still fully covered below.
+#
+# One pattern (not two) handles both shapes via Python's conditional-group
+# syntax `(?(scheme)yes|no)`, keeping the "when does this fire" logic in a
+# single place instead of two regexes a future edit could let drift apart.
+# The replacement is a function (not a fixed string) because the correct
+# output differs by branch: re-emit "://" only if it was actually present in
+# the input, so a no-scheme value doesn't gain a fake "://" it never had.
+_URL_CREDENTIALS_RE = re.compile(
+    r"(?P<scheme>://)?"
+    r"(?(scheme)"
+    r"[^/@\s:]*(?::[^/@\s]*)?"  # scheme present: user, user:pass, :pass, or user: all count
+    r"|"
+    r"[A-Za-z0-9_.~%+=-]*:[A-Za-z0-9_.~%+=-]*"  # no scheme: colon in userinfo required
+    r")"
+    r"@"
+)
+
+
+def _redact_url_credentials_match(match: re.Match[str]) -> str:
+    scheme = match.group("scheme") or ""
+    return f"{scheme}[REDACTED]@"
 
 
 def _redact_url_credentials(text: str) -> str:
-    """Strip embedded basic-auth credentials (user:pass@) from any URL in text."""
-    return _URL_CREDENTIALS_RE.sub("://[REDACTED]@", text)
+    """Strip embedded basic-auth credentials (user:pass@) from any URL in text.
+
+    Catches both `scheme://user:pass@host` and the scheme-less
+    `user:pass@host` form (see the regex comment above for why the latter is
+    the case that actually matters for GAP-016).
+    """
+    return _URL_CREDENTIALS_RE.sub(_redact_url_credentials_match, text)
 
 
 # ---------------------------------------------------------------------------

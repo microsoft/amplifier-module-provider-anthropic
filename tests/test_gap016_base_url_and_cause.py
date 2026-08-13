@@ -196,3 +196,91 @@ class TestRedactUrlCredentialsForms:
         """An ``@`` appearing after the first ``/`` is part of the path, not userinfo."""
         url = "https://host/a@b"
         assert _redact_url_credentials(url) == url
+
+
+class TestRedactUrlCredentialsNoScheme:
+    """Credentials must be redacted even when there is no ``scheme://`` at all.
+
+    This is the exact scenario GAP-016 exists to handle: httpx's own
+    "Request URL ... is missing an 'http://' or 'https://' protocol" text
+    echoes a malformed/missing-protocol ``base_url`` back verbatim, and a
+    pattern anchored on a literal ``"://"`` never fires for it -- the one
+    input this redaction exists to catch was the one input it didn't catch.
+    """
+
+    def test_no_scheme_user_pass_is_redacted(self) -> None:
+        """The confirmed leak: user:pass@ with no scheme prefix at all."""
+        secret_user, secret_pass = "svc-account", "hunter2-token"
+        text = (
+            f"Request URL '{secret_user}:{secret_pass}@proxy.internal/v1' "
+            "is missing an 'http://' or 'https://' protocol"
+        )
+        out = _redact_url_credentials(text)
+
+        assert secret_user not in out and secret_pass not in out, (
+            f"credentials leaked with no scheme present: {out!r}"
+        )
+        assert "[REDACTED]" in out
+        assert "proxy.internal" in out, (
+            f"redaction should remove only the userinfo: {out!r}"
+        )
+
+    def test_no_scheme_empty_username_token_password_is_redacted(self) -> None:
+        secret = "ghp_TOKEN"
+        text = f"URL ':{secret}@proxy.internal/v1' is missing a protocol"
+        out = _redact_url_credentials(text)
+        assert secret not in out, f"secret leaked: {out!r}"
+        assert "[REDACTED]" in out
+
+    def test_no_scheme_token_username_empty_password_is_redacted(self) -> None:
+        secret = "sk-ant-KEY"
+        text = f"URL '{secret}:@proxy.internal/v1' is missing a protocol"
+        out = _redact_url_credentials(text)
+        assert secret not in out, f"secret leaked: {out!r}"
+        assert "[REDACTED]" in out
+
+    def test_bare_email_is_not_mangled(self) -> None:
+        """A bare email's local part has no colon -- it must not be treated
+
+        as leaked credentials. Over-redaction destroys diagnostic value for
+        no security benefit: this pins the over-redaction risk instead of
+        merely assuming it's handled.
+        """
+        text = "Contact admin at someone@example.com for help"
+        assert _redact_url_credentials(text) == text
+
+    def test_bare_token_no_scheme_is_left_alone_by_design(self) -> None:
+        """A colon-less bare token with no scheme (``token@host``) is
+
+        indistinguishable from an email's ``user@host`` shape without scheme
+        context. This pins the deliberate design choice to leave it alone
+        rather than risk destroying real diagnostic text on a guess -- the
+        scheme-present form of the same case is still fully redacted
+        (see ``bare-token-username-no-colon`` above).
+        """
+        text = "Request URL 'token@proxy.internal/v1' is missing a protocol"
+        assert _redact_url_credentials(text) == text
+
+    def test_scheme_present_case_is_unaffected(self) -> None:
+        """The original, tested, scheme-anchored behaviour must be unchanged."""
+        secret = "hunter2-token"
+        text = f"https://user:{secret}@proxy.internal/v1"
+        out = _redact_url_credentials(text)
+        assert secret not in out
+
+    def test_base64_padded_password_no_scheme_is_redacted(self) -> None:
+        """Additional leak found during review: a base64-style secret with
+
+        ``+``/``=`` padding characters (a common real-world token shape --
+        e.g. a proxy password or bearer token) was left completely unredacted
+        in the no-scheme form, because the first character class draft only
+        allowed ``[A-Za-z0-9_.~%+-]`` and stopped matching at the unhandled
+        ``=``, leaving no valid span reaching ``@`` at all -- not even a
+        partial redaction. ``=`` was added to the no-scheme character classes
+        to close this.
+        """
+        secret = "P4ss+word=="
+        text = f"URL 'user:{secret}@proxy.internal/v1' missing protocol"
+        out = _redact_url_credentials(text)
+        assert secret not in out, f"secret leaked: {out!r}"
+        assert "[REDACTED]" in out
