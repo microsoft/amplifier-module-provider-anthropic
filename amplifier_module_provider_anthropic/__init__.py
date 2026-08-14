@@ -4138,6 +4138,40 @@ class AnthropicProvider:
             for block in content
         )
 
+    @staticmethod
+    def _stamps_empty_text_block(msg: dict[str, Any]) -> bool:
+        """True if stamping ``msg`` would put cache_control on empty text.
+
+        Mirrors ``_stamp_last_block``'s two branches, because that method is
+        what decides which block actually receives the marker:
+
+        * list content -> the LAST block. Unsafe only when that block is a
+          text block whose text is empty or whitespace-only. A trailing
+          ``tool_use`` / ``tool_result`` / image block is fine.
+        * string content -> the whole string is turned INTO a text block, so
+          an empty or whitespace-only string is unsafe.
+
+        Anthropic rejects the request outright when a cache breakpoint lands
+        on an empty text block:
+
+            messages.N.content.0.text: cache_control cannot be set for
+            empty text blocks
+
+        Whitespace-only counts as empty on their side too, hence ``.strip()``.
+        """
+        content = msg.get("content")
+        if isinstance(content, list):
+            if not content:
+                # Nothing to stamp; _stamp_last_block is a no-op here.
+                return False
+            last = content[-1]
+            if not isinstance(last, dict) or last.get("type") != "text":
+                return False
+            return not (last.get("text") or "").strip()
+        if isinstance(content, str):
+            return not content.strip()
+        return False
+
     def _last_safe_breakpoint_index(
         self, messages: list[dict[str, Any]], start_idx: int
     ) -> int | None:
@@ -4165,7 +4199,11 @@ class AnthropicProvider:
                 and self._is_tool_use_message(msg)
                 and self._is_tool_result_message(messages[idx + 1])
             )
-            if not splits_pair:
+            # A content-less turn (e.g. an OpenAI-format assistant message
+            # replayed as ``content: null`` and defaulted to ``""`` upstream)
+            # would be stamped as an EMPTY text block, which Anthropic rejects
+            # with a 400. Walk past it exactly as we walk past a split pair.
+            if not splits_pair and not self._stamps_empty_text_block(msg):
                 return idx
             idx -= 1
         return None
@@ -4321,8 +4359,9 @@ class AnthropicProvider:
         if primary_idx is None:
             logger.warning(
                 "[PROVIDER] Prompt caching: could not find a stable message "
-                "boundary that doesn't split a tool_use/tool_result pair -- "
-                "skipping conversation-region cache breakpoint(s)."
+                "boundary that neither splits a tool_use/tool_result pair nor "
+                "lands on an empty text block -- skipping conversation-region "
+                "cache breakpoint(s)."
             )
             return all_messages, 0
 

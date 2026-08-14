@@ -578,3 +578,97 @@ def test_cache_stable_region_ttl_1h_opt_in_applies_to_system_and_tools_only():
             for block in content:
                 if isinstance(block, dict) and "cache_control" in block:
                     assert block["cache_control"] == {"type": "ephemeral"}
+
+# ---------------------------------------------------------------------------
+# Empty text blocks must never carry a cache breakpoint
+# ---------------------------------------------------------------------------
+
+
+def _cache_controlled_empty_text_blocks(params: dict) -> list[tuple[int, dict]]:
+    """Return every (message_index, block) that is an EMPTY text block carrying
+    cache_control -- the exact shape Anthropic rejects with:
+
+        messages.N.content.0.text: cache_control cannot be set for empty text blocks
+    """
+    offenders: list[tuple[int, dict]] = []
+    for i, msg in enumerate(params.get("messages") or []):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or "cache_control" not in block:
+                continue
+            if block.get("type") != "text":
+                continue
+            if not (block.get("text") or "").strip():
+                offenders.append((i, block))
+    return offenders
+
+
+def test_breakpoint_never_lands_on_an_empty_text_block():
+    """A content-less assistant turn must never receive a cache breakpoint.
+
+    Reproduces a live 400 from the Anthropic API. The chain:
+
+    1. A caller represents a turn that carries no text (for example an
+       assistant turn whose only payload is tool calls) as empty string
+       content. This is legitimate and reaches providers routinely.
+    2. That empty STRING reaches this provider. ``_stamp_last_block`` converts
+       string content into a block array and stamps ``cache_control`` on it in
+       the same step -- synthesising ``{"type": "text", "text": ""}`` WITH a
+       cache breakpoint on it.
+    3. Anthropic rejects the request outright.
+
+    ``_last_safe_breakpoint_index`` already refuses to split a tool_use /
+    tool_result pair; it must likewise refuse a candidate whose stamped block
+    would be empty.
+    """
+    provider = _make_provider()
+
+    messages = [
+        Message(role="system", content="System prompt."),
+        Message(role="user", content="do the thing"),
+        Message(
+            role="assistant",
+            content=[ToolCallBlock(id="call_1", name="do_something", input={"value": "x"})],
+        ),
+        Message(role="tool", tool_call_id="call_1", content="tool output"),
+        # The content-less assistant turn: tool calls already replayed above, so
+        # this turn carries no text and no tool_use of its own.
+        Message(role="assistant", content=""),
+        Message(role="user", content="summarise what you found"),
+        _ephemeral_tail("<system-reminder>live</system-reminder>"),
+    ]
+    request = ChatRequest(messages=messages)
+    params = _run(provider, request)
+
+    offenders = _cache_controlled_empty_text_blocks(params)
+    assert not offenders, (
+        "cache_control was stamped on an empty text block, which Anthropic "
+        f"rejects with a 400: {offenders}"
+    )
+
+
+def test_breakpoint_never_lands_on_a_whitespace_only_text_block():
+    """Same invariant for whitespace-only content.
+
+    Anthropic treats a whitespace-only text block the same as an empty one, so
+    a fix that only checks ``text == ""`` would still 400 in production.
+    """
+    provider = _make_provider()
+
+    messages = [
+        Message(role="system", content="System prompt."),
+        Message(role="user", content="do the thing"),
+        Message(role="assistant", content="   \n  "),
+        Message(role="user", content="summarise what you found"),
+        _ephemeral_tail("<system-reminder>live</system-reminder>"),
+    ]
+    request = ChatRequest(messages=messages)
+    params = _run(provider, request)
+
+    offenders = _cache_controlled_empty_text_blocks(params)
+    assert not offenders, (
+        "cache_control was stamped on a whitespace-only text block: "
+        f"{offenders}"
+    )
