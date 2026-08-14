@@ -4359,8 +4359,9 @@ class AnthropicProvider:
         if primary_idx is None:
             logger.warning(
                 "[PROVIDER] Prompt caching: could not find a stable message "
-                "boundary that doesn't split a tool_use/tool_result pair -- "
-                "skipping conversation-region cache breakpoint(s)."
+                "boundary that neither splits a tool_use/tool_result pair nor "
+                "lands on an empty text block -- skipping conversation-region "
+                "cache breakpoint(s)."
             )
             return all_messages, 0
 
