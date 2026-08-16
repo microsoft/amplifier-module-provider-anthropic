@@ -1494,7 +1494,9 @@ class AnthropicProvider:
         Cloudflare interposes HTML challenge pages (HTTP 403) that look nothing
         like Anthropic API errors.  Signals:
 
-        1. The SDK failed to parse the body as JSON (error.body is None).
+        1. The body did not parse as a JSON object/array. (When the SDK
+           cannot parse the body as JSON it stores the RAW TEXT in
+           ``error.body`` -- a str, NOT None; a parsed error is a dict/list.)
         2. The Content-Type is text/html (not application/json).
         3. The raw response text contains Cloudflare markers.
 
@@ -1502,8 +1504,14 @@ class AnthropicProvider:
         successfully parsed a JSON body, this is a real API error regardless
         of other signals.
         """
-        # If the SDK parsed a JSON body, this is a real API error
-        if getattr(error, "body", None) is not None:
+        # Only a PARSED JSON body (dict/list) means a genuine, structured
+        # API error. When the SDK cannot parse the body as JSON it stores the
+        # RAW TEXT in ``error.body`` -- a str, NOT None -- so a "body is not
+        # None" guard bails on exactly the HTML challenge pages this exists to
+        # catch. Fall through for a str (or absent) body; bail only on parsed
+        # JSON.
+        body = getattr(error, "body", None)
+        if isinstance(body, (dict, list)):
             return False
 
         # Inspect the raw HTTP response for HTML / Cloudflare signals
@@ -2462,11 +2470,9 @@ class AnthropicProvider:
         # above). Budget is whatever remains of the 4-breakpoint API limit
         # after system (0 or 1) and tools (0 or 1, applied below) -- tools
         # hasn't run yet at this point, so reserve its slot conservatively.
-        _tools_will_use_a_slot = bool(
-            request.tools and self.enable_prompt_caching
-        )
-        conversation_budget = 4 - breakpoints_used - (
-            1 if _tools_will_use_a_slot else 0
+        _tools_will_use_a_slot = bool(request.tools and self.enable_prompt_caching)
+        conversation_budget = (
+            4 - breakpoints_used - (1 if _tools_will_use_a_slot else 0)
         )
         all_messages, conversation_breakpoints_used = (
             self._apply_conversation_cache_control(
@@ -3229,8 +3235,8 @@ class AnthropicProvider:
                 if status == 403:
                     # Distinguish Cloudflare bot challenges (transient) from
                     # real API 403s (permanent).  Cloudflare returns HTML
-                    # challenge pages that the SDK can't parse as JSON, so
-                    # e.body is None and content-type is text/html.
+                    # challenge pages the SDK can't parse as JSON, so e.body is
+                    # the raw HTML str (never None) and content-type is text/html.
                     if self._is_cloudflare_challenge(e):
                         logger.warning(
                             "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
@@ -4353,9 +4359,7 @@ class AnthropicProvider:
 
         cache_control: dict[str, Any] = {"type": "ephemeral"}
 
-        primary_idx = self._last_safe_breakpoint_index(
-            all_messages, eligible_upper - 1
-        )
+        primary_idx = self._last_safe_breakpoint_index(all_messages, eligible_upper - 1)
         if primary_idx is None:
             logger.warning(
                 "[PROVIDER] Prompt caching: could not find a stable message "
@@ -4409,9 +4413,7 @@ class AnthropicProvider:
         if last_user_turn_idx is None or last_user_turn_idx == 0:
             return None  # first turn in the conversation - nothing earlier
 
-        return self._last_safe_breakpoint_index(
-            all_messages, last_user_turn_idx - 1
-        )
+        return self._last_safe_breakpoint_index(all_messages, last_user_turn_idx - 1)
 
     @staticmethod
     def _stamp_last_block(msg: dict[str, Any], cache_control: dict[str, Any]) -> None:
