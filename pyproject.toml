@@ -12,6 +12,10 @@ dependencies = [
     "anthropic>=0.96.0",
 ]
 
+[project.scripts]
+amplifier-anthropic-login = "amplifier_anthropic_oauth.login:main"
+amplifier-claude-login = "amplifier_anthropic_oauth.login:main"
+
 [project.entry-points."amplifier.modules"]
 provider-anthropic = "amplifier_module_provider_anthropic:mount"
 
@@ -27,6 +31,7 @@ package = true
 [tool.hatch.build.targets.wheel]
 packages = [
     "amplifier_module_provider_anthropic",
+    "amplifier_anthropic_oauth",
 ]
 
 [tool.hatch.metadata]
@@ -34,8 +39,12 @@ allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--import-mode=importlib"
+addopts = "--import-mode=importlib -m 'not live_oauth'"
 asyncio_mode = "strict"
+markers = [
+    "live_oauth: opt-in tests that call Anthropic with stored OAuth credentials",
+    "local_header_capture: opt-in local capture of installed Claude Code HTTPS headers",
+]
 
 [dependency-groups]
 dev = [

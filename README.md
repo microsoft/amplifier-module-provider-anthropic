@@ -1,5 +1,75 @@
 # Amplifier Anthropic Provider Module
 
+This is a drop-in fork of
+[`microsoft/amplifier-module-provider-anthropic`](https://github.com/microsoft/amplifier-module-provider-anthropic).
+It keeps the official provider implementation and adds Claude Pro/Max OAuth
+using the same direct Anthropic Messages API approach as Pi.
+
+## Quickstart
+
+Copy and paste:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv tool install --force git+https://github.com/microsoft/amplifier
+
+FORK=git+https://github.com/gszep/amplifier-module-provider-anthropic@main
+amplifier source add provider-anthropic "$FORK" --global --module
+amplifier provider install anthropic --force
+uvx --refresh --from "$FORK" amplifier-anthropic-login
+amplifier provider add anthropic
+amplifier provider test anthropic
+```
+
+Leave the API-key prompt blank after OAuth login, then run `amplifier`.
+
+OAuth credentials are stored in `~/.amplifier/anthropic-auth.json` with mode
+`0600` and refreshed automatically. Authentication precedence is
+`ANTHROPIC_OAUTH_TOKEN`, stored OAuth, configured `api_key`, then
+`ANTHROPIC_API_KEY`.
+
+OAuth requests use bearer authentication, Claude Code identity headers and
+system identity, and canonical Claude Code casing for matching built-in tool
+names. Tools otherwise follow the official provider's native `tools`,
+`tool_use`, and `tool_result` path; nothing is serialized into model-visible
+text. The request contract is centralized in
+`amplifier_anthropic_oauth/auth.py` and checked against an installed Claude Code
+executable by `tests/test_claude_header_parity.py`.
+
+### OAuth test coverage
+
+The automated suite includes transport-level assertions over the final HTTP
+requests emitted by the Anthropic SDK for both `/v1/models` and `/v1/messages`.
+It verifies bearer auth, absence of `x-api-key`, Claude Code user-agent and
+`x-app`, and the complete required beta-header set. Token exchange/refresh
+request construction is tested separately, including its OAuth identity
+headers and error bodies.
+
+The live OAuth test is excluded from normal and CI runs. It uses the stored
+provider credential to list models and force a native tool call through the
+Messages API:
+
+```bash
+uv run pytest -m live_oauth
+```
+
+Normal local test runs also execute the header-capture test whenever `claude`
+and `~/.claude/.credentials.json` are available; CI runners skip it. The test
+starts a minimal in-process CONNECT proxy,
+generates a temporary CA and leaf certificate, passes that CA to Claude through
+`NODE_EXTRA_CA_CERTS`, captures one `claude -p` Messages request, immediately
+redacts its bearer token, compares stable OAuth headers, and tears everything
+down:
+
+```bash
+uv run pytest -m local_header_capture
+```
+
+No container, persistent CA installation, or third-party proxy is required.
+`tests/test_claude_header_parity.py` separately checks the client ID, OAuth
+endpoints, betas, and user-agent version embedded in the installed Claude Code
+executable.
+
 Claude model integration for Amplifier via Anthropic API.
 
 ## Prerequisites

@@ -17,6 +17,7 @@ import re
 import time
 import uuid
 from decimal import Decimal
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -59,6 +60,13 @@ from anthropic._exceptions import (
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 from ._cost import compute_cost
+from amplifier_anthropic_oauth.auth import (
+    AnthropicAuth,
+    AnthropicAuthError,
+    AnthropicAuthManager,
+    OAUTH_BETAS,
+    oauth_request_headers,
+)
 
 
 @dataclass
@@ -249,6 +257,28 @@ BETA_HEADER_1M_CONTEXT = "context-1m-2025-08-07"
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
 BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
 BETA_HEADER_FAST_MODE = "fast-mode-2026-02-01"
+_CLAUDE_CODE_TOOL_NAMES = {
+    name.lower(): name
+    for name in (
+        "Read",
+        "Write",
+        "Edit",
+        "Bash",
+        "Grep",
+        "Glob",
+        "AskUserQuestion",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "KillShell",
+        "NotebookEdit",
+        "Skill",
+        "Task",
+        "TaskOutput",
+        "TodoWrite",
+        "WebFetch",
+        "WebSearch",
+    )
+}
 PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
 FALLBACK_STATE_VERSION = 1
@@ -494,16 +524,25 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + cost
             _totals["has_data"] = True
 
-    # Get API key from config or environment
-    api_key = config.get("api_key")
-    if not api_key:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-
-    if not api_key:
-        logger.warning("No API key found for Anthropic provider")
+    auth_path = config.get("auth_file")
+    auth_manager = AnthropicAuthManager(
+        path=Path(auth_path).expanduser() if auth_path else None,
+        api_key=config.get("api_key"),
+    )
+    try:
+        initial_auth = await auth_manager.get_auth()
+    except AnthropicAuthError as exc:
+        logger.warning("Anthropic authentication unavailable: %s", exc)
         return None
 
-    provider = AnthropicProvider(api_key, config, coordinator, add_cost=_add_cost)
+    provider = AnthropicProvider(
+        initial_auth.token,
+        config,
+        coordinator,
+        add_cost=_add_cost,
+        auth_manager=auth_manager,
+        initial_auth=initial_auth,
+    )
     await coordinator.mount("providers", provider, name="anthropic")
     coordinator.register_contributor(
         "session.cost",
@@ -586,6 +625,8 @@ class AnthropicProvider:
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
         add_cost=None,
+        auth_manager: AnthropicAuthManager | None = None,
+        initial_auth: AnthropicAuth | None = None,
     ):
         """
         Initialize Anthropic provider.
@@ -598,9 +639,25 @@ class AnthropicProvider:
             config: Additional configuration
             coordinator: Module coordinator for event emission
         """
+        # Amplifier's configuration-time loader passes an empty string when an
+        # optional API-key field is left blank. Treat it as absent so stored
+        # OAuth credentials remain discoverable during model listing/testing.
+        api_key = api_key or None
         self._api_key = api_key
-        self._client: AsyncAnthropic | None = None  # Lazy init
         self.config = config or {}
+        auth_path = self.config.get("auth_file")
+        self._auth_manager = auth_manager or (
+            AnthropicAuthManager(
+                path=Path(auth_path).expanduser() if auth_path else None,
+                api_key=None,
+            )
+            if api_key is None
+            else None
+        )
+        self._auth_state = initial_auth or (
+            AnthropicAuth(api_key, oauth=False) if api_key else None
+        )
+        self._client: AsyncAnthropic | None = None  # Lazy init
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "claude-sonnet-4-5")
         self._default_caps = self._get_capabilities(self.default_model)
@@ -785,6 +842,15 @@ class AnthropicProvider:
             self._default_headers = {"anthropic-beta": beta_header_value}
             logger.info(f"[PROVIDER] Beta headers enabled: {beta_header_value}")
 
+        if self._auth_state and self._auth_state.oauth:
+            self._beta_headers = list(
+                dict.fromkeys([*OAUTH_BETAS, *self._beta_headers])
+            )
+            self._default_headers = {
+                **oauth_request_headers(),
+                "anthropic-beta": ",".join(self._beta_headers),
+            }
+
         # Shared rate-limit state file for cross-process awareness.
         # All Anthropic provider instances (across processes, Docker containers
         # sharing a filesystem, etc.) read this file before the per-emptive
@@ -827,6 +893,7 @@ class AnthropicProvider:
         # detected repeatedly across LLM iterations (since synthetic results
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
+        self._oauth_tool_names: dict[str, str] = {}
         self._add_cost = add_cost or (lambda cost: None)
 
     @property
@@ -837,20 +904,57 @@ class AnthropicProvider:
                 raise ValueError("api_key must be provided for API calls")
             # Set SDK max_retries=0 - we handle retries ourselves to properly
             # honor retry-after headers with jitter and longer backoffs
-            self._client = AsyncAnthropic(
-                api_key=self._api_key,
-                base_url=self._base_url,
-                default_headers=self._default_headers,
-                max_retries=0,
-            )
+            auth = self._auth_state
+            if auth and auth.oauth:
+                # Passing api_key=None makes the SDK silently reload
+                # ANTHROPIC_API_KEY from the environment. Use an explicit empty
+                # value during construction, then clear it so OAuth requests
+                # carry Authorization only and never an X-Api-Key header.
+                self._client = AsyncAnthropic(
+                    api_key="",
+                    auth_token=auth.token,
+                    base_url=self._base_url,
+                    default_headers=self._default_headers,
+                    max_retries=0,
+                )
+                self._client.api_key = None
+            else:
+                self._client = AsyncAnthropic(
+                    api_key=self._api_key,
+                    base_url=self._base_url,
+                    default_headers=self._default_headers,
+                    max_retries=0,
+                )
         return self._client
+
+    async def _refresh_auth(self) -> None:
+        """Refresh OAuth credentials and rotate the SDK client when needed."""
+        if self._auth_manager is None:
+            return
+        auth = await self._auth_manager.get_auth()
+        if auth == self._auth_state:
+            return
+        old_client = self._client
+        self._client = None
+        self._auth_state = auth
+        self._api_key = auth.token
+        if auth.oauth:
+            self._beta_headers = list(
+                dict.fromkeys([*OAUTH_BETAS, *self._beta_headers])
+            )
+            self._default_headers = {
+                **oauth_request_headers(),
+                "anthropic-beta": ",".join(self._beta_headers),
+            }
+        if old_client is not None:
+            await old_client.close()
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
         return ProviderInfo(
             id="anthropic",
             display_name="Anthropic",
-            credential_env_vars=["ANTHROPIC_API_KEY"],
+            credential_env_vars=["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
             capabilities=list(self._default_caps.capability_tags),
             defaults={
                 "model": self.default_model,
@@ -865,10 +969,11 @@ class AnthropicProvider:
             config_fields=[
                 ConfigField(
                     id="api_key",
-                    display_name="API Key",
+                    display_name="API Key (optional with Claude Pro/Max OAuth)",
                     field_type="secret",
-                    prompt="Enter your Anthropic API key",
+                    prompt="Enter your Anthropic API key, or leave blank after OAuth login",
                     env_var="ANTHROPIC_API_KEY",
+                    required=False,
                 ),
                 ConfigField(
                     id="base_url",
@@ -1009,6 +1114,7 @@ class AnthropicProvider:
         Returns:
             List of ModelInfo for available Claude models.
         """
+        await self._refresh_auth()
         response = await self.client.models.list()
         api_models = list(response.data)
 
@@ -2158,6 +2264,8 @@ class AnthropicProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
+        await self._refresh_auth()
+
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)
 
@@ -2472,6 +2580,38 @@ class AnthropicProvider:
             block["cache_control"] = cache_control
 
         return [block]
+
+    def _apply_oauth_request_contract(self, params: dict[str, Any]) -> None:
+        """Apply Claude Code identity and canonical tool casing for OAuth."""
+        if not self._auth_state or not self._auth_state.oauth:
+            return
+
+        self._oauth_tool_names = {}
+        for tool in params.get("tools", []):
+            name = tool.get("name")
+            if isinstance(name, str):
+                canonical = _CLAUDE_CODE_TOOL_NAMES.get(name.lower(), name)
+                self._oauth_tool_names[canonical.lower()] = name
+                tool["name"] = canonical
+
+        for message in params.get("messages", []):
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if block.get("type") != "tool_use":
+                    continue
+                name = block.get("name")
+                if isinstance(name, str):
+                    block["name"] = _CLAUDE_CODE_TOOL_NAMES.get(name.lower(), name)
+
+        identity: dict[str, Any] = {
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        }
+        if self.enable_prompt_caching:
+            identity["cache_control"] = {"type": "ephemeral"}
+        params["system"] = [identity, *(params.get("system") or [])]
 
     async def _complete_chat_request(
         self,
@@ -3018,8 +3158,10 @@ class AnthropicProvider:
             extra_headers["anthropic-beta"] = ",".join(request_beta_headers)
             params["extra_headers"] = extra_headers
 
+        self._apply_oauth_request_contract(params)
+
         logger.info(
-            f"[PROVIDER] Anthropic API call - model: {params['model']}, messages: {len(params['messages'])}, system: {bool(system_blocks)}, tools: {len(params.get('tools', []))}, thinking: {thinking_enabled}"
+            f"[PROVIDER] Anthropic API call - model: {params['model']}, messages: {len(params['messages'])}, system: {bool(params.get('system'))}, tools: {len(params.get('tools', []))}, thinking: {thinking_enabled}"
         )
 
         # Emit llm:request event
@@ -4637,14 +4779,17 @@ class AnthropicProvider:
                 event_blocks.append(ThinkingContent(text=block.thinking))
                 # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
             elif block.type == "tool_use":
+                tool_name = self._oauth_tool_names.get(
+                    block.name.lower(), block.name
+                )
                 content_blocks.append(
-                    ToolCallBlock(id=block.id, name=block.name, input=block.input)
+                    ToolCallBlock(id=block.id, name=tool_name, input=block.input)
                 )
                 tool_calls.append(
-                    ToolCall(id=block.id, name=block.name, arguments=block.input)
+                    ToolCall(id=block.id, name=tool_name, arguments=block.input)
                 )
                 event_blocks.append(
-                    ToolCallContent(id=block.id, name=block.name, arguments=block.input)
+                    ToolCallContent(id=block.id, name=tool_name, arguments=block.input)
                 )
             elif block.type == "web_search_tool_result":
                 # Handle native web search results from Anthropic
