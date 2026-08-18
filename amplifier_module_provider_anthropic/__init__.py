@@ -4559,14 +4559,23 @@ class AnthropicProvider:
             # the tool-heavy first turn of every session, because none of those
             # shapes contain a second real user turn.
             #
-            # Lag one complete tool round behind the primary instead. In
-            # Anthropic wire format a round is exactly two messages (the
-            # assistant tool_use and the batched user tool_result), so
+            # Lag one complete tool round behind the primary instead. In the
+            # canonical shape this branch handles, a round is two messages --
+            # the assistant tool_use and the single batched user tool_result
+            # that answers it (parallel calls fan out as multiple blocks
+            # inside that one message, not as extra messages). So
             # primary_idx - 2 places this request's secondary precisely where
             # the previous request's primary sat -- the same rolling overlap
-            # the real-user-turn path above achieves. _last_safe_breakpoint_index
-            # still walks further back if that boundary would split a
-            # tool_use/tool_result pair or stamp an empty text block.
+            # the real-user-turn path above achieves.
+            #
+            # The -2 is a heuristic starting point, not an invariant: a
+            # caller that interleaves narration or splits tool_results across
+            # messages shifts the stride. _last_safe_breakpoint_index absorbs
+            # that -- it walks further back from this index if the boundary
+            # would split a tool_use/tool_result pair or stamp an empty text
+            # block. A mis-stride costs a cache read, never a malformed
+            # request; the worst case degrades to today's single-breakpoint
+            # behaviour rather than breaking the call.
             if primary_idx < 2:
                 return None  # no completed round behind the primary yet
             return self._last_safe_breakpoint_index(all_messages, primary_idx - 2)
