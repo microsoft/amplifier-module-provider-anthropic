@@ -718,3 +718,124 @@ def test_breakpoint_never_lands_on_a_whitespace_only_text_block():
         "cache_control was stamped on a whitespace-only text block: "
         f"{offenders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Agentic tool loop: one real user turn, then N tool rounds
+# ---------------------------------------------------------------------------
+
+
+def _tool_round(n: int) -> list[Message]:
+    """One agentic tool round: an assistant tool_use plus its tool_result.
+
+    This is the shape of *every* iteration of an agentic loop -- a sub-agent
+    delegation, a /goal run, a recipe step, or simply the tool-heavy first
+    turn of an ordinary session. Critically, it contains NO new real user
+    message: the human spoke once, at the very start, and everything after
+    that is the model talking to its own tools.
+    """
+    return [
+        Message(
+            role="assistant",
+            content=[ToolCallBlock(id=f"call_{n}", name="read_file", input={"n": n})],
+        ),
+        Message(role="tool", tool_call_id=f"call_{n}", content=f"file contents {n}"),
+    ]
+
+
+def _agentic_conversation(rounds: int) -> list[Message]:
+    """A conversation with exactly ONE real user turn followed by `rounds`
+    tool rounds, terminated by the orchestrator's ephemeral tail."""
+    messages: list[Message] = [
+        Message(role="system", content="System prompt."),
+        Message(role="user", content="do the task"),
+    ]
+    for n in range(rounds):
+        messages.extend(_tool_round(n))
+    messages.append(
+        _ephemeral_tail(f"<system-reminder>tail {rounds}</system-reminder>")
+    )
+    return messages
+
+
+def _cached_block_ids(params: dict) -> set[str]:
+    """Stable identity of every cache_control-stamped block.
+
+    Message *indices* are stable across consecutive agentic requests (the
+    prefix never changes, it only grows), but identifying by content makes
+    a failure message far easier to read.
+    """
+    out: set[str] = set()
+    for msg in params.get("messages") or []:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or "cache_control" not in block:
+                continue
+            btype = block.get("type")
+            if btype == "tool_use":
+                out.add(f"tool_use:{block.get('id')}")
+            elif btype == "tool_result":
+                out.add(f"tool_result:{block.get('tool_use_id')}")
+            else:
+                out.add(f"text:{block.get('text', '')}")
+    return out
+
+
+def test_agentic_tool_loop_reuses_a_breakpoint_across_iterations():
+    """An agentic tool loop must get a rolling cache hit, exactly like a
+    multi-turn chat does.
+
+    Regression test for the case where `_find_rolling_secondary_index`
+    bailed out whenever the only real user turn was at index 0 -- which is
+    *always* true in an agentic loop. That left a single advancing primary
+    breakpoint which can never overlap itself, so every request rewrote the
+    whole prefix at the 1.25x write premium and read back nothing, for the
+    entire run.
+
+    The suite already covered this property for multi-turn chat (see
+    `test_rolling_secondary_breakpoint_matches_previous_primary`), but every
+    fixture there supplies a fresh real user turn each round -- the shape
+    that takes the working code path. This test pins the agentic shape.
+    """
+    params_a = _run(_make_provider(), ChatRequest(messages=_agentic_conversation(3)))
+    params_b = _run(_make_provider(), ChatRequest(messages=_agentic_conversation(4)))
+
+    cached_a = _cached_block_ids(params_a)
+    cached_b = _cached_block_ids(params_b)
+
+    assert cached_a, "iteration 3 should have placed at least one breakpoint"
+    assert cached_b, "iteration 4 should have placed at least one breakpoint"
+    assert cached_a & cached_b, (
+        "an agentic tool loop placed NO overlapping cache breakpoint between "
+        "consecutive iterations, so the cache can never be read -- every call "
+        f"pays the write premium for nothing. iter3={sorted(cached_a)} "
+        f"iter4={sorted(cached_b)}"
+    )
+
+
+def test_agentic_tool_loop_places_two_breakpoints_once_a_round_completes():
+    """Once at least one full tool round sits behind the primary, both the
+    primary and the rolling secondary should be placed.
+
+    Guards the `primary_idx < 2` early-out: it must suppress the secondary
+    only when there is genuinely no completed round behind the primary, not
+    swallow the whole agentic case.
+    """
+    params = _run(_make_provider(), ChatRequest(messages=_agentic_conversation(3)))
+    assert len(_cached_block_ids(params)) == 2, (
+        "expected a primary and a rolling secondary breakpoint in an "
+        f"established agentic loop, got {sorted(_cached_block_ids(params))}"
+    )
+
+
+def test_agentic_breakpoints_never_land_on_the_ephemeral_tail():
+    """The agentic fallback must respect the same ephemeral exclusion as
+    every other placement path -- otherwise it reintroduces the original
+    bug it exists to fix."""
+    params = _run(_make_provider(), ChatRequest(messages=_agentic_conversation(4)))
+    cached = _cached_block_ids(params)
+    assert not any("system-reminder" in c for c in cached), (
+        f"a breakpoint landed on the regenerated-per-turn tail: {sorted(cached)}"
+    )
