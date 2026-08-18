@@ -4702,9 +4702,20 @@ class AnthropicProvider:
         )
 
     async def close(self) -> None:
-        """Close the underlying Anthropic client to prevent resource leaks."""
+        """Close the underlying Anthropic client to prevent resource leaks.
+
+        Resets ``self._client`` to ``None`` so the ``client`` property's
+        lazy-init contract still holds after close(): that property only
+        constructs a client when ``self._client is None``, so leaving a
+        closed client in place would make every subsequent call reuse it
+        and fail permanently with "Cannot send a request, as the client
+        has been closed." Clearing it lets the next use lazily rebuild a
+        fresh client, and makes close() idempotent.
+        """
         if self._client is not None:
             try:
                 await asyncio.shield(self._client.close())
             except asyncio.CancelledError:
                 pass
+            finally:
+                self._client = None

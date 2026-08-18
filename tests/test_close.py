@@ -4,7 +4,6 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from amplifier_module_provider_anthropic import AnthropicProvider
 
 
@@ -43,7 +42,13 @@ async def test_close_handles_cancelled_error():
 
 @pytest.mark.asyncio
 async def test_close_can_be_called_twice():
-    """close() should be safe to call multiple times."""
+    """close() should be safe to call multiple times.
+
+    The second call is a no-op: close() resets `_client` to None (see
+    test_close_resets_client_to_none), so the second call's
+    `if self._client is not None` guard is False and the mock's close()
+    is only awaited once, not twice.
+    """
     provider = AnthropicProvider(api_key="fake-key")
     mock_client = MagicMock()
     mock_client.close = AsyncMock()
@@ -52,5 +57,29 @@ async def test_close_can_be_called_twice():
     await provider.close()
     await provider.close()
 
-    assert mock_client.close.await_count == 2
-    assert provider._client is not None  # close() does not clear the reference
+    mock_client.close.assert_awaited_once()
+    assert provider._client is None
+
+
+@pytest.mark.asyncio
+async def test_close_resets_client_to_none():
+    """close() must reset `_client` to None so a provider reused after
+    teardown (e.g. a background task still in flight when session cleanup
+    closes providers -- see hooks-session-naming) lazily rebuilds a fresh
+    client via the `client` property instead of permanently failing every
+    subsequent call with "Cannot send a request, as the client has been
+    closed." (RuntimeError raised by httpx.AsyncClient.send() against a
+    closed client).
+    """
+    provider = AnthropicProvider(api_key="fake-key")
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    provider._client = mock_client
+
+    await provider.close()
+
+    assert provider._client is None
+    # Reusing the provider after close() must lazily rebuild a fresh client
+    # rather than returning the (closed) mock.
+    rebuilt = provider.client
+    assert rebuilt is not mock_client
