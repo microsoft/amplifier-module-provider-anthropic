@@ -279,6 +279,64 @@ def _is_context_overflow(raw_msg: str) -> bool:
     return any(m in raw_msg for m in _CONTEXT_OVERFLOW_MESSAGE_MARKERS)
 
 
+# redact_secrets() (amplifier_core.utils) only redacts dict values keyed by a
+# sensitive name -- it passes plain strings straight through unchanged. The
+# httpx/httpcore exceptions surfaced via __cause__ are plain strings, and a
+# base_url with embedded basic-auth (https://user:pass@proxy.internal/) shows
+# up verbatim inside them (e.g. in the "Request URL is missing/invalid ..."
+# text). Strip that userinfo before it reaches a log line or KernelLLMError.
+#
+# The scheme prefix ("://") is OPTIONAL, not required: GAP-016's whole reason
+# for existing is a malformed/missing-protocol base_url, and that is exactly
+# the case where httpx's own "Request URL ... is missing an 'http://' or
+# 'https://' protocol" text echoes the configured value back with NO "://" in
+# front of it. A pattern anchored on "://" never fires for the one input this
+# redaction exists to catch.
+#
+# Making "://" optional everywhere would also swallow an ordinary bare email
+# address (e.g. "contact admin@example.com") appearing in unrelated
+# diagnostic text -- that's over-redaction, destroying diagnostic value for
+# no security benefit. So the no-scheme branch additionally REQUIRES a colon
+# in the userinfo (user:pass@, :pass@, user:@). An email's local part never
+# contains a colon, so this cleanly separates "credentials" from "email"
+# without needing scheme context. A bare token with no colon AND no scheme
+# (e.g. "token@host") is genuinely ambiguous -- it looks exactly like an
+# email's user@host shape -- and is deliberately left unredacted rather than
+# risk destroying real diagnostic text on a guess; the scheme-present form of
+# the same bare-token case (https://token@host) is still fully covered below.
+#
+# One pattern (not two) handles both shapes via Python's conditional-group
+# syntax `(?(scheme)yes|no)`, keeping the "when does this fire" logic in a
+# single place instead of two regexes a future edit could let drift apart.
+# The replacement is a function (not a fixed string) because the correct
+# output differs by branch: re-emit "://" only if it was actually present in
+# the input, so a no-scheme value doesn't gain a fake "://" it never had.
+_URL_CREDENTIALS_RE = re.compile(
+    r"(?P<scheme>://)?"
+    r"(?(scheme)"
+    r"[^/@\s:]*(?::[^/@\s]*)?"  # scheme present: user, user:pass, :pass, or user: all count
+    r"|"
+    r"[A-Za-z0-9_.~%+=-]*:[A-Za-z0-9_.~%+=-]*"  # no scheme: colon in userinfo required
+    r")"
+    r"@"
+)
+
+
+def _redact_url_credentials_match(match: re.Match[str]) -> str:
+    scheme = match.group("scheme") or ""
+    return f"{scheme}[REDACTED]@"
+
+
+def _redact_url_credentials(text: str) -> str:
+    """Strip embedded basic-auth credentials (user:pass@) from any URL in text.
+
+    Catches both `scheme://user:pass@host` and the scheme-less
+    `user:pass@host` form (see the regex comment above for why the latter is
+    the case that actually matters for GAP-016).
+    """
+    return _URL_CREDENTIALS_RE.sub(_redact_url_credentials_match, text)
+
+
 # ---------------------------------------------------------------------------
 # Deprecated model retirement dates — warn once per process per model
 # ---------------------------------------------------------------------------
@@ -682,7 +740,26 @@ class AnthropicProvider:
         )
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
-        self._base_url = self.config.get("base_url")
+        #
+        # GAP-016: settings.yaml commonly stores this as an env-var template
+        # (e.g. ``base_url: ${ANTHROPIC_BASE_URL}``). amplifier-app-cli's
+        # expand_env_vars() substitutes an *unset* referenced variable with
+        # "" (empty string), not None -- by design, so that provider
+        # instances the user isn't actively using this session don't crash
+        # config loading just because one of their optional env vars isn't
+        # set. But "" is never a valid base_url: passed straight to
+        # AsyncAnthropic(base_url=""), httpx/httpcore raises
+        # `UnsupportedProtocol: Request URL is missing an 'http://' or
+        # 'https://' protocol`, which the SDK re-wraps as a generic
+        # `APIConnectionError("Connection error.")` -- indistinguishable
+        # from a real network failure and hitting every call this client
+        # makes (list_models() preflight *and* the primary completion).
+        # An empty string is never a meaningful custom endpoint, so treat it
+        # the same as "not configured" and fall back to the SDK's real
+        # default (https://api.anthropic.com), exactly as if base_url had
+        # never been set at all.
+        raw_base_url = self.config.get("base_url")
+        self._base_url = raw_base_url if raw_base_url else None
 
         # Beta headers support for enabling experimental features
         # Store as instance variable so we can merge with per-request headers later
@@ -1822,7 +1899,14 @@ class AnthropicProvider:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(tmp_path, "w") as f:
                 json.dump(state, f)
-            os.rename(tmp_path, path)
+            # os.replace(), NOT os.rename(): on POSIX rename() atomically
+            # replaces an existing target, but on Windows it raises
+            # FileExistsError when the target exists. Both call sites sit
+            # inside `except Exception: pass`, so on Windows every write
+            # after the first one failed SILENTLY and this file froze at
+            # its initial contents for the life of the process.
+            # os.replace() has rename()'s atomic-replace semantics on both.
+            os.replace(tmp_path, path)
         except Exception:
             pass  # Never crash on I/O errors
 
@@ -1844,7 +1928,7 @@ class AnthropicProvider:
     def _write_shared_rate_limit_state(self, rate_limit_info: dict[str, Any]) -> None:
         """Atomically write rate-limit header data to the shared cross-process file.
 
-        Uses write-to-tmp + os.rename() so concurrent readers never see a partial
+        Uses write-to-tmp + os.replace() so concurrent readers never see a partial
         file.  Only writes if the rate-limit data actually changed (debounce by
         content equality) to avoid excessive I/O on every response.
 
@@ -1887,7 +1971,14 @@ class AnthropicProvider:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(tmp_path, "w") as f:
                 json.dump(state, f)
-            os.rename(tmp_path, path)
+            # os.replace(), NOT os.rename(): on POSIX rename() atomically
+            # replaces an existing target, but on Windows it raises
+            # FileExistsError when the target exists. Both call sites sit
+            # inside `except Exception: pass`, so on Windows every write
+            # after the first one failed SILENTLY and this file froze at
+            # its initial contents for the life of the process.
+            # os.replace() has rename()'s atomic-replace semantics on both.
+            os.replace(tmp_path, path)
             self._last_written_state = comparable
         except Exception:
             pass  # Never crash on I/O errors
@@ -3310,6 +3401,47 @@ class AnthropicProvider:
                     if body is not None
                     else (str(e) or f"{type(e).__name__}: (no message)")
                 )
+                # GAP-016: the Anthropic SDK's own APIConnectionError carries a
+                # fixed, generic message ("Connection error.") regardless of
+                # *why* the underlying httpx/httpcore call failed -- DNS
+                # failure, TLS failure, a malformed base_url producing
+                # `UnsupportedProtocol`, etc. all look identical to a user or
+                # to logs, and are indistinguishable from real transient
+                # network flakiness. The SDK chains the real exception via
+                # `raise APIConnectionError(...) from err`, so it's available
+                # on `__cause__` -- surface it instead of silently dropping it,
+                # so "Connection error." becomes something a user can actually
+                # act on (e.g. "caused by UnsupportedProtocol: Request URL is
+                # missing an 'http://' or 'https://' protocol" directly names
+                # a misconfigured base_url instead of looking like the network
+                # is down).
+                cause = e.__cause__
+                if cause is not None:
+                    # Redact before interpolating: this path is generic, so ANY
+                    # exception with a __cause__ gets its str() spliced into a
+                    # message that reaches logs and user-facing output. A
+                    # base_url carrying embedded basic-auth
+                    # (https://user:pass@proxy.internal/) shows up verbatim in
+                    # httpx/httpcore's own exception text (e.g. the URL is
+                    # quoted back in "Request URL is missing/invalid ..."), so
+                    # redact_secrets() alone isn't enough -- it only redacts
+                    # dict values under a sensitive key, not credentials
+                    # embedded inside a plain string. Strip URL userinfo first,
+                    # then apply the same redact_secrets() treatment the raw
+                    # request/response payloads already get elsewhere in this
+                    # file.
+                    cause_text = redact_secrets(_redact_url_credentials(str(cause)))
+                    # Compare on the redacted text -- comparing on the raw text
+                    # would suppress the suffix whenever the unredacted string
+                    # happened to appear, which is not the question being asked.
+                    #
+                    # `cause_text` is checked for truthiness explicitly: an
+                    # exception with an empty str() ("" in anything is True)
+                    # would otherwise silently drop the whole suffix, taking the
+                    # useful *type name* with it -- the one piece of diagnostic
+                    # value such a cause still has.
+                    if not cause_text or cause_text not in error_msg:
+                        error_msg = f"{error_msg} (caused by {type(cause).__name__}: {cause_text})"
                 raise KernelLLMError(
                     error_msg,
                     provider="anthropic",

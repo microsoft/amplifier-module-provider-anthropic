@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    # A hang must fail LOUDLY and fast, not sit burning runner time until the
+    # 6h default -- a job stuck at "in_progress" reads as "not done yet"
+    # rather than "broken", which is how a false green gets merged.
+    timeout-minutes: 10
+    strategy:
+      # A Windows failure must not cancel the POSIX legs. Those tell us whether
+      # we regressed the population that works today, which is the more
+      # expensive outcome by far.
+      fail-fast: false
+      matrix:
+        # requires-python = ">=3.11" -- cover the floor and a current minor.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Run test suite
+        # NOTE: `tests/test_validation.py` and `tests/test_behavioral.py`
+        # silently depend on ANTHROPIC_API_KEY being exported. Measured on
+        # Linux: key unset -> 1 failed, 6 passed, 5 errors; key set -> 12
+        # passed. On a fresh runner with no secret they fail for a reason that
+        # has nothing to do with the code under test.
+        #
+        # They should skip explicitly when the key is absent, or mock the
+        # provider. Until that is fixed, this job will be red on those six --
+        # that is the pre-existing defect becoming visible, not a new one.
+        run: uv run pytest -q
