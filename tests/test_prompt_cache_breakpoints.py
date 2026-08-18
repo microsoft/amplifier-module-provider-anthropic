@@ -24,7 +24,15 @@ These tests cover the three properties the fix must guarantee:
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-from amplifier_core.message_models import ChatRequest, Message, ToolCallBlock, ToolSpec
+from amplifier_core.message_models import (
+    ChatRequest,
+    Message,
+    RedactedThinkingBlock,
+    TextBlock,
+    ThinkingBlock,
+    ToolCallBlock,
+    ToolSpec,
+)
 
 from amplifier_module_provider_anthropic import AnthropicProvider
 from tests._helpers import DummyResponse
@@ -97,7 +105,9 @@ def _long_tool_spec(name: str = "do_something") -> ToolSpec:
     )
 
 
-def _turn(user_text: str, assistant_text: str, ephemeral: bool = False) -> list[Message]:
+def _turn(
+    user_text: str, assistant_text: str, ephemeral: bool = False
+) -> list[Message]:
     """Build one simple user/assistant turn (no tool calls)."""
     return [
         Message(role="user", content=user_text),
@@ -129,7 +139,9 @@ def _run(provider: AnthropicProvider, request: ChatRequest) -> dict:
 def test_never_exceeds_four_breakpoints_with_system_tools_and_conversation():
     provider = _make_provider()
 
-    messages: list[Message] = [Message(role="system", content="You are a helpful assistant.")]
+    messages: list[Message] = [
+        Message(role="system", content="You are a helpful assistant.")
+    ]
     for i in range(6):
         messages.extend(_turn(f"question {i}", f"answer {i}"))
     messages.append(_ephemeral_tail("<system-reminder>live status</system-reminder>"))
@@ -242,8 +254,12 @@ def test_breakpoint_placement_stable_across_changing_ephemeral_tail():
         request = ChatRequest(messages=messages)
         return _run(provider, request)
 
-    params_a = _params_for_tail("<system-reminder>10:30:31 clean tree</system-reminder>")
-    params_b = _params_for_tail("<system-reminder>10:37:55 3 files changed</system-reminder>")
+    params_a = _params_for_tail(
+        "<system-reminder>10:30:31 clean tree</system-reminder>"
+    )
+    params_b = _params_for_tail(
+        "<system-reminder>10:37:55 3 files changed</system-reminder>"
+    )
 
     def _cached_block_texts(params: dict) -> list[str]:
         texts = []
@@ -369,7 +385,9 @@ def test_breakpoint_never_splits_a_tool_use_tool_result_pair():
         Message(role="user", content="do the thing"),
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_1", name="do_something", input={"value": "x"})],
+            content=[
+                ToolCallBlock(id="call_1", name="do_something", input={"value": "x"})
+            ],
         ),
         Message(role="tool", tool_call_id="call_1", content="tool output"),
         # No further stable content after the tool round -- the only
@@ -457,9 +475,9 @@ def test_single_message_no_metadata_returns_silently_with_no_warning(caplog):
 
     # Nothing at all logged by _apply_conversation_cache_control -- not a
     # warning, not even a debug-level message. A silent return, full stop.
-    assert not any(
-        "Prompt caching" in r.message for r in caplog.records
-    ), "single-message request must not log anything from the cache-control path"
+    assert not any("Prompt caching" in r.message for r in caplog.records), (
+        "single-message request must not log anything from the cache-control path"
+    )
     assert not any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
@@ -528,7 +546,9 @@ def test_multi_message_with_ephemeral_metadata_places_breakpoints_as_before(capl
         if isinstance(content, list):
             if any(isinstance(b, dict) and "cache_control" in b for b in content):
                 found_breakpoint = True
-    assert found_breakpoint, "expected at least one conversation-region cache breakpoint"
+    assert found_breakpoint, (
+        "expected at least one conversation-region cache breakpoint"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +598,7 @@ def test_cache_stable_region_ttl_1h_opt_in_applies_to_system_and_tools_only():
             for block in content:
                 if isinstance(block, dict) and "cache_control" in block:
                     assert block["cache_control"] == {"type": "ephemeral"}
+
 
 # ---------------------------------------------------------------------------
 # Empty text blocks must never carry a cache breakpoint
@@ -630,7 +651,9 @@ def test_breakpoint_never_lands_on_an_empty_text_block():
         Message(role="user", content="do the thing"),
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_1", name="do_something", input={"value": "x"})],
+            content=[
+                ToolCallBlock(id="call_1", name="do_something", input={"value": "x"})
+            ],
         ),
         Message(role="tool", tool_call_id="call_1", content="tool output"),
         # The content-less assistant turn: tool calls already replayed above, so
@@ -669,6 +692,156 @@ def test_breakpoint_never_lands_on_a_whitespace_only_text_block():
 
     offenders = _cache_controlled_empty_text_blocks(params)
     assert not offenders, (
-        "cache_control was stamped on a whitespace-only text block: "
-        f"{offenders}"
+        f"cache_control was stamped on a whitespace-only text block: {offenders}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cache breakpoints must never land on thinking / redacted_thinking blocks
+# ---------------------------------------------------------------------------
+
+
+def _run_offline(provider: AnthropicProvider, request: ChatRequest) -> dict:
+    """Drive one request without ever building a real Anthropic client.
+
+    ``_capture_params`` only mocks the SDK's ``create`` call; on its own it
+    still touches ``provider.client``, which lazily constructs a real
+    ``AsyncAnthropic`` (and its httpx client). That client is later reaped by
+    GC -- after ``asyncio.run`` has already torn its loop down -- surfacing a
+    spurious ``RuntimeError: Event loop is closed`` during an unrelated test's
+    teardown. Pre-seeding ``_client`` with a plain mock (the same handle
+    ``test_close.py`` uses) keeps these thinking-block tests from leaking a
+    client and destabilising the wider suite.
+    """
+    provider._client = MagicMock()
+    return _run(provider, request)
+
+
+def _cache_controlled_thinking_blocks(params: dict) -> list[tuple[int, dict]]:
+    """Every (message_index, block) where cache_control was stamped onto a
+    thinking or redacted_thinking block -- the exact shape Anthropic rejects
+    with a 400 ("cache_control cannot be set for thinking blocks")."""
+    offenders: list[tuple[int, dict]] = []
+    for i, msg in enumerate(params.get("messages") or []):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") not in ("thinking", "redacted_thinking"):
+                continue
+            if "cache_control" in block:
+                offenders.append((i, block))
+    return offenders
+
+
+def test_breakpoint_never_lands_on_a_thinking_block():
+    """A resumed transcript whose last stable turn ends on a ``thinking``
+    block must never receive a cache breakpoint on that block.
+
+    Reproduces a deterministic live 400 from the Anthropic API. The chain:
+
+    1. A long-lived session accumulates ``thinking`` blocks in history. On
+       resume they are replayed as assistant content (see
+       ``_convert_messages`` / ``_clean_content_block``, which preserve a
+       ``{"type": "thinking", ...}`` block).
+    2. ``_apply_conversation_cache_control`` selects that assistant turn as a
+       stable breakpoint boundary and ``_stamp_last_block`` stamps
+       ``cache_control`` on its LAST content block -- which is the thinking
+       block.
+    3. Anthropic rejects the ENTIRE request: "cache_control cannot be set for
+       thinking blocks". Every subsequent turn hits it again -> the run is
+       dead.
+
+    The breakpoint must be placed on the nearest cache-eligible block instead
+    (per Anthropic's rules), or skipped -- never on a thinking block.
+    """
+    provider = _make_provider()
+
+    messages = [
+        Message(role="system", content="System prompt."),
+        Message(role="user", content="do the thing"),
+        # Resumed assistant turn whose only / last content block is thinking.
+        Message(
+            role="assistant",
+            content=[ThinkingBlock(thinking="long private reasoning", signature="s1")],
+        ),
+        Message(role="user", content="and now summarise", metadata={"ephemeral": True}),
+    ]
+    request = ChatRequest(messages=messages)
+    params = _run_offline(provider, request)
+
+    offenders = _cache_controlled_thinking_blocks(params)
+    assert not offenders, (
+        "cache_control was stamped on a thinking block, which Anthropic "
+        f"rejects with a 400 that kills the whole request: {offenders}"
+    )
+
+
+def test_breakpoint_never_lands_on_a_redacted_thinking_block():
+    """Same invariant for ``redacted_thinking`` blocks.
+
+    Anthropic forbids ``cache_control`` on redacted_thinking exactly as it
+    does on thinking, so a fix that only special-cased ``thinking`` would
+    still 400 in production on any session that hit a safety redaction.
+    """
+    provider = _make_provider()
+
+    messages = [
+        Message(role="system", content="System prompt."),
+        Message(role="user", content="do the thing"),
+        Message(
+            role="assistant",
+            content=[RedactedThinkingBlock(data="EncryptedReasoningBlob==")],
+        ),
+        Message(role="user", content="and now summarise", metadata={"ephemeral": True}),
+    ]
+    request = ChatRequest(messages=messages)
+    params = _run_offline(provider, request)
+
+    offenders = _cache_controlled_thinking_blocks(params)
+    assert not offenders, (
+        f"cache_control was stamped on a redacted_thinking block: {offenders}"
+    )
+
+
+def test_breakpoint_moves_to_eligible_block_when_thinking_precedes_text():
+    """When a thinking block is followed by a normal text block in the same
+    turn, caching must still happen -- the breakpoint just has to land on the
+    text block, not on the thinking block.
+
+    This is the no-regression companion to the two tests above: the fix must
+    not silently disable caching for every turn that contains any thinking;
+    it must relocate the marker to the nearest eligible block.
+    """
+    provider = _make_provider()
+
+    messages = [
+        Message(role="system", content="System prompt."),
+        Message(role="user", content="do the thing"),
+        Message(
+            role="assistant",
+            content=[
+                # Ordering that trips the naive "content[-1]" placement only
+                # if text came last; here text IS last, so this must be
+                # stamped and cached normally.
+                ThinkingBlock(thinking="private reasoning", signature="s2"),
+                TextBlock(text="here is the visible answer"),
+            ],
+        ),
+        Message(role="user", content="another question"),
+        Message(role="assistant", content="a second answer"),
+        Message(role="user", content="live tail", metadata={"ephemeral": True}),
+    ]
+    request = ChatRequest(messages=messages)
+    params = _run_offline(provider, request)
+
+    # No thinking block may carry a breakpoint...
+    assert not _cache_controlled_thinking_blocks(params)
+    # ...and caching must not have been disabled wholesale: at least one
+    # cache_control marker is still present across the request.
+    assert _count_cache_control_blocks(params) >= 1, (
+        "the thinking-block fix must relocate the breakpoint, not disable "
+        "conversation caching entirely"
     )

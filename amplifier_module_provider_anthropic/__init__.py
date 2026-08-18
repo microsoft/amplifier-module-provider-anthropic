@@ -249,6 +249,13 @@ BETA_HEADER_1M_CONTEXT = "context-1m-2025-08-07"
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
 BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
 BETA_HEADER_FAST_MODE = "fast-mode-2026-02-01"
+
+# Block types Anthropic forbids from carrying a `cache_control` marker. A cache
+# breakpoint that lands on one of these is a hard 400 that kills the ENTIRE
+# request ("cache_control cannot be set for thinking blocks"), so breakpoint
+# placement must always skip them. redacted_thinking is the same class of block
+# on the API's side and is covered too.
+CACHE_INELIGIBLE_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
 FALLBACK_STATE_VERSION = 1
@@ -4151,8 +4158,10 @@ class AnthropicProvider:
         Mirrors ``_stamp_last_block``'s two branches, because that method is
         what decides which block actually receives the marker:
 
-        * list content -> the LAST block. Unsafe only when that block is a
-          text block whose text is empty or whitespace-only. A trailing
+        * list content -> the last *cacheable* block (thinking /
+          redacted_thinking blocks are skipped, see
+          ``_last_cacheable_block_index``). Unsafe only when that target block
+          is a text block whose text is empty or whitespace-only. A trailing
           ``tool_use`` / ``tool_result`` / image block is fine.
         * string content -> the whole string is turned INTO a text block, so
           an empty or whitespace-only string is unsafe.
@@ -4167,16 +4176,32 @@ class AnthropicProvider:
         """
         content = msg.get("content")
         if isinstance(content, list):
-            if not content:
-                # Nothing to stamp; _stamp_last_block is a no-op here.
+            target = AnthropicProvider._last_cacheable_block_index(content)
+            if target is None:
+                # Nothing cacheable to stamp; _stamp_last_block is a no-op
+                # here. This is not an "empty text" rejection specifically --
+                # the all-thinking / empty-content case is excluded by
+                # _message_has_cacheable_block in the index walk instead.
                 return False
-            last = content[-1]
+            last = content[target]
             if not isinstance(last, dict) or last.get("type") != "text":
                 return False
             return not (last.get("text") or "").strip()
         if isinstance(content, str):
             return not content.strip()
         return False
+
+    @staticmethod
+    def _message_has_cacheable_block(msg: dict[str, Any]) -> bool:
+        """False for a list-content message with no block eligible to carry a
+        cache_control marker -- i.e. content that is empty or made up entirely
+        of thinking / redacted_thinking blocks, so ``_stamp_last_block`` would
+        have nothing safe to mark. String content is always cacheable (it
+        becomes a text block)."""
+        content = msg.get("content")
+        if isinstance(content, list):
+            return AnthropicProvider._last_cacheable_block_index(content) is not None
+        return True
 
     def _last_safe_breakpoint_index(
         self, messages: list[dict[str, Any]], start_idx: int
@@ -4209,7 +4234,17 @@ class AnthropicProvider:
             # replayed as ``content: null`` and defaulted to ``""`` upstream)
             # would be stamped as an EMPTY text block, which Anthropic rejects
             # with a 400. Walk past it exactly as we walk past a split pair.
-            if not splits_pair and not self._stamps_empty_text_block(msg):
+            #
+            # A turn whose only content is thinking / redacted_thinking blocks
+            # has nothing eligible to stamp at all (``_stamp_last_block`` would
+            # no-op, wasting a counted breakpoint on no marker, and any naive
+            # placement onto the thinking block itself is the exact 400 this
+            # method exists to avoid). Walk past it too.
+            if (
+                not splits_pair
+                and not self._stamps_empty_text_block(msg)
+                and self._message_has_cacheable_block(msg)
+            ):
                 return idx
             idx -= 1
         return None
@@ -4416,12 +4451,53 @@ class AnthropicProvider:
         return self._last_safe_breakpoint_index(all_messages, last_user_turn_idx - 1)
 
     @staticmethod
+    def _last_cacheable_block_index(content: list[Any]) -> int | None:
+        """Index of the last block eligible to carry a `cache_control` marker.
+
+        Walks from the end and skips thinking / redacted_thinking blocks,
+        which Anthropic forbids from carrying `cache_control`
+        (``CACHE_INELIGIBLE_BLOCK_TYPES``). Returns ``None`` when no eligible
+        block exists -- empty content, or a turn made up entirely of thinking
+        blocks -- in which case there is nothing safe to stamp at all.
+
+        A non-dict block is treated as ineligible: ``_stamp_last_block`` can
+        only add a key to a dict, so a malformed entry is skipped rather than
+        crashed on.
+        """
+        for idx in range(len(content) - 1, -1, -1):
+            block = content[idx]
+            if (
+                isinstance(block, dict)
+                and block.get("type") not in CACHE_INELIGIBLE_BLOCK_TYPES
+            ):
+                return idx
+        return None
+
+    @staticmethod
     def _stamp_last_block(msg: dict[str, Any], cache_control: dict[str, Any]) -> None:
-        """Add cache_control to the last content block of a message,
-        converting string content to a block array first if needed."""
+        """Add cache_control to the last *cacheable* content block of a
+        message, converting string content to a block array first if needed.
+
+        The marker is placed on the last block that is NOT a thinking /
+        redacted_thinking block. Anthropic rejects the request outright when a
+        cache breakpoint lands on one of those:
+
+            messages.N.content.M: cache_control cannot be set for thinking
+            blocks
+
+        A resumed transcript routinely ends an assistant turn on a thinking
+        block (a thinking-only turn, a redacted_thinking block, or interleaved
+        thinking whose visible text was empty), so blindly stamping
+        ``content[-1]`` is a deterministic 400. Placement falls back to the
+        nearest preceding eligible block, per Anthropic's rules. When a turn
+        has NO eligible block, nothing is stamped -- ``_last_safe_breakpoint_index``
+        is responsible for never selecting such a message in the first place.
+        """
         content = msg.get("content")
         if isinstance(content, list) and content:
-            content[-1]["cache_control"] = dict(cache_control)
+            target = AnthropicProvider._last_cacheable_block_index(content)
+            if target is not None:
+                content[target]["cache_control"] = dict(cache_control)
         elif isinstance(content, str):
             msg["content"] = [
                 {
