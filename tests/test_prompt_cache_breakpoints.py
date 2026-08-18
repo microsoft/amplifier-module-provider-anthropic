@@ -557,8 +557,14 @@ def test_multi_message_with_ephemeral_metadata_places_breakpoints_as_before(capl
         params = _run(provider, request)
 
     # No spurious warnings for this well-formed, multi-message, properly
-    # tagged request.
-    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+    # tagged request. Scoped to this module's own logger for the same reason
+    # as the single-message case above: a leaked AsyncClient finalized by the
+    # GC logs an ERROR on the unrelated "asyncio" logger, and it can land in
+    # whichever caplog window happens to be open when that fires.
+    own_records = [
+        r for r in caplog.records if r.name == "amplifier_module_provider_anthropic"
+    ]
+    assert not any(r.levelno >= logging.WARNING for r in own_records)
 
     # At least one conversation-region cache breakpoint was placed -- the
     # guard did not accidentally suppress placement for a real conversation.
