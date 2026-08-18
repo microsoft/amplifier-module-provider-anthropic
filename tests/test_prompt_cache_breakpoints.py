@@ -24,7 +24,14 @@ These tests cover the three properties the fix must guarantee:
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-from amplifier_core.message_models import ChatRequest, Message, ToolCallBlock, ToolSpec
+from amplifier_core.message_models import (
+    ChatRequest,
+    ContentBlockUnion,
+    Message,
+    TextBlock,
+    ToolCallBlock,
+    ToolSpec,
+)
 
 from amplifier_module_provider_anthropic import AnthropicProvider
 from tests._helpers import DummyResponse
@@ -717,4 +724,268 @@ def test_breakpoint_never_lands_on_a_whitespace_only_text_block():
     assert not offenders, (
         "cache_control was stamped on a whitespace-only text block: "
         f"{offenders}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Agentic tool loop: one real user turn, then N tool rounds
+# ---------------------------------------------------------------------------
+
+
+def _tool_round(n: int, *, parallel: int = 1) -> list[Message]:
+    """One agentic tool round, in the shape the orchestrator actually emits.
+
+    A real assistant turn in a tool loop *narrates before it acts*: the model
+    emits a text block and then one or more `tool_use` blocks in the SAME
+    assistant message. The orchestrator then appends one `role="tool"`
+    message per call, and `_convert_messages` batches those consecutive tool
+    messages back into a single Anthropic `user` message whose content is an
+    array of `tool_result` blocks. So a round is two *wire* messages however
+    many tools ran in parallel.
+
+    Both details matter to what this fix touches:
+
+    * the mixed `[text, tool_use, ...]` assistant turn is what
+      `_stamp_last_block` actually sees, so the marker lands on the trailing
+      `tool_use` block rather than on a lone one;
+    * a parallel round produces a multi-block `tool_result` batch, so the
+      marker lands on the *last* result in the batch.
+
+    Critically, a round contains NO new real user message: the human spoke
+    once, at the very start, and everything after that is the model talking
+    to its own tools. That is the shape whose secondary breakpoint this fix
+    restores -- a sub-agent delegation, a /goal run, a recipe step, or simply
+    the tool-heavy first turn of an ordinary session.
+    """
+    assistant_content: list[ContentBlockUnion] = [
+        TextBlock(text=f"Let me read file {n}.")
+    ]
+    for k in range(parallel):
+        assistant_content.append(
+            ToolCallBlock(id=f"call_{n}_{k}", name="read_file", input={"n": n, "k": k})
+        )
+
+    messages: list[Message] = [Message(role="assistant", content=assistant_content)]
+    messages.extend(
+        Message(
+            role="tool",
+            tool_call_id=f"call_{n}_{k}",
+            content=f"file contents {n}.{k}",
+        )
+        for k in range(parallel)
+    )
+    return messages
+
+
+def _agentic_conversation(rounds: int, *, parallel: int = 1) -> list[Message]:
+    """A conversation with exactly ONE real user turn followed by `rounds`
+    tool rounds, terminated by the orchestrator's ephemeral tail."""
+    messages: list[Message] = [
+        Message(role="system", content="System prompt."),
+        Message(role="user", content="do the task"),
+    ]
+    for n in range(rounds):
+        messages.extend(_tool_round(n, parallel=parallel))
+    messages.append(
+        _ephemeral_tail(f"<system-reminder>tail {rounds}</system-reminder>")
+    )
+    return messages
+
+
+def _cached_block_ids(params: dict) -> set[str]:
+    """Stable identity of every cache_control-stamped block.
+
+    Message *indices* are stable across consecutive agentic requests (the
+    prefix never changes, it only grows), but identifying by content makes
+    a failure message far easier to read.
+    """
+    out: set[str] = set()
+    for msg in params.get("messages") or []:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or "cache_control" not in block:
+                continue
+            btype = block.get("type")
+            if btype == "tool_use":
+                out.add(f"tool_use:{block.get('id')}")
+            elif btype == "tool_result":
+                out.add(f"tool_result:{block.get('tool_use_id')}")
+            else:
+                out.add(f"text:{block.get('text', '')}")
+    return out
+
+
+def test_agentic_tool_loop_reuses_a_breakpoint_across_iterations():
+    """An agentic tool loop must get a rolling cache hit, exactly like a
+    multi-turn chat does.
+
+    Regression test for the case where `_find_rolling_secondary_index`
+    bailed out whenever the only real user turn was at index 0 -- which is
+    *always* true in an agentic loop. That left a single advancing primary
+    breakpoint which can never overlap itself, so every request rewrote the
+    whole prefix at the 1.25x write premium and read back nothing, for the
+    entire run.
+
+    The suite already covered this property for multi-turn chat (see
+    `test_rolling_secondary_breakpoint_matches_previous_primary`), but every
+    fixture there supplies a fresh real user turn each round -- the shape
+    that takes the working code path. This test pins the agentic shape.
+    """
+    params_a = _run(_make_provider(), ChatRequest(messages=_agentic_conversation(3)))
+    params_b = _run(_make_provider(), ChatRequest(messages=_agentic_conversation(4)))
+
+    cached_a = _cached_block_ids(params_a)
+    cached_b = _cached_block_ids(params_b)
+
+    assert cached_a, "iteration 3 should have placed at least one breakpoint"
+    assert cached_b, "iteration 4 should have placed at least one breakpoint"
+    assert cached_a & cached_b, (
+        "an agentic tool loop placed NO overlapping cache breakpoint between "
+        "consecutive iterations, so the cache can never be read -- every call "
+        f"pays the write premium for nothing. iter3={sorted(cached_a)} "
+        f"iter4={sorted(cached_b)}"
+    )
+
+
+def test_agentic_tool_loop_places_two_breakpoints_once_a_round_completes():
+    """Once at least one full tool round sits behind the primary, both the
+    primary and the rolling secondary should be placed.
+
+    Guards the `primary_idx < 2` early-out: it must suppress the secondary
+    only when there is genuinely no completed round behind the primary, not
+    swallow the whole agentic case.
+    """
+    params = _run(_make_provider(), ChatRequest(messages=_agentic_conversation(3)))
+    assert len(_cached_block_ids(params)) == 2, (
+        "expected a primary and a rolling secondary breakpoint in an "
+        f"established agentic loop, got {sorted(_cached_block_ids(params))}"
+    )
+
+
+def _message_is_cache_stamped(msg: dict) -> bool:
+    """True if `msg` carries a cache_control marker, whichever content shape
+    it arrived in.
+
+    Deliberately checks BOTH the list-of-blocks and bare-string forms. The
+    ephemeral tail reaches the wire with `content` as a plain string, and a
+    checker that only walks list content silently skips it -- so a tail
+    assertion built on such a checker can never fail, whether or not the
+    tail was stamped. This helper is what makes the tail test below real.
+    """
+    content = msg.get("content")
+    if isinstance(content, list):
+        return any(
+            isinstance(block, dict) and "cache_control" in block for block in content
+        )
+    return False
+
+
+def test_agentic_breakpoints_never_land_on_the_ephemeral_tail():
+    """The agentic fallback must respect the same ephemeral exclusion as
+    every other placement path -- otherwise it reintroduces the original
+    bug it exists to fix.
+
+    Asserted against the tail message *directly* rather than against a
+    content-derived id set. `_stamp_last_block` rewrites a stamped string
+    content into a `[{"type": "text", ...}]` array, so an unstamped tail and
+    a stamped one differ in content *shape*, and a list-only scan of the
+    request would skip the unstamped case entirely -- passing for the wrong
+    reason. Reading the last message and requiring it to be both unstamped
+    and still the tail we sent closes that hole.
+    """
+    tail_text = "<system-reminder>tail 4</system-reminder>"
+    params = _run(_make_provider(), ChatRequest(messages=_agentic_conversation(4)))
+
+    last_msg = params["messages"][-1]
+    assert tail_text in str(last_msg.get("content")), (
+        "fixture drift: the ephemeral tail is no longer the final wire "
+        f"message, so this test is not testing what it claims: {last_msg}"
+    )
+    assert not _message_is_cache_stamped(last_msg), (
+        "a cache breakpoint landed on the regenerated-per-turn ephemeral "
+        f"tail -- the exact bug this fix exists to prevent: {last_msg}"
+    )
+
+    # And positively: the breakpoints went somewhere useful instead --
+    # onto frozen tool rounds, which is the content the next request
+    # actually replays.
+    cached = _cached_block_ids(params)
+    assert cached and all(c.startswith("tool_result:") for c in cached), (
+        "expected every agentic breakpoint to land on a completed tool "
+        f"round, got {sorted(cached)}"
+    )
+
+
+def test_agentic_loop_never_exceeds_four_breakpoints():
+    """The agentic path must respect Anthropic's hard limit of 4.
+
+    The existing ceiling tests all drive the *chat* path (a fresh real user
+    turn every round). This drives the agentic fallback introduced by this
+    fix, with a system prompt and tools also competing for the 4 slots, over
+    a loop long enough that a per-round leak would blow the budget many
+    times over.
+    """
+    request = ChatRequest(
+        messages=_agentic_conversation(25),
+        tools=[_long_tool_spec("read_file"), _long_tool_spec("write_file")],
+    )
+    params = _run(_make_provider(), request)
+
+    assert _count_cache_control_blocks(params) <= 4, (
+        "the agentic fallback placed more than Anthropic's maximum of 4 "
+        f"cache breakpoints: {_count_cache_control_blocks(params)}"
+    )
+
+
+def test_agentic_parallel_tool_calls_still_roll_forward():
+    """A round with several tools running in parallel is still ONE round.
+
+    Parallel calls collapse into a single batched `tool_result` user
+    message, so the two-message-per-round spacing the secondary relies on
+    holds. Pinned because a fan-out round is the common shape in real
+    agentic work, and a scheme that only rolls correctly for single-call
+    rounds would silently stop overlapping the moment the model fans out.
+    """
+    params_a = _run(
+        _make_provider(), ChatRequest(messages=_agentic_conversation(3, parallel=3))
+    )
+    params_b = _run(
+        _make_provider(), ChatRequest(messages=_agentic_conversation(4, parallel=3))
+    )
+
+    cached_a = _cached_block_ids(params_a)
+    cached_b = _cached_block_ids(params_b)
+
+    assert cached_a & cached_b, (
+        "consecutive parallel-tool-call iterations shared no cache "
+        f"breakpoint, so nothing can be read back. iter3={sorted(cached_a)} "
+        f"iter4={sorted(cached_b)}"
+    )
+
+
+def test_agentic_secondary_is_suppressed_until_a_round_completes():
+    """The `primary_idx < 2` guard must fire when there is no completed
+    round behind the primary -- and only then.
+
+    With zero tool rounds the conversation is just the opening instruction
+    plus the ephemeral tail: there is no frozen round to lag onto, so
+    lagging anyway would either duplicate the primary or walk off the front
+    of the list. Exactly one conversation breakpoint is correct here. The
+    moment one round completes, the secondary must appear -- otherwise the
+    guard is over-firing and swallowing the case this fix exists to serve.
+    """
+    no_rounds = _run(_make_provider(), ChatRequest(messages=_agentic_conversation(0)))
+    assert len(_cached_block_ids(no_rounds)) == 1, (
+        "with no completed tool round there is nothing to lag onto, so "
+        "exactly one (primary) breakpoint is expected, got "
+        f"{sorted(_cached_block_ids(no_rounds))}"
+    )
+
+    one_round = _run(_make_provider(), ChatRequest(messages=_agentic_conversation(1)))
+    assert len(_cached_block_ids(one_round)) == 2, (
+        "one completed tool round is enough to place the rolling secondary; "
+        "the guard is over-firing and suppressing it, got "
+        f"{sorted(_cached_block_ids(one_round))}"
     )

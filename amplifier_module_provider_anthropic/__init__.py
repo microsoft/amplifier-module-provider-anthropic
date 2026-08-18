@@ -4543,7 +4543,42 @@ class AnthropicProvider:
                 break
 
         if last_user_turn_idx is None or last_user_turn_idx == 0:
-            return None  # first turn in the conversation - nothing earlier
+            # No *earlier* real user turn exists. This is the normal shape of
+            # an agentic tool loop: one instruction at index 0, then N rounds
+            # of assistant(tool_use)/user(tool_result) with no further user
+            # input. It does NOT mean there is no stable earlier boundary --
+            # every completed tool round before the primary is permanently
+            # frozen, and is exactly the content the next request needs to hit.
+            #
+            # Returning None here (the previous behaviour) left only the single
+            # advancing primary, which can never overlap itself: every request
+            # wrote a new prefix at the 1.25x write premium and read back
+            # nothing, for the entire run. That is precisely the pre-two-
+            # breakpoint failure mode this method exists to fix -- it was still
+            # live for every sub-agent delegation, /goal run, recipe step, and
+            # the tool-heavy first turn of every session, because none of those
+            # shapes contain a second real user turn.
+            #
+            # Lag one complete tool round behind the primary instead. In the
+            # canonical shape this branch handles, a round is two messages --
+            # the assistant tool_use and the single batched user tool_result
+            # that answers it (parallel calls fan out as multiple blocks
+            # inside that one message, not as extra messages). So
+            # primary_idx - 2 places this request's secondary precisely where
+            # the previous request's primary sat -- the same rolling overlap
+            # the real-user-turn path above achieves.
+            #
+            # The -2 is a heuristic starting point, not an invariant: a
+            # caller that interleaves narration or splits tool_results across
+            # messages shifts the stride. _last_safe_breakpoint_index absorbs
+            # that -- it walks further back from this index if the boundary
+            # would split a tool_use/tool_result pair or stamp an empty text
+            # block. A mis-stride costs a cache read, never a malformed
+            # request; the worst case degrades to today's single-breakpoint
+            # behaviour rather than breaking the call.
+            if primary_idx < 2:
+                return None  # no completed round behind the primary yet
+            return self._last_safe_breakpoint_index(all_messages, primary_idx - 2)
 
         return self._last_safe_breakpoint_index(all_messages, last_user_turn_idx - 1)
 
