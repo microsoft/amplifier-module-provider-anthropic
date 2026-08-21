@@ -55,7 +55,7 @@ def _request_with_max_output_tokens(max_output_tokens: int) -> ChatRequest:
 
 def _make_raw_success(model: str) -> MagicMock:
     raw_mock = MagicMock()
-    raw_mock.parse.return_value = DummyResponse(model=model)
+    raw_mock.parse = AsyncMock(return_value=DummyResponse(model=model))
     raw_mock.headers = {}
     return raw_mock
 

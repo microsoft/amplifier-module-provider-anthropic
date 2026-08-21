@@ -291,7 +291,7 @@ class TestCloudflare403Retry:
 
         # First call: Cloudflare 403.  Second call: success.
         raw_ok = MagicMock()
-        raw_ok.parse.return_value = DummyResponse()
+        raw_ok.parse = AsyncMock(return_value=DummyResponse())
         raw_ok.headers = {}
 
         call_count = 0

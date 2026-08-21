@@ -60,7 +60,7 @@ def _make_raw_mock(headers: dict | None = None) -> MagicMock:
     """Create a mock raw response with optional rate limit headers."""
     dummy = DummyResponse()
     raw_mock = MagicMock()
-    raw_mock.parse.return_value = dummy
+    raw_mock.parse = AsyncMock(return_value=dummy)
     raw_mock.headers = headers or {}
     return raw_mock
 

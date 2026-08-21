@@ -69,7 +69,7 @@ def create_raw_response_mock(response: DummyResponse):
     object with .parse() → response and .headers → dict.
     """
     raw = MagicMock()
-    raw.parse.return_value = response
+    raw.parse = AsyncMock(return_value=response)
     raw.headers = {}
     return AsyncMock(return_value=raw)
 
@@ -517,7 +517,7 @@ def test_resume_end_to_end_synthetic_results_reach_anthropic_api():
     async def capturing_create(**kwargs):  # type: ignore[return]
         captured_kwargs.append(kwargs)
         raw = MagicMock()
-        raw.parse.return_value = DummyResponse()
+        raw.parse = AsyncMock(return_value=DummyResponse())
         raw.headers = {}
         return raw
 

@@ -38,7 +38,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "anthropic", specifier = ">=0.96.0" }]
+requires-dist = [{ name = "anthropic", specifier = ">=0.96.0,<1.0.0" }]
 
 [package.metadata.requires-dev]
 dev = [

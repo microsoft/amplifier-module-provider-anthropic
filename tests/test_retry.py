@@ -112,7 +112,7 @@ class TestRetryOnTransientErrors:
         dummy = DummyResponse()
 
         raw_mock = MagicMock()
-        raw_mock.parse.return_value = dummy
+        raw_mock.parse = AsyncMock(return_value=dummy)
         raw_mock.headers = {}
 
         # Fail twice, succeed third time
@@ -135,7 +135,7 @@ class TestRetryOnTransientErrors:
         dummy = DummyResponse()
 
         raw_mock = MagicMock()
-        raw_mock.parse.return_value = dummy
+        raw_mock.parse = AsyncMock(return_value=dummy)
         raw_mock.headers = {}
 
         provider.client.messages.with_raw_response.create = AsyncMock(
@@ -156,7 +156,7 @@ class TestRetryOnTransientErrors:
         dummy = DummyResponse()
 
         raw_mock = MagicMock()
-        raw_mock.parse.return_value = dummy
+        raw_mock.parse = AsyncMock(return_value=dummy)
         raw_mock.headers = {}
 
         provider.client.messages.with_raw_response.create = AsyncMock(
@@ -200,7 +200,7 @@ class TestRetryAfterExceedsMaxDelay:
         dummy = DummyResponse()
 
         raw_mock = MagicMock()
-        raw_mock.parse.return_value = dummy
+        raw_mock.parse = AsyncMock(return_value=dummy)
         raw_mock.headers = {}
 
         # First call: 429 with retry_after=120 (exceeds max_delay=60).
@@ -224,7 +224,7 @@ class TestRetryAfterExceedsMaxDelay:
         dummy = DummyResponse()
 
         raw_mock = MagicMock()
-        raw_mock.parse.return_value = dummy
+        raw_mock.parse = AsyncMock(return_value=dummy)
         raw_mock.headers = {}
 
         provider.client.messages.with_raw_response.create = AsyncMock(
@@ -254,7 +254,7 @@ class TestRetryEventEmission:
         dummy = DummyResponse()
 
         raw_mock = MagicMock()
-        raw_mock.parse.return_value = dummy
+        raw_mock.parse = AsyncMock(return_value=dummy)
         raw_mock.headers = {}
 
         provider.client.messages.with_raw_response.create = AsyncMock(
@@ -284,7 +284,7 @@ class TestRetryEventEmission:
         dummy = DummyResponse()
 
         raw_mock = MagicMock()
-        raw_mock.parse.return_value = dummy
+        raw_mock.parse = AsyncMock(return_value=dummy)
         raw_mock.headers = {}
 
         provider.client.messages.with_raw_response.create = AsyncMock(
@@ -374,7 +374,7 @@ class TestOverloadedRetryBehavior:
         dummy = DummyResponse()
 
         raw_mock = MagicMock()
-        raw_mock.parse.return_value = dummy
+        raw_mock.parse = AsyncMock(return_value=dummy)
         raw_mock.headers = {}
 
         provider.client.messages.with_raw_response.create = AsyncMock(
@@ -395,7 +395,7 @@ class TestOverloadedRetryBehavior:
         dummy = DummyResponse()
 
         raw_mock = MagicMock()
-        raw_mock.parse.return_value = dummy
+        raw_mock.parse = AsyncMock(return_value=dummy)
         raw_mock.headers = {}
 
         provider.client.messages.with_raw_response.create = AsyncMock(
@@ -421,7 +421,7 @@ class TestOverloadedRetryBehavior:
         dummy = DummyResponse()
 
         raw_mock = MagicMock()
-        raw_mock.parse.return_value = dummy
+        raw_mock.parse = AsyncMock(return_value=dummy)
         raw_mock.headers = {}
 
         provider.client.messages.with_raw_response.create = AsyncMock(
@@ -473,7 +473,7 @@ class TestOverloadedRetryBehavior:
         dummy = DummyResponse()
 
         raw_mock = MagicMock()
-        raw_mock.parse.return_value = dummy
+        raw_mock.parse = AsyncMock(return_value=dummy)
         raw_mock.headers = {}
 
         provider.client.messages.with_raw_response.create = AsyncMock(

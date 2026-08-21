@@ -39,7 +39,7 @@ def _make_provider(
 
 def _make_raw_mock() -> MagicMock:
     raw = MagicMock()
-    raw.parse.return_value = DummyResponse(model="claude-opus-4-7-20260416")
+    raw.parse = AsyncMock(return_value=DummyResponse(model="claude-opus-4-7-20260416"))
     raw.headers = {}
     return raw
 
