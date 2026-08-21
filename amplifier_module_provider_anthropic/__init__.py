@@ -4310,6 +4310,35 @@ class AnthropicProvider:
             return not content.strip()
         return False
 
+    @staticmethod
+    def _stamps_uncacheable_block(msg: dict[str, Any]) -> bool:
+        """True if stamping ``msg`` would put cache_control on a block type
+        Anthropic forbids it on.
+
+        Mirrors ``_stamp_last_block``'s list branch: the marker lands on the
+        LAST content block. Anthropic permits ``cache_control`` on text,
+        tool_use, tool_result, image and document blocks -- but NOT on
+        ``thinking`` or ``redacted_thinking`` blocks. When the chosen stable
+        message ends with a thinking block (an interleaved-thinking step, or a
+        turn whose only stored payload is its thinking block -> content ==
+        ``[thinking]``), a breakpoint there makes Anthropic reject the ENTIRE
+        request with:
+
+            messages.N.content.0.thinking.cache_control:
+            Extra inputs are not permitted
+
+        Only list content can offend: ``_stamp_last_block``'s string branch
+        always synthesises a ``text`` block, which is cacheable.
+        """
+        content = msg.get("content")
+        if isinstance(content, list) and content:
+            last = content[-1]
+            return isinstance(last, dict) and last.get("type") in (
+                "thinking",
+                "redacted_thinking",
+            )
+        return False
+
     def _last_safe_breakpoint_index(
         self, messages: list[dict[str, Any]], start_idx: int
     ) -> int | None:
@@ -4341,7 +4370,17 @@ class AnthropicProvider:
             # replayed as ``content: null`` and defaulted to ``""`` upstream)
             # would be stamped as an EMPTY text block, which Anthropic rejects
             # with a 400. Walk past it exactly as we walk past a split pair.
-            if not splits_pair and not self._stamps_empty_text_block(msg):
+            #
+            # A turn ending in a ``thinking`` / ``redacted_thinking`` block is
+            # rejected the same way (``...thinking.cache_control: Extra inputs
+            # are not permitted``), because ``_stamp_last_block`` would mark
+            # that trailing thinking block. Walk past it too, to a message
+            # whose last block can legally carry a cache breakpoint.
+            if (
+                not splits_pair
+                and not self._stamps_empty_text_block(msg)
+                and not self._stamps_uncacheable_block(msg)
+            ):
                 return idx
             idx -= 1
         return None
