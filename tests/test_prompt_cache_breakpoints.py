@@ -45,7 +45,7 @@ def _make_provider(**config_overrides) -> AnthropicProvider:
 
 def _make_raw_mock(response: DummyResponse):
     raw = MagicMock()
-    raw.parse.return_value = response
+    raw.parse = AsyncMock(return_value=response)
     raw.headers = {}
     return AsyncMock(return_value=raw)
 
@@ -59,7 +59,7 @@ def _capture_params(provider: AnthropicProvider) -> dict:
     async def _fake_create(**params):
         captured.update(params)
         raw = MagicMock()
-        raw.parse.return_value = DummyResponse()
+        raw.parse = AsyncMock(return_value=DummyResponse())
         raw.headers = {}
         return raw
 

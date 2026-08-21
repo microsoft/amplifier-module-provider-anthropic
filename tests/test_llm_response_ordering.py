@@ -62,7 +62,7 @@ def _make_raw_response(
     )
 
     raw = MagicMock()
-    raw.parse.return_value = response
+    raw.parse = AsyncMock(return_value=response)
     raw.headers = {}
     return raw
 

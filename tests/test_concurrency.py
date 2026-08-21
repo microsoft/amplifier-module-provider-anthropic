@@ -76,7 +76,7 @@ def _make_api_status_error(
 def _ok_raw_response():
     """Return a fake raw HTTP response that parse()s to DummyResponse."""
     raw = MagicMock()
-    raw.parse.return_value = DummyResponse()
+    raw.parse = AsyncMock(return_value=DummyResponse())
     raw.headers = {}
     return raw
 

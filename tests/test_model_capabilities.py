@@ -35,7 +35,7 @@ def _make_provider(default_model: str = "claude-fable-5") -> AnthropicProvider:
 
 def _make_raw_mock() -> MagicMock:
     raw = MagicMock()
-    raw.parse.return_value = DummyResponse()
+    raw.parse = AsyncMock(return_value=DummyResponse())
     raw.headers = {}
     return raw
 

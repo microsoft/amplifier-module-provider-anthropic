@@ -70,7 +70,7 @@ def _make_raw_response(model: str = "claude-sonnet-4-5-20250929") -> MagicMock:
     )
     # MagicMock (not AsyncMock) — raw.parse() is called synchronously in the provider
     raw = MagicMock()
-    raw.parse.return_value = response
+    raw.parse = AsyncMock(return_value=response)
     raw.headers = {}
     return raw
 
