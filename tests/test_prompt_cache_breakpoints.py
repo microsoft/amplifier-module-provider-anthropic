@@ -28,7 +28,9 @@ from amplifier_core.message_models import (
     ChatRequest,
     ContentBlockUnion,
     Message,
+    RedactedThinkingBlock,
     TextBlock,
+    ThinkingBlock,
     ToolCallBlock,
     ToolSpec,
 )
@@ -988,4 +990,146 @@ def test_agentic_secondary_is_suppressed_until_a_round_completes():
         "one completed tool round is enough to place the rolling secondary; "
         "the guard is over-firing and suppressing it, got "
         f"{sorted(_cached_block_ids(one_round))}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Thinking blocks: cache_control is forbidden on thinking / redacted_thinking
+# ---------------------------------------------------------------------------
+
+
+def _cache_controlled_thinking_blocks(params: dict) -> list[tuple[int, dict]]:
+    """Return every (message_index, block) that is a thinking or
+    redacted_thinking block carrying cache_control -- the exact shape
+    Anthropic rejects with:
+
+        messages.N.content.M.thinking.cache_control: Extra inputs are not permitted
+    """
+    offenders: list[tuple[int, dict]] = []
+    for i, msg in enumerate(params.get("messages") or []):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or "cache_control" not in block:
+                continue
+            if block.get("type") in ("thinking", "redacted_thinking"):
+                offenders.append((i, block))
+    return offenders
+
+
+def _thinking_blocks_on_wire(params: dict) -> int:
+    """How many thinking/redacted_thinking blocks made it into the request.
+
+    Used to guard against these regression tests going vacuous: if message
+    conversion ever starts dropping thinking blocks, the offender scan below
+    would pass for the wrong reason.
+    """
+    count = 0
+    for msg in params.get("messages") or []:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in (
+                    "thinking",
+                    "redacted_thinking",
+                ):
+                    count += 1
+    return count
+
+
+def test_breakpoint_never_lands_on_a_trailing_thinking_block():
+    """A stable turn whose LAST content block is a thinking block must never
+    receive a cache breakpoint.
+
+    Reproduces a live 400 caught in production: a scheduled automation's
+    pinned conversation grew until the chosen breakpoint landed on a message
+    whose trailing block was thinking, and Anthropic rejected the ENTIRE
+    request with:
+
+        messages.25.content.0.thinking.cache_control: Extra inputs are not permitted
+
+    Anthropic permits cache_control on text/tool_use/tool_result/image/
+    document blocks but NOT on thinking or redacted_thinking.
+    ``_stamp_last_block`` marks the LAST block of the chosen message, so
+    ``_last_safe_breakpoint_index`` must walk past such a message exactly as
+    it walks past an empty text block.
+    """
+    provider = _make_provider()
+
+    messages = [
+        Message(role="system", content="System prompt."),
+        Message(role="user", content="do the thing"),
+        # The offending shape: an interleaved-thinking assistant turn whose
+        # trailing block is thinking. As the last STABLE message it is the
+        # primary breakpoint candidate; the fix must walk past it.
+        Message(
+            role="assistant",
+            content=[
+                TextBlock(text="Looking into it."),
+                ThinkingBlock(thinking="private chain of thought"),
+            ],
+        ),
+        _ephemeral_tail("<system-reminder>live</system-reminder>"),
+    ]
+    request = ChatRequest(messages=messages)
+    params = _run(provider, request)
+
+    assert _thinking_blocks_on_wire(params) > 0, (
+        "test setup no longer produces a thinking block on the wire -- "
+        "the offender scan below would be vacuously green"
+    )
+    offenders = _cache_controlled_thinking_blocks(params)
+    assert not offenders, (
+        "cache_control was stamped on a thinking block, which Anthropic "
+        f"rejects the whole request for: {offenders}"
+    )
+
+
+def test_breakpoint_never_lands_on_a_thinking_only_turn():
+    """Same invariant when thinking is the ONLY stored block of the turn --
+    the ``content.0.thinking`` shape from the production rejection."""
+    provider = _make_provider()
+
+    messages = [
+        Message(role="system", content="System prompt."),
+        Message(role="user", content="do the thing"),
+        Message(
+            role="assistant",
+            content=[ThinkingBlock(thinking="only the thinking survived")],
+        ),
+        _ephemeral_tail("<system-reminder>live</system-reminder>"),
+    ]
+    request = ChatRequest(messages=messages)
+    params = _run(provider, request)
+
+    assert _thinking_blocks_on_wire(params) > 0
+    offenders = _cache_controlled_thinking_blocks(params)
+    assert not offenders, (
+        f"cache_control landed on a thinking-only turn: {offenders}"
+    )
+
+
+def test_breakpoint_never_lands_on_a_redacted_thinking_block():
+    """redacted_thinking is rejected identically -- the guard must cover both."""
+    provider = _make_provider()
+
+    messages = [
+        Message(role="system", content="System prompt."),
+        Message(role="user", content="do the thing"),
+        Message(
+            role="assistant",
+            content=[
+                TextBlock(text="Looking into it."),
+                RedactedThinkingBlock(data="opaque-payload"),
+            ],
+        ),
+        _ephemeral_tail("<system-reminder>live</system-reminder>"),
+    ]
+    request = ChatRequest(messages=messages)
+    params = _run(provider, request)
+
+    offenders = _cache_controlled_thinking_blocks(params)
+    assert not offenders, (
+        f"cache_control landed on a redacted_thinking block: {offenders}"
     )
