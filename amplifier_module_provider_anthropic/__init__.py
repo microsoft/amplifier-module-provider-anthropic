@@ -3236,7 +3236,7 @@ class AnthropicProvider:
                         self.client.messages.with_raw_response.create(**params),
                         timeout=self.timeout,
                     )
-                    response = raw_response.parse()
+                    response = await raw_response.parse()
                     rate_limit_info = self._extract_rate_limit_headers(
                         raw_response.headers
                     )
