@@ -9,7 +9,12 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    "anthropic>=0.96.0",
+    # Cap below 1.0.0: the SDK's 1.0.0 major removed `temperature` (and other
+    # sampling params) from the Messages API, which this module passes into
+    # messages.stream()/create(), causing
+    # "AsyncMessages.stream() got an unexpected keyword argument 'temperature'".
+    # Supporting 1.0.0 requires a separate port; see follow-up.
+    "anthropic>=0.96.0,<1.0.0",
 ]
 
 [project.entry-points."amplifier.modules"]
