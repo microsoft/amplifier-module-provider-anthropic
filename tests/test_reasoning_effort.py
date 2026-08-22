@@ -48,10 +48,21 @@ def _make_raw_mock() -> MagicMock:
 
 
 def _get_api_params(mock_create: AsyncMock) -> dict[str, Any]:
-    """Extract the kwargs passed to the API call."""
+    """Extract the effective wire params for the API call.
+
+    `extra_body` entries are merged up to the top level. Params like
+    `temperature` and `speed` are not typed keyword arguments on the SDK
+    (`temperature` was removed in anthropic 1.0.0; `speed` was never typed),
+    so the provider sends them via `extra_body`. Tests assert on what reaches
+    the API, not on which transport carried it.
+    """
     assert mock_create.await_count == 1
     _, kwargs = mock_create.call_args
-    return kwargs
+    params = dict(kwargs)
+    extra_body = params.pop("extra_body", None) or {}
+    for key, value in extra_body.items():
+        params.setdefault(key, value)
+    return params
 
 
 # ---------------------------------------------------------------------------

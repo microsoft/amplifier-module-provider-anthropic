@@ -12,8 +12,13 @@ This builds the error the way the SDK actually does -- via
 reintroduces the body-is-None premise.
 """
 
-import httpx
 import anthropic
+
+# anthropic 1.x is built on `httpx2`, not `httpx`, and does not depend on
+# `httpx` at all -- a bare `import httpx` fails on a clean install. The
+# request/response objects handed to the SDK must come from the package the
+# SDK itself uses.
+import httpx2 as httpx
 
 from amplifier_module_provider_anthropic import AnthropicProvider
 

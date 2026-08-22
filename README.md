@@ -331,7 +331,7 @@ messages = [
 ## Dependencies
 
 - `amplifier-core>=1.0.0`
-- `anthropic>=0.25.0`
+- `anthropic>=1.0.0,<2.0.0`
 
 ## Contributing
 

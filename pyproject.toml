@@ -9,12 +9,19 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    # Cap below 1.0.0: the SDK's 1.0.0 major removed `temperature` (and other
-    # sampling params) from the Messages API, which this module passes into
-    # messages.stream()/create(), causing
-    # "AsyncMessages.stream() got an unexpected keyword argument 'temperature'".
-    # Supporting 1.0.0 requires a separate port; see follow-up.
-    "anthropic>=0.96.0,<1.0.0",
+    # Requires 1.x. On 0.x, `messages.with_raw_response` returns
+    # `LegacyAPIResponse`, whose `parse()` is synchronous; this module awaits it
+    # (see the non-streaming path in `_complete_chat_request`), which raises
+    # "object Message can't be used in 'await' expression" on every
+    # non-streaming call. 1.0.0 returns `AsyncAPIResponse`, whose `parse()` is a
+    # coroutine -- the contract this module's code actually targets.
+    #
+    # 1.0.0 also removed `temperature`/`top_p`/`top_k` from the typed Messages
+    # surface; the API still honors them, so they are sent via `extra_body`.
+    #
+    # Capped below the next major: an unpinned major bump is what broke fresh
+    # installs when 1.0.0 shipped.
+    "anthropic>=1.0.0,<2.0.0",
 ]
 
 [project.entry-points."amplifier.modules"]
