@@ -12,8 +12,16 @@ This builds the error the way the SDK actually does -- via
 reintroduces the body-is-None premise.
 """
 
-import httpx
 import anthropic
+
+# anthropic 1.0.0 moved its HTTP layer from `httpx` to `httpx2` and no longer
+# depends on `httpx` at all, so a bare `import httpx` fails on a clean install.
+# The request/response objects handed to the SDK must come from whichever
+# package the installed SDK is built on. This module supports both majors.
+try:
+    import httpx2 as httpx
+except ImportError:  # anthropic < 1.0.0
+    import httpx
 
 from amplifier_module_provider_anthropic import AnthropicProvider
 
