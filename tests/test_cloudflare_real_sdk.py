@@ -14,14 +14,11 @@ reintroduces the body-is-None premise.
 
 import anthropic
 
-# anthropic 1.0.0 moved its HTTP layer from `httpx` to `httpx2` and no longer
-# depends on `httpx` at all, so a bare `import httpx` fails on a clean install.
-# The request/response objects handed to the SDK must come from whichever
-# package the installed SDK is built on. This module supports both majors.
-try:
-    import httpx2 as httpx
-except ImportError:  # anthropic < 1.0.0
-    import httpx
+# anthropic 1.x is built on `httpx2`, not `httpx`, and does not depend on
+# `httpx` at all -- a bare `import httpx` fails on a clean install. The
+# request/response objects handed to the SDK must come from the package the
+# SDK itself uses.
+import httpx2 as httpx
 
 from amplifier_module_provider_anthropic import AnthropicProvider
 

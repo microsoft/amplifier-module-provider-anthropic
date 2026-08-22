@@ -9,13 +9,19 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    # 1.0.0 removed `temperature`/`top_p`/`top_k` from the typed Messages
-    # surface. The API still honors them, so this module now sends its
-    # wire-only params (`temperature`, `speed`) via `extra_body` instead of as
-    # typed keywords -- a single code path that works on both 0.x and 1.x.
+    # Requires 1.x. On 0.x, `messages.with_raw_response` returns
+    # `LegacyAPIResponse`, whose `parse()` is synchronous; this module awaits it
+    # (see the non-streaming path in `_complete_chat_request`), which raises
+    # "object Message can't be used in 'await' expression" on every
+    # non-streaming call. 1.0.0 returns `AsyncAPIResponse`, whose `parse()` is a
+    # coroutine -- the contract this module's code actually targets.
+    #
+    # 1.0.0 also removed `temperature`/`top_p`/`top_k` from the typed Messages
+    # surface; the API still honors them, so they are sent via `extra_body`.
+    #
     # Capped below the next major: an unpinned major bump is what broke fresh
     # installs when 1.0.0 shipped.
-    "anthropic>=0.96.0,<2.0.0",
+    "anthropic>=1.0.0,<2.0.0",
 ]
 
 [project.entry-points."amplifier.modules"]
