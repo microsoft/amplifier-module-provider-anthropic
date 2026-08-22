@@ -60,6 +60,38 @@ from anthropic._exceptions import (
 
 from ._cost import compute_cost
 
+# Params the Messages API still accepts on the wire but the SDK does not expose
+# as typed keyword arguments.
+#
+#   temperature -- removed from the typed Messages surface in anthropic 1.0.0
+#                  (0 occurrences anywhere in the 1.0.0 package). The API still
+#                  honors it; only the SDK signature dropped it.
+#   speed       -- never present in the typed surface on any 0.x or 1.x release,
+#                  though the API accepts it when the fast-mode beta header is
+#                  sent. Passing it as a keyword has always raised TypeError.
+#
+# Both must travel in extra_body. Sending them as keywords raises
+# "got an unexpected keyword argument", which the retry loop then treats as a
+# transient failure and retries five times before surfacing.
+_WIRE_ONLY_PARAMS: tuple[str, ...] = ("temperature", "speed")
+
+
+def _route_wire_only_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Relocate wire-only params from the typed surface into ``extra_body``.
+
+    Mutates and returns ``params``. A key already present in ``extra_body``
+    wins -- an explicit caller-supplied override is not clobbered by the
+    value this module derived.
+    """
+    for key in _WIRE_ONLY_PARAMS:
+        if key not in params:
+            continue
+        value = params.pop(key)
+        extra_body = dict(params.get("extra_body") or {})
+        extra_body.setdefault(key, value)
+        params["extra_body"] = extra_body
+    return params
+
 
 @dataclass
 class WebSearchContent:
@@ -3017,6 +3049,11 @@ class AnthropicProvider:
             extra_headers = dict(params.get("extra_headers", {}))
             extra_headers["anthropic-beta"] = ",".join(request_beta_headers)
             params["extra_headers"] = extra_headers
+
+        # Move wire-only params off the typed SDK surface. Must be the last
+        # mutation of `params` before the call -- everything above may still
+        # add or overwrite the keys this relocates.
+        _route_wire_only_params(params)
 
         logger.info(
             f"[PROVIDER] Anthropic API call - model: {params['model']}, messages: {len(params['messages'])}, system: {bool(system_blocks)}, tools: {len(params.get('tools', []))}, thinking: {thinking_enabled}"

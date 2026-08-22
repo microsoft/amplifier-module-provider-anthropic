@@ -9,12 +9,13 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    # Cap below 1.0.0: the SDK's 1.0.0 major removed `temperature` (and other
-    # sampling params) from the Messages API, which this module passes into
-    # messages.stream()/create(), causing
-    # "AsyncMessages.stream() got an unexpected keyword argument 'temperature'".
-    # Supporting 1.0.0 requires a separate port; see follow-up.
-    "anthropic>=0.96.0,<1.0.0",
+    # 1.0.0 removed `temperature`/`top_p`/`top_k` from the typed Messages
+    # surface. The API still honors them, so this module now sends its
+    # wire-only params (`temperature`, `speed`) via `extra_body` instead of as
+    # typed keywords -- a single code path that works on both 0.x and 1.x.
+    # Capped below the next major: an unpinned major bump is what broke fresh
+    # installs when 1.0.0 shipped.
+    "anthropic>=0.96.0,<2.0.0",
 ]
 
 [project.entry-points."amplifier.modules"]
