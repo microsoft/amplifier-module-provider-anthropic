@@ -18,6 +18,7 @@ Usage
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 
 # ---------------------------------------------------------------------------
@@ -174,6 +175,8 @@ _RATES: dict[str, dict[str, Decimal]] = {
     },
     # ------------------------------------------------------------------
     # Deprecated models
+    # Retained for historical cost accounting; not expected from
+    # list_models() post-retirement.
     # ------------------------------------------------------------------
     "claude-3-haiku-20240307": {
         "input_per_m": Decimal("0.25"),
@@ -270,3 +273,79 @@ def compute_cost(
         cost *= 2
 
     return cost
+
+
+# Anthropic dated-snapshot suffix, e.g. the "-20250929" in
+# "claude-sonnet-4-5-20250929".
+_DATE_SUFFIX_RE = re.compile(r"-\d{8}$")
+
+
+def _normalize_model_id(model_id: str) -> str:
+    """Strip a trailing Anthropic dated-snapshot suffix (``-YYYYMMDD``), if present.
+
+    Bare aliases (e.g. ``"claude-sonnet-4-6"``) are returned unchanged.
+    """
+    return _DATE_SUFFIX_RE.sub("", model_id)
+
+
+def _find_rates(model_id: str) -> dict[str, Decimal] | None:
+    """Look up ``_RATES`` for *model_id*, tolerating snapshot/alias asymmetry.
+
+    ``_RATES`` is not consistently populated with both a bare-alias entry
+    (e.g. ``"claude-sonnet-4-6"``) and a dated-snapshot entry (e.g.
+    ``"claude-sonnet-4-6-20260101"``) for every model. A plain
+    ``_RATES.get(model_id)`` silently misses in two directions:
+
+    - An alias-only entry misses when the API returns a dated snapshot id
+      (e.g. ``"claude-sonnet-4-6"`` is in ``_RATES`` but the API returns
+      ``"claude-sonnet-4-6-20260201"``).
+    - A snapshot-only entry misses when the API returns the bare alias
+      (e.g. only ``"claude-haiku-3-5-20250929"`` is in ``_RATES`` but the
+      API returns ``"claude-haiku-3-5"``).
+
+    This function tries an exact match first, then falls back to comparing
+    *normalized* ids (date suffix stripped from both the query and each
+    ``_RATES`` key) so either shape resolves to the same rate entry.
+
+    Returns
+    -------
+    dict[str, Decimal] | None
+        The matching rate dict, or ``None`` if no exact or normalized match
+        exists.
+    """
+    rates = _RATES.get(model_id)
+    if rates is not None:
+        return rates
+
+    normalized_query = _normalize_model_id(model_id)
+    for key, value in _RATES.items():
+        if _normalize_model_id(key) == normalized_query:
+            return value
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Module-load invariant: every _RATES entry carries all four rate fields.
+# ---------------------------------------------------------------------------
+_REQUIRED_RATE_KEYS = frozenset(
+    {"input_per_m", "output_per_m", "cache_read_per_m", "cache_write_per_m"}
+)
+
+
+def _validate_rates_table() -> None:
+    """Assert every ``_RATES`` entry carries all four required rate keys.
+
+    ``_build_pricing()`` (amplifier_module_provider_anthropic/__init__.py)
+    relies on every ``_RATES`` entry having all four keys and reads them
+    unconditionally. Fail fast at import time if a future entry omits one,
+    rather than letting a partial entry silently produce a ``KeyError`` deep
+    in ``_build_pricing()`` or reintroducing a defensive-but-dead fallback
+    path there.
+    """
+    for model_id, rate in _RATES.items():
+        missing = _REQUIRED_RATE_KEYS - rate.keys()
+        assert not missing, f"_RATES[{model_id!r}] is missing required keys: {missing}"
+
+
+_validate_rates_table()

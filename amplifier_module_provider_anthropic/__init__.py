@@ -26,6 +26,7 @@ from dataclasses import field
 from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
+from amplifier_core import Pricing
 from amplifier_core import ProviderInfo
 from amplifier_core import TextContent
 from amplifier_core import ThinkingContent
@@ -59,6 +60,7 @@ from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
+from ._cost import _find_rates
 from ._cost import compute_cost
 
 # Params the Messages API still accepts on the wire but the SDK does not expose
@@ -559,6 +561,29 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         await provider.close()
 
     return cleanup
+
+
+def _build_pricing(model_id: str) -> Pricing | None:
+    """Build a Pricing object for a model from the internal _RATES table.
+
+    Uses _find_rates() (amplifier_module_provider_anthropic/_cost.py) to
+    tolerate the snapshot-id/alias asymmetry in _RATES -- e.g. an API
+    response of "claude-sonnet-4-6-20260201" resolves to the bare
+    "claude-sonnet-4-6" entry, and "claude-haiku-3-5" resolves to the dated
+    "claude-haiku-3-5-20250929" entry.
+
+    Returns None if the model has no exact or normalized match in _RATES.
+    """
+    rates = _find_rates(model_id)
+    if rates is None:
+        return None
+    return Pricing(
+        input_per_million=float(rates["input_per_m"]),
+        output_per_million=float(rates["output_per_m"]),
+        cache_read_per_million=float(rates["cache_read_per_m"]),
+        cache_write_per_million=float(rates["cache_write_per_m"]),
+        currency="USD",
+    )
 
 
 class AnthropicProvider:
@@ -1127,6 +1152,7 @@ class AnthropicProvider:
                             "temperature": 0.7,
                             "max_tokens": caps.max_output_tokens,
                         },
+                        pricing=_build_pricing(model_id),
                     )
                 )
 
