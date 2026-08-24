@@ -635,7 +635,7 @@ class AnthropicProvider:
         self._client: AsyncAnthropic | None = None  # Lazy init
         self.config = config or {}
         self.coordinator = coordinator
-        self.default_model = self.config.get("default_model", "claude-sonnet-4-5")
+        self.default_model = self.config.get("default_model", "claude-sonnet-5")
         self._default_caps = self._get_capabilities(self.default_model)
 
         # Effort-family config keys. Canonical key: "reasoning_effort" (matches
