@@ -319,7 +319,7 @@ class TestCauseChainPreservation:
 class TestModelPassthrough:
     """Verify that .model is set on all kernel errors raised by _do_complete()."""
 
-    EXPECTED_MODEL = "claude-sonnet-4-5"  # default_model from _make_provider()
+    EXPECTED_MODEL = "claude-sonnet-5"  # default_model from _make_provider()
 
     def test_rate_limit_error_includes_model(self):
         provider = _make_provider()
@@ -582,4 +582,4 @@ class TestOverloadedErrorTranslation:
         with pytest.raises(KernelProviderUnavailableError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        assert exc_info.value.model == "claude-sonnet-4-5"
+        assert exc_info.value.model == "claude-sonnet-5"

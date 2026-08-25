@@ -29,8 +29,8 @@ Provides access to Anthropic's Claude models (Claude 4 series: Sonnet, Opus, Hai
 
 ## Supported Models
 
-- `claude-sonnet-4-5` - Claude Sonnet 4.5 (recommended, default)
-- `claude-opus-4-6` - Claude Opus 4.6 (most capable)
+- `claude-sonnet-5` - Claude Sonnet 5 (recommended, default)
+- `claude-opus-5` - Claude Opus 5 (most capable)
 - `claude-haiku-4-5` - Claude Haiku 4.5 (fastest, cheapest)
 
 ## Configuration
@@ -40,9 +40,9 @@ Provides access to Anthropic's Claude models (Claude 4 series: Sonnet, Opus, Hai
 module = "provider-anthropic"
 name = "anthropic"
 config = {
-    default_model = "claude-sonnet-4-5",
+    default_model = "claude-sonnet-5",
     max_tokens = 8192,
-    temperature = 1.0,
+    temperature = 1.0,   # Silently ignored by models without sampling support (sonnet-5, opus-4.7+)
     debug = false,      # Enable standard debug events
     raw_debug = false   # Enable ultra-verbose raw API I/O logging
 }
@@ -272,7 +272,7 @@ export ANTHROPIC_API_KEY="your-api-key-here"
 # In amplifier configuration
 [provider]
 name = "anthropic"
-default_model = "claude-sonnet-4-5"
+default_model = "claude-sonnet-5"
 ```
 
 ## Features
