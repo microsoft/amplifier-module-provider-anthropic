@@ -59,7 +59,7 @@ from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
-from ._cost import compute_cost
+from ._cost import compute_cost, parse_rate_overrides
 
 # Params the Messages API still accepts on the wire but the SDK does not expose
 # as typed keyword arguments.
@@ -750,6 +750,16 @@ class AnthropicProvider:
             "filtered", True
         )  # Filter to curated model list by default
         self.enable_prompt_caching = self.config.get("enable_prompt_caching", True)
+
+        # Config-level cost rate overrides for models missing from _RATES
+        # (private, brand-new, or fine-tuned models).  Parsed once here;
+        # overrides take precedence over the built-in table in compute_cost().
+        self._rate_overrides = parse_rate_overrides(self.config.get("rates"))
+        if self._rate_overrides:
+            logger.info(
+                "[PROVIDER] Cost rate overrides configured for: %s",
+                ", ".join(sorted(self._rate_overrides)),
+            )
         self.enable_web_search = self.config.get(
             "enable_web_search", False
         )  # Enable native web search tool
@@ -4859,6 +4869,7 @@ class AnthropicProvider:
             )
             or 0,
             speed=getattr(response.usage, "speed", None),
+            rate_overrides=self._rate_overrides or None,
         )
         usage = usage.model_copy(update={"cost_usd": cost})
         self._add_cost(cost)
