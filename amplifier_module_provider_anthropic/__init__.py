@@ -703,6 +703,17 @@ class AnthropicProvider:
         self._enable_1m_context = self._config_bool(
             self.config.get("enable_1m_context", True)
         )
+        # Operator assertion that this Anthropic account is entitled to the
+        # beta-gated 1M context window (a usage-tier requirement on top of the
+        # context-1m-2025-08-07 beta header). Sending the beta header is
+        # necessary but NOT sufficient: a non-entitled account is still capped
+        # at 200K. We therefore only *advertise* a beta-gated 1M window when
+        # the operator confirms entitlement here, so downstream clients do not
+        # budget against a window the API will reject. GA 1M windows (e.g.
+        # Opus 4.8+) are unaffected and always advertised. Default False.
+        self._context_1m_entitled = self._config_bool(
+            self.config.get("context_1m_entitled", False)
+        )
         self._fallback_sonnet_model = str(
             self.config.get("fallback_sonnet_model", "claude-sonnet-4-6")
         )
@@ -922,9 +933,9 @@ class AnthropicProvider:
                 "max_tokens": 4096,
                 "temperature": 0.7,
                 "timeout": 600.0,
-                "context_window": 1000000
-                if self._enable_1m_context and self._default_caps.supports_1m
-                else self._default_caps.base_context_window,
+                "context_window": self._advertised_context_window(
+                    self.default_model, self._default_caps
+                ),
                 "max_output_tokens": self._default_caps.max_output_tokens,
             },
             config_fields=[
@@ -955,6 +966,22 @@ class AnthropicProvider:
                     show_when={
                         "default_model": "not_contains:haiku"
                     },  # Hide for Haiku (doesn't support 1M)
+                ),
+                ConfigField(
+                    id="context_1m_entitled",
+                    display_name="1M Context Entitlement",
+                    field_type="boolean",
+                    prompt=(
+                        "Is this account entitled to the beta 1M context window? "
+                        "Only enable if Anthropic has granted 1M access; otherwise "
+                        "the advertised window stays at 200K to avoid overflow."
+                    ),
+                    required=False,
+                    default="false",
+                    requires_model=True,
+                    show_when={
+                        "default_model": "not_contains:haiku"
+                    },
                 ),
                 ConfigField(
                     id="enable_prompt_caching",
@@ -1109,12 +1136,7 @@ class AnthropicProvider:
                     self._extract_runtime_model_info(raw_model),
                 )
 
-                has_1m = self._enable_1m_context and caps.supports_1m
-                context_window = (
-                    max(caps.base_context_window, 1000000)
-                    if has_1m
-                    else caps.base_context_window
-                )
+                context_window = self._advertised_context_window(model_id, caps)
 
                 result.append(
                     ModelInfo(
@@ -1525,6 +1547,32 @@ class AnthropicProvider:
                 continue
             deduped.append(header)
         return deduped
+
+    def _advertised_context_window(
+        self, model_id: str, caps: ModelCapabilities
+    ) -> int:
+        """Return the context window to *advertise* for ``model_id``.
+
+        The 1M window exists in two forms:
+
+        * **GA** (e.g. Opus 4.8+) -- always honored; safe to advertise.
+        * **Beta-gated** (Sonnet 4.6/4.7, Opus 4.6/4.7) -- requires the
+          ``context-1m-2025-08-07`` beta header AND a usage-tier
+          entitlement. A non-entitled account is still capped at 200K, so
+          advertising 1M to it makes downstream clients skip context
+          compaction and overflow the real cap with a hard
+          ``prompt is too long: N > 200000 maximum`` 400.
+
+        We advertise beta-gated 1M only when the operator asserts
+        entitlement via ``context_1m_entitled``; GA 1M is always advertised.
+        Falls back to ``base_context_window`` (200K) otherwise.
+        """
+        if not (self._enable_1m_context and caps.supports_1m):
+            return caps.base_context_window
+        beta_gated = self._should_add_context_1m_beta(model_id, caps)
+        if beta_gated and not self._context_1m_entitled:
+            return caps.base_context_window
+        return max(caps.base_context_window, 1000000)
 
     def _should_add_context_1m_beta(
         self, model_id: str, request_caps: ModelCapabilities
