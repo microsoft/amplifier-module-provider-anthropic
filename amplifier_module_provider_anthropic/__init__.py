@@ -1071,10 +1071,140 @@ class AnthropicProvider:
         model family (e.g. fable, opus, sonnet, haiku). When filtered=False,
         returns all available Claude models.
 
+        The query is retried with the same shared retry_with_backoff()/
+        _retry_config machinery used by complete() on transient failures
+        (5xx, connection errors, timeouts, rate limits). Raises the
+        translated kernel error once retries are exhausted, or immediately
+        for non-retryable errors (401/403/404) -- no fallback; caller
+        handles empty lists.
+
         Returns:
             List of ModelInfo for available Claude models.
         """
-        response = await self.client.models.list()
+
+        async def _do_list_models():
+            """Single API call attempt with SDK -> kernel error translation.
+
+            Mirrors the error-translation branches used by _do_complete()
+            (rate limit, authentication, status errors 403/404/5xx, and a
+            catch-all for connection/timeout errors) so list_models() shares
+            the same retry policy as complete().
+            """
+            try:
+                return await self.client.models.list()
+            except AnthropicRateLimitError as e:
+                rate_info = self._parse_rate_limit_info(e)
+                retry_after = rate_info.get("retry_after_seconds")
+                body = getattr(e, "body", None)
+                msg = json.dumps(body) if body is not None else str(e)
+                raise KernelRateLimitError(
+                    msg,
+                    provider="anthropic",
+                    status_code=429,
+                    retryable=True,
+                    retry_after=retry_after,
+                ) from e
+            except AnthropicAuthenticationError as e:
+                body = getattr(e, "body", None)
+                msg = json.dumps(body) if body is not None else str(e)
+                raise KernelAuthenticationError(
+                    msg,
+                    provider="anthropic",
+                    status_code=getattr(e, "status_code", 401),
+                ) from e
+            except AnthropicAPIStatusError as e:
+                # Also catches AnthropicOverloadedError (529), a subclass of
+                # AnthropicAPIStatusError -- it falls into the status >= 500
+                # branch below and is retried like any other 5xx.
+                status = getattr(e, "status_code", 500)
+                body = getattr(e, "body", None)
+                error_msg = json.dumps(body) if body is not None else str(e)
+                if status == 403:
+                    # Distinguish Cloudflare bot challenges (transient) from
+                    # real API 403s (permanent), same detection _do_complete uses.
+                    if self._is_cloudflare_challenge(e):
+                        logger.warning(
+                            "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
+                            "with HTML body) on list_models(). Treating as "
+                            "transient -- will retry."
+                        )
+                        raise KernelProviderUnavailableError(
+                            "Cloudflare bot challenge (transient 403 with HTML "
+                            "body). This typically resolves on retry.",
+                            provider="anthropic",
+                            status_code=403,
+                            retryable=True,
+                        ) from e
+                    raise KernelAccessDeniedError(
+                        error_msg,
+                        provider="anthropic",
+                        status_code=403,
+                    ) from e
+                if status == 404:
+                    raise KernelNotFoundError(
+                        error_msg,
+                        provider="anthropic",
+                        status_code=404,
+                    ) from e
+                if status >= 500:
+                    raise KernelProviderUnavailableError(
+                        error_msg,
+                        provider="anthropic",
+                        status_code=status,
+                        retryable=True,
+                    ) from e
+                raise KernelLLMError(
+                    error_msg,
+                    provider="anthropic",
+                    status_code=status,
+                    retryable=False,
+                ) from e
+            except KernelLLMError:
+                raise  # Already translated, don't double-wrap
+            except Exception as e:
+                # Connection errors, timeouts, and anything unforeseen land
+                # here -- same catch-all _do_complete() uses, treated as
+                # transient and retryable.
+                body = getattr(e, "body", None)
+                error_msg = (
+                    json.dumps(body)
+                    if body is not None
+                    else (str(e) or f"{type(e).__name__}: (no message)")
+                )
+                raise KernelLLMError(
+                    error_msg,
+                    provider="anthropic",
+                    retryable=True,
+                ) from e
+
+        async def _on_retry(attempt: int, delay: float, error: KernelLLMError):
+            """Callback invoked before each retry sleep."""
+            error_type = type(error).__name__
+            logger.warning(
+                "[PROVIDER] Retry %d/%d for list_models(): %s, sleeping %.1fs",
+                attempt,
+                self._retry_config.max_retries,
+                error_type,
+                delay,
+            )
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    PROVIDER_RETRY,
+                    {
+                        "provider": "anthropic",
+                        "attempt": attempt,
+                        "max_retries": self._retry_config.max_retries,
+                        "delay": delay,
+                        "error_type": error_type,
+                        "error_message": str(error),
+                    },
+                )
+
+        response = await retry_with_backoff(
+            _do_list_models,
+            self._retry_config,
+            on_retry=_on_retry,
+        )
         api_models = list(response.data)
 
         # Group models by family using _detect_family() as the single source of
