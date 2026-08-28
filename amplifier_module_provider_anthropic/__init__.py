@@ -4976,6 +4976,26 @@ class AnthropicProvider:
 
         usage = Usage(**usage_kwargs)
 
+        # Anthropic's usage object may carry a per-TTL cache-write split under
+        # `usage.cache_creation` (`.ephemeral_5m_input_tokens` /
+        # `.ephemeral_1h_input_tokens`), in addition to the aggregate
+        # `cache_creation_input_tokens` count. When present, this lets
+        # compute_cost() bill 1h writes at their real 2x rate instead of the
+        # 1.25x 5-minute rate. The isinstance guards are a graceful fallback
+        # for response shapes (or test doubles) that don't carry real ints
+        # here -- treated the same as "split absent".
+        cache_creation_ttl_split = getattr(response.usage, "cache_creation", None)
+        cache_creation_5m = getattr(
+            cache_creation_ttl_split, "ephemeral_5m_input_tokens", None
+        )
+        cache_creation_1h = getattr(
+            cache_creation_ttl_split, "ephemeral_1h_input_tokens", None
+        )
+        if not isinstance(cache_creation_5m, int):
+            cache_creation_5m = None
+        if not isinstance(cache_creation_1h, int):
+            cache_creation_1h = None
+
         cost = compute_cost(
             response.model,
             input_tokens=response.usage.input_tokens,
@@ -4988,6 +5008,8 @@ class AnthropicProvider:
                 response.usage, "cache_creation_input_tokens", 0
             )
             or 0,
+            cache_creation_5m_input_tokens=cache_creation_5m,
+            cache_creation_1h_input_tokens=cache_creation_1h,
             speed=getattr(response.usage, "speed", None),
         )
         usage = usage.model_copy(update={"cost_usd": cost})

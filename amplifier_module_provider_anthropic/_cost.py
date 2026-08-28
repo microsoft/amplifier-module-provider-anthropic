@@ -18,7 +18,10 @@ Usage
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Internal constants
@@ -138,9 +141,13 @@ _RATES: dict[str, dict[str, Decimal]] = {
     # ------------------------------------------------------------------
     # Claude Fable 5  ($10 / $50 / $1.00 / $12.50)
     # Exactly 2x Opus 4.8 on every rate.
-    # NOTE: A 1-hour cache write tier exists at $20.00/MTok but Anthropic's
-    # usage object returns a single cache_creation_input_tokens count and
-    # does not distinguish TTLs — track the 5-minute rate ($12.50) here.
+    # A 1-hour cache write tier exists at $20.00/MTok (= 2x input_per_m, the
+    # same relationship as every other model in this table). Anthropic's
+    # usage object now reports a per-TTL split via `usage.cache_creation`
+    # (`.ephemeral_5m_input_tokens` / `.ephemeral_1h_input_tokens`) — see the
+    # TTL-aware billing in compute_cost() below. cache_write_per_m here is
+    # the 5-minute rate ($12.50), used for the split's 5m portion and as the
+    # legacy aggregate-only fallback rate.
     # ------------------------------------------------------------------
     "claude-fable-5": {
         "input_per_m": Decimal("10.00"),
@@ -220,6 +227,8 @@ def compute_cost(
     output_tokens: int = 0,
     cache_read_input_tokens: int = 0,
     cache_creation_input_tokens: int = 0,
+    cache_creation_5m_input_tokens: int | None = None,
+    cache_creation_1h_input_tokens: int | None = None,
     speed: str | None = None,
 ) -> Decimal | None:
     """Return the USD cost for an Anthropic API call as a :class:`~decimal.Decimal`.
@@ -237,8 +246,26 @@ def compute_cost(
     cache_read_input_tokens:
         Tokens served from the prompt cache (cheaper than fresh input).
     cache_creation_input_tokens:
-        Tokens written to the prompt cache (slightly more expensive than
-        fresh input).
+        Aggregate tokens written to the prompt cache, regardless of TTL
+        (Anthropic's ``usage.cache_creation_input_tokens`` field). Used as
+        the legacy fallback billing basis — billed at the 5-minute rate —
+        when *neither* ``cache_creation_5m_input_tokens`` nor
+        ``cache_creation_1h_input_tokens`` is supplied.
+    cache_creation_5m_input_tokens:
+        Tokens written to the prompt cache with a 5-minute TTL (Anthropic's
+        ``usage.cache_creation.ephemeral_5m_input_tokens``), billed at 1.25x
+        the base input rate. Pass ``None`` (the default) when the caller's
+        usage object doesn't carry the per-TTL split; passing either split
+        parameter (even as ``0``) switches billing to split mode for this
+        call, so the discrepancy check below applies.
+    cache_creation_1h_input_tokens:
+        Tokens written to the prompt cache with a 1-hour TTL (Anthropic's
+        ``usage.cache_creation.ephemeral_1h_input_tokens``), billed at 2x
+        the base input rate (official Anthropic pricing — 1h writes cost
+        double a 5m write). Undercounting this was the root cause of the
+        cost-tracking bug this split-aware path fixes: before, all cache
+        writes — including 1h ones — were billed at the 5-minute (1.25x)
+        rate because the usage object only exposed the aggregate count.
     speed:
         When ``'fast'`` AND *model* is in :data:`_FAST_ELIGIBLE_MODELS` a 2x
         multiplier is applied; any other value leaves cost unchanged.
@@ -261,7 +288,47 @@ def compute_cost(
     if cache_read_input_tokens > 0:
         cost += Decimal(cache_read_input_tokens) * rates["cache_read_per_m"] / _PER_M
 
-    if cache_creation_input_tokens > 0:
+    # Per-TTL split billing: only engaged when the caller actually supplies
+    # part of the split (usage.cache_creation was present on the SDK usage
+    # object). Passing neither param preserves the pre-split legacy path
+    # below unchanged — a graceful fallback for older SDK response shapes
+    # (or test doubles) that only carry the aggregate count.
+    has_ttl_split = (
+        cache_creation_5m_input_tokens is not None
+        or cache_creation_1h_input_tokens is not None
+    )
+
+    if has_ttl_split:
+        five_min_tokens = cache_creation_5m_input_tokens or 0
+        one_hour_tokens = cache_creation_1h_input_tokens or 0
+
+        # Sanity-check consistency: the split should sum to the aggregate.
+        # If it doesn't, prefer the split (it is the more precise, billable
+        # figure) and note the discrepancy at debug level only — this is
+        # observability for an unexpected SDK response shape, not a user
+        # actionable warning.
+        split_total = five_min_tokens + one_hour_tokens
+        if cache_creation_input_tokens and split_total != cache_creation_input_tokens:
+            logger.debug(
+                "cache_creation TTL split (5m=%s + 1h=%s = %s) does not match "
+                "aggregate cache_creation_input_tokens=%s for model %s; "
+                "billing from the split.",
+                five_min_tokens,
+                one_hour_tokens,
+                split_total,
+                cache_creation_input_tokens,
+                model,
+            )
+
+        if five_min_tokens > 0:
+            cost += Decimal(five_min_tokens) * rates["cache_write_per_m"] / _PER_M
+        if one_hour_tokens > 0:
+            # 1-hour cache writes cost 2x the base input rate (Anthropic
+            # pricing), not the 1.25x 5-minute cache_write_per_m rate.
+            cost += Decimal(one_hour_tokens) * (rates["input_per_m"] * 2) / _PER_M
+    elif cache_creation_input_tokens > 0:
+        # Legacy path: no TTL split available, bill the full aggregate at
+        # the 5-minute rate (unchanged historical behavior).
         cost += (
             Decimal(cache_creation_input_tokens) * rates["cache_write_per_m"] / _PER_M
         )
