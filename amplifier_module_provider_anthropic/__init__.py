@@ -767,7 +767,9 @@ class AnthropicProvider:
         # (and reused often enough) for the longer TTL to pay for itself.
         #
         # NOTE: the beta header this requires is registered just below, once
-        # `self._beta_headers` exists (see "Beta headers support").
+        # `self._beta_headers` exists (see "Beta headers support") -- and only
+        # when `enable_prompt_caching` is also on, since the knob has no
+        # effect at all when caching itself is disabled.
         self.cache_stable_region_ttl_1h = self._config_bool(
             self.config.get("cache_stable_region_ttl_1h", False)
         )
@@ -808,9 +810,23 @@ class AnthropicProvider:
             )
 
         if self.cache_stable_region_ttl_1h:
-            _ttl_beta = "extended-cache-ttl-2025-04-11"
-            if _ttl_beta not in self._beta_headers:
-                self._beta_headers.append(_ttl_beta)
+            if self.enable_prompt_caching:
+                _ttl_beta = "extended-cache-ttl-2025-04-11"
+                if _ttl_beta not in self._beta_headers:
+                    self._beta_headers.append(_ttl_beta)
+            else:
+                # The knob only affects cache breakpoints, which are never
+                # placed at all when prompt caching is off -- sending the
+                # beta header in that state would be pure noise (and would
+                # silently opt the account into 1h-TTL billing semantics for
+                # a feature that never fires). Log once so a user who set
+                # this expecting an effect isn't left guessing why nothing
+                # changed.
+                logger.info(
+                    "[PROVIDER] cache_stable_region_ttl_1h is set but "
+                    "enable_prompt_caching is False -- the 1h cache TTL "
+                    "knob has no effect without prompt caching enabled."
+                )
 
         if self._beta_headers:
             # Build anthropic-beta header value (comma-separated)
@@ -963,6 +979,34 @@ class AnthropicProvider:
                     prompt="Enable prompt caching? (Reduces cost by 90% on cached tokens)",
                     required=False,
                     default="true",
+                ),
+                ConfigField(
+                    id="cache_stable_region_ttl_1h",
+                    display_name="1-Hour Cache TTL (Stable Regions)",
+                    field_type="boolean",
+                    prompt=(
+                        "1-hour cache TTL for stable regions (system prompt + "
+                        "tools). Writes cost 2x vs 1.25x for the default "
+                        "5-minute TTL -- pays off when calls are >5 min apart "
+                        "or sessions are long. Leave unset for the 5-minute "
+                        "default."
+                    ),
+                    required=False,
+                    # No declared default -- an unset field is a real,
+                    # visible third state ("use provider default") distinct
+                    # from an explicit False, not just "off by default"
+                    # spelled a different way. The app-cli wizard renders a
+                    # None-default boolean as "(leave unset -- use provider
+                    # default)" and omits the key entirely when left blank;
+                    # the constructor already treats an absent key as False
+                    # via `self.config.get("cache_stable_region_ttl_1h",
+                    # False)` above, so behavior is unchanged either way.
+                    default=None,
+                    requires_model=False,
+                    # Only meaningful once prompt caching itself is on --
+                    # both fields are pre-model, so enable_prompt_caching is
+                    # already collected by the time this is evaluated.
+                    show_when={"enable_prompt_caching": "true"},
                 ),
                 ConfigField(
                     # Canonical key — matches the kernel's portable
