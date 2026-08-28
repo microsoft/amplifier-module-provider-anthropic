@@ -14,19 +14,32 @@ Integration tests (i–k): _convert_to_chat_response stamps cost_usd on Usage
   (i)  Known model + tokens → cost_usd is Decimal > 0
   (j)  1M cache_creation_input_tokens → cost_usd == Decimal('3.75')
   (k)  Unknown model → cost_usd is None
+
+Cache-write TTL split tests (t–z): compute_cost() honors the per-TTL split
+(usage.cache_creation.ephemeral_5m_input_tokens / .ephemeral_1h_input_tokens)
+when present, billing 1h writes at 2x input rather than the 1.25x 5m rate.
+  (t) Split present, all tokens 1h → billed at 2x input rate
+  (u) Split present, all tokens 5m → identical to legacy aggregate behavior
+  (v) Split present, mixed 5m + 1h → each portion billed at its own rate
+  (w) Aggregate-only (no split kwargs) → unchanged legacy 1.25x behavior
+  (x) Split kwargs explicitly 0/0 with no aggregate → zero cache-write cost,
+      no crash
+  (y) Split doesn't sum to aggregate → split wins, discrepancy logged at
+      DEBUG (not WARNING)
+  (z) Integration: _convert_to_chat_response wires usage.cache_creation into
+      compute_cost() and stamps the corrected 1h cost on Usage.cost_usd
 """
 
+import logging
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
 
 from amplifier_core import ModuleCoordinator
-
 from amplifier_module_provider_anthropic import AnthropicProvider
 from amplifier_module_provider_anthropic._cost import compute_cost
-
 from tests._helpers import FakeCoordinator
-
 
 # ---------------------------------------------------------------------------
 # Integration test helpers
@@ -140,7 +153,7 @@ def test_unknown_distinct_from_zero():
     """None returned for unknown model must not equal Decimal('0')."""
     result = compute_cost("no-such-model", input_tokens=0)
     assert result is None
-    assert result != Decimal("0")
+    assert result != Decimal(0)
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +404,9 @@ def test_sonnet_5_cache_write_cost():
 # Claude Opus 5 pricing: same rates as Opus 4.8, and fast-mode eligible
 # ---------------------------------------------------------------------------
 def test_opus_5_standard_rate():
-    cost = compute_cost("claude-opus-5", input_tokens=1_000_000, output_tokens=1_000_000)
+    cost = compute_cost(
+        "claude-opus-5", input_tokens=1_000_000, output_tokens=1_000_000
+    )
     assert cost == Decimal("5.00") + Decimal("25.00")
 
 
@@ -406,3 +421,185 @@ def test_opus_5_fast_mode_multiplier():
         speed="fast",
     )
     assert fast == standard * 2
+
+
+# ---------------------------------------------------------------------------
+# Cache-write TTL split: bill 1h writes at 2x input, 5m writes at 1.25x input
+# ---------------------------------------------------------------------------
+#
+# claude-sonnet-4-5-20250929 rates: input=$3.00/M, cache_write(5m)=$3.75/M
+# (1.25x). The 1h rate is not a separate table entry -- it is always 2x the
+# model's base input_per_m, per Anthropic's official pricing.
+
+
+# (t) Split present, all tokens 1h -> billed at 2x input rate ($6.00/M)
+def test_ttl_split_all_1h_billed_at_2x_input():
+    """1M ephemeral_1h_input_tokens -> $6.00 (2x $3.00 input), not $3.75."""
+    result = compute_cost(
+        "claude-sonnet-4-5-20250929",
+        cache_creation_1h_input_tokens=1_000_000,
+        cache_creation_5m_input_tokens=0,
+    )
+    assert result == Decimal("6.00"), f"Expected Decimal('6.00'), got {result!r}"
+
+
+# (u) Split present, all tokens 5m -> identical to legacy aggregate behavior
+def test_ttl_split_all_5m_matches_legacy_behavior():
+    """1M ephemeral_5m_input_tokens (split) == 1M cache_creation_input_tokens (legacy)."""
+    split_result = compute_cost(
+        "claude-sonnet-4-5-20250929",
+        cache_creation_5m_input_tokens=1_000_000,
+        cache_creation_1h_input_tokens=0,
+    )
+    legacy_result = compute_cost(
+        "claude-sonnet-4-5-20250929", cache_creation_input_tokens=1_000_000
+    )
+    assert split_result == Decimal("3.75"), (
+        f"Expected Decimal('3.75'), got {split_result!r}"
+    )
+    assert split_result == legacy_result
+
+
+# (v) Split present, mixed 5m + 1h -> each portion billed at its own rate
+def test_ttl_split_mixed_5m_and_1h():
+    """400K 5m + 600K 1h -> (400K*3.75 + 600K*6.00) / 1M == $5.10."""
+    result = compute_cost(
+        "claude-sonnet-4-5-20250929",
+        cache_creation_5m_input_tokens=400_000,
+        cache_creation_1h_input_tokens=600_000,
+        cache_creation_input_tokens=1_000_000,  # sums correctly, no discrepancy
+    )
+    assert result == Decimal("5.10"), f"Expected Decimal('5.10'), got {result!r}"
+
+
+# (w) Aggregate-only (no split kwargs at all) -> unchanged legacy 1.25x behavior
+def test_no_ttl_split_kwargs_preserves_legacy_behavior():
+    """Omitting both split kwargs must behave exactly as before the fix."""
+    result = compute_cost(
+        "claude-sonnet-4-5-20250929", cache_creation_input_tokens=1_000_000
+    )
+    assert result == Decimal("3.75"), f"Expected Decimal('3.75'), got {result!r}"
+
+
+# (x) Missing/None cache fields -> zero cost contribution, no crash
+def test_ttl_split_none_fields_contribute_zero_cost_no_crash():
+    """cache_creation_5m/1h=None (default) and cache_creation_input_tokens=0
+    must contribute nothing to cost and must not raise."""
+    result = compute_cost(
+        "claude-sonnet-4-5-20250929",
+        input_tokens=1_000,
+        output_tokens=500,
+        # cache_creation_input_tokens defaults to 0
+        # cache_creation_5m_input_tokens / _1h_input_tokens default to None
+    )
+    baseline = compute_cost(
+        "claude-sonnet-4-5-20250929", input_tokens=1_000, output_tokens=500
+    )
+    assert result == baseline
+    assert result is not None and result > 0  # input/output cost still applies
+
+
+def test_ttl_split_explicit_zero_zero_no_aggregate_contributes_zero():
+    """Explicitly passing 0/0 for the split (split mode engaged, no tokens)
+    must not crash and must contribute zero cache-write cost."""
+    result = compute_cost(
+        "claude-sonnet-4-5-20250929",
+        input_tokens=1_000,
+        cache_creation_5m_input_tokens=0,
+        cache_creation_1h_input_tokens=0,
+    )
+    input_only = compute_cost("claude-sonnet-4-5-20250929", input_tokens=1_000)
+    assert result == input_only
+
+
+# (y) Split doesn't sum to aggregate -> split wins; discrepancy logged at DEBUG
+def test_ttl_split_discrepancy_prefers_split_and_logs_debug_only(caplog):
+    """Aggregate says 1M but split sums to 900K -> billed from the split
+    (900K), and the mismatch is logged at DEBUG, never WARNING."""
+    with caplog.at_level(
+        logging.DEBUG, logger="amplifier_module_provider_anthropic._cost"
+    ):
+        result = compute_cost(
+            "claude-sonnet-4-5-20250929",
+            cache_creation_5m_input_tokens=400_000,
+            cache_creation_1h_input_tokens=500_000,
+            cache_creation_input_tokens=1_000_000,  # stale/mismatched aggregate
+        )
+
+    # Billed from the 900K split (400K*3.75 + 500K*6.00)/1M = $4.50, NOT the
+    # legacy aggregate-at-5m-rate figure ($1M * 3.75/1M == $3.75).
+    assert result == Decimal("4.50"), f"Expected Decimal('4.50'), got {result!r}"
+
+    debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+    warning_or_above = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("does not match aggregate" in r.message for r in debug_records), (
+        "Expected a debug-level discrepancy note"
+    )
+    assert not warning_or_above, (
+        f"Discrepancy must not be logged at WARNING or above, got: {warning_or_above}"
+    )
+
+
+# (z) Integration: _convert_to_chat_response wires usage.cache_creation split
+#     into compute_cost() and stamps the corrected cost on Usage.cost_usd
+def _make_response_with_ttl_split(
+    model: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
+    ephemeral_5m_input_tokens: int | None = None,
+    ephemeral_1h_input_tokens: int | None = None,
+) -> MagicMock:
+    """Fake Anthropic API response whose usage carries a real cache_creation
+    TTL split object (SimpleNamespace, not an auto-attribute MagicMock)."""
+    response = MagicMock()
+    response.content = []
+    response.model = model
+    response.stop_reason = "end_turn"
+    response.usage.input_tokens = input_tokens
+    response.usage.output_tokens = output_tokens
+    response.usage.cache_read_input_tokens = 0
+    response.usage.cache_creation_input_tokens = cache_creation_input_tokens
+    response.usage.speed = None
+    if ephemeral_5m_input_tokens is None and ephemeral_1h_input_tokens is None:
+        response.usage.cache_creation = None
+    else:
+        response.usage.cache_creation = SimpleNamespace(
+            ephemeral_5m_input_tokens=ephemeral_5m_input_tokens or 0,
+            ephemeral_1h_input_tokens=ephemeral_1h_input_tokens or 0,
+        )
+    return response
+
+
+def test_convert_bills_1h_cache_writes_at_2x_via_usage_split():
+    """End-to-end: response.usage.cache_creation.ephemeral_1h_input_tokens
+    flows through _convert_to_chat_response into a corrected cost_usd."""
+    provider = _make_provider()
+    response = _make_response_with_ttl_split(
+        model="claude-sonnet-4-5-20250929",
+        cache_creation_input_tokens=1_000_000,
+        ephemeral_5m_input_tokens=0,
+        ephemeral_1h_input_tokens=1_000_000,
+    )
+    result = provider._convert_to_chat_response(response)
+    assert result.usage is not None
+    assert result.usage.cost_usd == Decimal("6.00"), (
+        f"Expected Decimal('6.00') for 1M 1h cache write, got {result.usage.cost_usd!r}"
+    )
+
+
+def test_convert_without_ttl_split_object_preserves_legacy_cost():
+    """When response.usage has no `cache_creation` object at all (older SDK
+    shape), cost_usd must match the pre-fix aggregate-at-5m-rate behavior."""
+    provider = _make_provider()
+    response = _make_response_with_ttl_split(
+        model="claude-sonnet-4-5-20250929",
+        cache_creation_input_tokens=1_000_000,
+        # ephemeral_5m_input_tokens / ephemeral_1h_input_tokens both None
+        # -> response.usage.cache_creation is None
+    )
+    result = provider._convert_to_chat_response(response)
+    assert result.usage is not None
+    assert result.usage.cost_usd == Decimal("3.75"), (
+        f"Expected Decimal('3.75') (legacy behavior), got {result.usage.cost_usd!r}"
+    )
