@@ -208,6 +208,56 @@ A `provider:retry` event is emitted before each retry sleep with the following f
 | `error_type` | Kernel error class name |
 | `error_message` | Error description |
 
+## Prompt Cache TTL
+
+By default, prompt-cache breakpoints use Anthropic's standard 5-minute TTL. The
+`cache_stable_region_ttl_1h` config key opts into a 1-hour TTL for the two most
+stable cache breakpoints only:
+
+```yaml
+providers:
+  - module: provider-anthropic
+    config:
+      enable_prompt_caching: true          # required -- see below
+      cache_stable_region_ttl_1h: true
+```
+
+**What it covers**: the **system prompt and tool-definition** breakpoints only.
+It deliberately never applies to conversation-region breakpoints, which move
+every turn on a rolling basis and would pay the higher write premium (below)
+on content that's about to be superseded anyway. Extending the conversation
+region to a longer TTL is a separate, currently-unimplemented idea tracked
+upstream in [microsoft/amplifier#337](https://github.com/microsoft/amplifier/issues/337).
+See the design comment above `self.cache_stable_region_ttl_1h` in
+`amplifier_module_provider_anthropic/__init__.py` for the full rationale.
+
+**The economics**: Anthropic bills 1-hour TTL cache *writes* at 2x the base
+input-token rate, versus 1.25x for the default 5-minute TTL. That's a real
+up-front cost -- but a longer TTL means the write survives more calls before
+it needs to be repeated. Once a cache entry is reused across roughly two or
+more reads inside the 1-hour window that a 5-minute TTL would have missed
+(because the previous call was more than 5 minutes ago), the 1h TTL comes out
+ahead. It helps most for:
+
+- **Long-running sessions** with gaps between calls longer than 5 minutes
+  (e.g. a human pausing between turns, a scheduled/cron-triggered agent).
+- **Stable system prompts and tool sets** that don't change turn-to-turn --
+  exactly the two regions this knob targets.
+
+If your calls are consistently more frequent than every 5 minutes, the
+default 5-minute TTL already keeps the cache warm at the cheaper 1.25x write
+rate, and enabling this knob only adds cost.
+
+**Requires prompt caching itself.** Because this knob only affects existing
+cache breakpoints, it is a no-op when `enable_prompt_caching` is `false` (or
+left at its `false` default) -- the provider will not append the
+`extended-cache-ttl-2025-04-11` beta header in that case, and logs a one-line
+notice explaining why. Enable both together.
+
+**Left unset by default** (rather than defaulting to `false`): this makes
+"no opinion, use the provider's own 5-minute default" a real, distinguishable
+third state in the config wizard, separate from an explicit opt-out.
+
 ## Beta Headers
 
 Anthropic provides experimental features through beta headers. Enable these features by adding the `beta_headers` configuration field.

@@ -634,6 +634,77 @@ def test_cache_stable_region_ttl_1h_opt_in_applies_to_system_and_tools_only():
                 if isinstance(block, dict) and "cache_control" in block:
                     assert block["cache_control"] == {"type": "ephemeral"}
 
+
+def test_cache_stable_region_ttl_1h_beta_header_absent_when_caching_disabled(caplog):
+    """The knob must be inert (and say so) when prompt caching itself is off.
+
+    Before this fix, `cache_stable_region_ttl_1h=True` unconditionally
+    appended the `extended-cache-ttl-2025-04-11` beta header even when
+    `enable_prompt_caching=False` -- sending a beta header for a feature
+    (cache breakpoints) that can never fire with caching disabled.
+    """
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="amplifier_module_provider_anthropic"):
+        provider = _make_provider(
+            enable_prompt_caching=False, cache_stable_region_ttl_1h=True
+        )
+
+    assert provider.cache_stable_region_ttl_1h is True
+    assert provider.enable_prompt_caching is False
+    assert "extended-cache-ttl-2025-04-11" not in provider._beta_headers
+    assert provider._default_headers is None or "anthropic-beta" not in (
+        provider._default_headers or {}
+    )
+
+    # A one-line notice explains why the knob had no effect, rather than
+    # silently doing nothing.
+    assert any(
+        "cache_stable_region_ttl_1h" in r.message
+        and "enable_prompt_caching" in r.message
+        for r in caplog.records
+    )
+
+    # And, of course, no cache_control at all is placed anywhere on the wire
+    # when prompt caching is disabled (pre-existing behavior, unaffected).
+    messages = [Message(role="system", content="System prompt.")]
+    messages.extend(_turn("question", "answer"))
+    request = ChatRequest(messages=messages, tools=[_long_tool_spec()])
+    params = _run(provider, request)
+    assert _count_cache_control_blocks(params) == 0
+
+
+def test_cache_stable_region_ttl_1h_config_field_advertised():
+    """get_info() must expose the knob so it is discoverable via the config
+    wizard, rather than existing only as an undocumented config key."""
+    provider = _make_provider()
+    field = next(
+        f
+        for f in provider.get_info().config_fields
+        if f.id == "cache_stable_region_ttl_1h"
+    )
+
+    assert field.field_type == "boolean"
+    assert field.required is False
+    # No declared default: "unset -- use the provider's own default" must be
+    # a real, distinguishable third state in the wizard, not force-collapsed
+    # into an explicit True/False choice.
+    assert field.default is None
+    assert field.requires_model is False
+    # Both fields are pre-model, so this show_when is evaluated with
+    # enable_prompt_caching already collected -- see provider_config_utils.py.
+    assert field.show_when == {"enable_prompt_caching": "true"}
+
+
+def test_cache_stable_region_ttl_1h_absent_key_still_defaults_to_false():
+    """An absent config key (the wizard's own encoding of 'leave unset') must
+    continue to resolve to the same False the module has always used."""
+    provider = _make_provider()
+    assert "cache_stable_region_ttl_1h" not in provider.config
+    assert provider.cache_stable_region_ttl_1h is False
+    assert "extended-cache-ttl-2025-04-11" not in provider._beta_headers
+
+
 # ---------------------------------------------------------------------------
 # Empty text blocks must never carry a cache breakpoint
 # ---------------------------------------------------------------------------
