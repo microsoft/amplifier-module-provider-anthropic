@@ -708,9 +708,10 @@ def test_cache_stable_region_ttl_1h_config_field_advertised():
     # into an explicit True/False choice.
     assert field.default is None
     assert field.requires_model is False
-    # Both fields are pre-model, so this show_when is evaluated with
-    # enable_prompt_caching already collected -- see provider_config_utils.py.
-    assert field.show_when == {"enable_prompt_caching": "true"}
+    # show_when REMOVED (A-04): enable_prompt_caching is no longer a
+    # ConfigField (demoted to settings-only), so the condition could never
+    # be satisfied in the wizard.
+    assert field.show_when is None
 
 
 def test_cache_stable_region_ttl_1h_absent_key_still_defaults_to_false():

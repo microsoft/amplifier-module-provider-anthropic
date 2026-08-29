@@ -43,10 +43,11 @@ config = {
     default_model = "claude-sonnet-5",
     max_tokens = 8192,
     temperature = 1.0,   # Silently ignored by models without sampling support (sonnet-5, opus-4.7+)
-    debug = false,      # Enable standard debug events
-    raw_debug = false   # Enable ultra-verbose raw API I/O logging
+    raw = false          # Include full request/response payloads in llm:* events
 }
 ```
+
+See the [Configuration Reference](#configuration-reference) table below for every surviving key.
 
 ### Reasoning Effort
 
@@ -102,28 +103,12 @@ chain is what enables thinking.
 - This key is exposed through `amplifier provider use` (shown for thinking-capable
   models), so it can be set interactively without hand-editing YAML.
 
-### Debug Configuration
+### Debug / Raw Payload Capture
 
-**Standard Debug** (`debug: true`):
-- Emits `llm:request:debug` and `llm:response:debug` events
-- Contains request/response summaries with message counts, model info, usage stats
-- Moderate log volume, suitable for development
-
-**Raw Debug** (`debug: true, raw_debug: true`):
-- Emits `llm:request:raw` and `llm:response:raw` events
-- Contains complete, unmodified request params and response objects
-- Extreme log volume, use only for deep provider integration debugging
-- Captures the exact data sent to/from Anthropic API before any processing
-
-**Example**:
-```yaml
-providers:
-  - module: provider-anthropic
-    config:
-      debug: true      # Enable debug events
-      raw_debug: true  # Enable raw API I/O capture
-      default_model: claude-sonnet-4-5
-```
+`debug` and `raw_debug` never existed as real keys -- this section documented
+them in error for a long time. The real key is `raw` (boolean, default
+`false`): when `true`, full request/response payloads are attached to the
+`llm:request` / `llm:response` events for inspection.
 
 ### Retry and Error Handling
 
@@ -181,7 +166,7 @@ providers:
       max_retries: 5
       min_retry_delay: 1.0
       max_retry_delay: 60.0
-      retry_jitter: 0.2
+      retry_jitter: true
       overloaded_delay_multiplier: 10.0
 ```
 
@@ -190,7 +175,7 @@ providers:
 | `max_retries` | `5` | Maximum retry attempts before giving up |
 | `min_retry_delay` | `1.0` | Base delay in seconds for the first retry |
 | `max_retry_delay` | `60.0` | Cap on the base delay (before multiplier) |
-| `retry_jitter` | `0.2` | Jitter fraction (0.0–1.0). Also accepts `true` (→ 0.2) or `false` (→ 0.0) for backward compatibility |
+| `retry_jitter` | `true` | Randomise each retry delay to avoid thundering-herd retries. **Boolean.** A numeric value such as `0.2` is parsed as `false` and disables jitter -- use `true`/`false` |
 | `overloaded_delay_multiplier` | `10.0` | Multiplier applied to delays for 529 Overloaded errors |
 
 #### Events
@@ -286,21 +271,18 @@ providers:
 
 ### 1M Token Context Window
 
-Claude Sonnet 4.5 supports a 1M token context window when the `context-1m-2025-08-07` beta header is enabled:
+1M context is **generally available, on by default, and billed at standard
+pricing** on every model that has it (Opus 5/4.8/4.7/4.6, Sonnet 5/4.6, Fable
+5, Mythos 5/Preview). No beta header is required, and there is no
+long-context price premium
+([Anthropic: Context windows](https://platform.claude.com/en/docs/build-with-claude/context-windows),
+verified 2026-08-29). Those models cap output at **128K tokens** per request
+regardless of context size.
 
-```yaml
-providers:
-  - module: provider-anthropic
-    config:
-      default_model: claude-sonnet-4-5
-      beta_headers: "context-1m-2025-08-07"
-      max_tokens: 8192  # Output tokens remain separate from context window
-```
-
-With this configuration:
-- **Context window**: Up to 1M tokens of input (messages, tools, system prompt)
-- **Output tokens**: Controlled by `max_tokens` (separate from context window)
-- **Use case**: Process large codebases, extensive documentation, or long conversation histories
+The `enable_1m_context` config key does **not** change what the API accepts.
+It only sets the context window this provider *advertises* to Amplifier's
+context manager (200K vs 1M), which determines how much conversation history
+is kept per request -- a cost decision. It defaults to `false`.
 
 ### Notes
 
@@ -309,6 +291,36 @@ With this configuration:
 - Beta headers are optional - existing configurations work unchanged
 - Invalid beta headers will cause API errors (fail fast)
 - Beta header usage is logged at initialization for observability
+
+## Configuration Reference
+
+House-style key reference. ✅ = wizard-visible ConfigField, ⚙️ = settings-only (fully functional, not asked in the wizard).
+
+| Key | Default | Surface | Description |
+|---|---|---|---|
+| `api_key` | *(env `ANTHROPIC_API_KEY`)* | ✅ | Anthropic API key |
+| `base_url` | `https://api.anthropic.com` | ✅ | Custom endpoint |
+| `default_model` | `claude-sonnet-5` | *(model picker)* | Model used when a request does not name one |
+| `reasoning_effort` | *(unset)* | ✅ | `low`\|`medium`\|`high`\|`xhigh`\|`max`. Enables extended thinking. Legacy alias: `effort` (deprecated) |
+| `enable_1m_context` | `false` | ✅ | Advertise the 1M context window (more history kept = higher cost) |
+| `cache_stable_region_ttl_1h` | *(unset)* | ✅ | 1h cache TTL for system prompt + tools. 2x write cost, fewer writes |
+| `enable_prompt_caching` | `true` | ⚙️ | Place cache breakpoints |
+| `max_tokens` | *(model ceiling)* | ⚙️ | Output token cap |
+| `temperature` | `0.7` | ⚙️ | Ignored by non-sampling models (Sonnet 5, Opus 4.7+) |
+| `timeout` | `600.0` | ⚙️ | API timeout, seconds |
+| `priority` | `100` | ⚙️ | Provider selection priority (lower wins) |
+| `raw` | `false` | ⚙️ | Include full request/response payloads in `llm:request`/`llm:response` events |
+| `fallback_on_overload` | `false` | ⚙️ | Downgrade one ladder rung (fable/mythos → opus → sonnet → haiku) after persistent 529s |
+| `fallback_retry_count` | `2` | ⚙️ | 529 retries before downgrading |
+| `fallback_cooldown_seconds` | `300` | ⚙️ | How long a downgrade window stays open |
+| `fallback_models` | *(unset)* | ⚙️ | Per-family target overrides, e.g. `{opus: claude-opus-4-8}` |
+| `persist_fallback_state` | `false` | ⚙️ | Share downgrade windows across processes |
+| `refusal_fallback_enabled` | `true` | ⚙️ | Retry once on `finish_reason="refusal"`, via the same ladder as overload |
+| `extra_request_params` | *(unset)* | ⚙️ | Escape hatch for Messages API params this provider doesn't model; merged last, user-wins |
+
+Removed keys (still recognized, warn with a migration message): `fallback_sonnet_model`,
+`fallback_haiku_model` (use `fallback_models`), `refusal_fallback_model` (refusal fallback
+now follows the same ladder as overload -- see Fallback section).
 
 ## Environment Variables
 

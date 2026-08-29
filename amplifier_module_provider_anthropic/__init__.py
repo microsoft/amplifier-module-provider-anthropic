@@ -1325,7 +1325,7 @@ class AnthropicProvider:
                     id="api_key",
                     display_name="API Key",
                     field_type="secret",
-                    prompt="Enter your Anthropic API key",
+                    prompt="Anthropic API key",
                     env_var="ANTHROPIC_API_KEY",
                 ),
                 ConfigField(
@@ -1341,14 +1341,15 @@ class AnthropicProvider:
                     id="enable_1m_context",
                     display_name="1M Context Window",
                     field_type="boolean",
-                    prompt="Request 1M token context window when the selected model supports it",
+                    prompt=(
+                        "Use the full 1M-token context window "
+                        "(more context kept per request = higher cost)"
+                    ),
                     required=False,
                     # Default flipped true -> false alongside the constructor
                     # default (both must change together or the wizard and
                     # the constructor disagree) -- see the enable_1m_context
                     # comment in __init__ for the full C-01/C-02 rationale.
-                    # Prompt text is reworded in the wizard-slimming commit
-                    # later in this series (A-03).
                     default="false",
                     requires_model=True,  # Shown after model selection
                     show_when={
@@ -1356,24 +1357,29 @@ class AnthropicProvider:
                     },  # Hide for Haiku (doesn't support 1M)
                 ),
                 ConfigField(
-                    id="enable_prompt_caching",
-                    display_name="Prompt Caching",
-                    field_type="boolean",
-                    prompt="Enable prompt caching? (Reduces cost by 90% on cached tokens)",
+                    # Canonical key -- matches the kernel's portable
+                    # request.reasoning_effort and the key used by the shipped
+                    # routing matrices. ConfigField.id is written verbatim into
+                    # settings.yaml, so this must be the canonical name, never
+                    # the legacy "effort" alias.
+                    id="reasoning_effort",
+                    display_name="Reasoning Effort",
+                    field_type="choice",
+                    choices=["low", "medium", "high", "xhigh", "max"],
+                    prompt="Reasoning effort -- higher is smarter, slower, costlier",
                     required=False,
-                    default="true",
+                    requires_model=True,  # Shown after model selection
+                    # Gate on the EFFECT surface (extended thinking), not on
+                    # output_config support: effort enables/sizes thinking on
+                    # every thinking-capable model, so hide it only for models
+                    # that don't support thinking at all (pre-4.5 Haiku).
+                    show_when={"default_model": "not_contains:haiku-3"},
                 ),
                 ConfigField(
                     id="cache_stable_region_ttl_1h",
                     display_name="1-Hour Cache TTL (Stable Regions)",
                     field_type="boolean",
-                    prompt=(
-                        "1-hour cache TTL for stable regions (system prompt + "
-                        "tools). Writes cost 2x vs 1.25x for the default "
-                        "5-minute TTL -- pays off when calls are >5 min apart "
-                        "or sessions are long. Leave unset for the 5-minute "
-                        "default."
-                    ),
+                    prompt="1-hour cache TTL -- 2x write cost, fewer writes",
                     required=False,
                     # No declared default -- an unset field is a real,
                     # visible third state ("use provider default") distinct
@@ -1386,106 +1392,12 @@ class AnthropicProvider:
                     # False)` above, so behavior is unchanged either way.
                     default=None,
                     requires_model=False,
-                    # Only meaningful once prompt caching itself is on --
-                    # both fields are pre-model, so enable_prompt_caching is
-                    # already collected by the time this is evaluated.
-                    show_when={"enable_prompt_caching": "true"},
-                ),
-                ConfigField(
-                    # Canonical key — matches the kernel's portable
-                    # request.reasoning_effort and the key used by the shipped
-                    # routing matrices. ConfigField.id is written verbatim into
-                    # settings.yaml, so this must be the canonical name, never
-                    # the legacy "effort" alias.
-                    id="reasoning_effort",
-                    display_name="Reasoning Effort",
-                    field_type="choice",
-                    choices=["low", "medium", "high", "xhigh", "max"],
-                    prompt=(
-                        "Default reasoning effort applied to every request. Like "
-                        "request.reasoning_effort, this ENABLES extended thinking "
-                        "and sets its depth, so it raises token cost on every call "
-                        "\u2014 leave blank unless you want stronger reasoning by default. "
-                        "low/medium/high work on all thinking-capable models; xhigh "
-                        "requires Opus 4.7+; max requires Opus 4.8+/Sonnet 4.6. "
-                        "On Opus 4.7+ it is also sent as output_config.effort. "
-                        "Unsupported values for the selected model are ignored."
-                    ),
-                    required=False,
-                    requires_model=True,  # Shown after model selection
-                    # Gate on the EFFECT surface (extended thinking), not on
-                    # output_config support: effort enables/sizes thinking on
-                    # every thinking-capable model, so hide it only for models
-                    # that don't support thinking at all (pre-4.5 Haiku).
-                    show_when={"default_model": "not_contains:haiku-3"},
-                ),
-                ConfigField(
-                    id="fallback_on_overload",
-                    display_name="Temporary Overload Downgrade",
-                    field_type="boolean",
-                    prompt="Downgrade temporarily if a higher-tier Claude model stays overloaded?",
-                    required=False,
-                    default="false",
-                    requires_model=True,
-                    show_when={
-                        "default_model": "not_contains:haiku"
-                    },  # No lower Anthropic family exists below Haiku
-                ),
-                ConfigField(
-                    id="fallback_retry_count",
-                    display_name="Retries Before Downgrade",
-                    field_type="text",
-                    prompt="How many overload retries before downgrading?",
-                    required=False,
-                    default="1",
-                    requires_model=True,
-                    show_when={"fallback_on_overload": "true"},
-                ),
-                ConfigField(
-                    id="fallback_cooldown_seconds",
-                    display_name="Downgrade Cooldown (seconds)",
-                    field_type="text",
-                    prompt="How long should the downgrade stay active before retrying the higher model?",
-                    required=False,
-                    default="1800",
-                    requires_model=True,
-                    show_when={"fallback_on_overload": "true"},
-                ),
-                ConfigField(
-                    id="persist_fallback_state",
-                    display_name="Share Downgrade State",
-                    field_type="boolean",
-                    prompt="Persist temporary downgrade state across separate Amplifier processes?",
-                    required=False,
-                    default="false",
-                    requires_model=True,
-                    show_when={"fallback_on_overload": "true"},
-                ),
-                ConfigField(
-                    id="fallback_sonnet_model",
-                    display_name="Opus Fallback Model",
-                    field_type="text",
-                    prompt="Model to use when Opus is overloaded",
-                    required=False,
-                    default="claude-sonnet-4-6",
-                    requires_model=True,
-                    show_when={
-                        "fallback_on_overload": "true",
-                        "default_model": "contains:opus",
-                    },
-                ),
-                ConfigField(
-                    id="fallback_haiku_model",
-                    display_name="Sonnet Fallback Model",
-                    field_type="text",
-                    prompt="Model to use when Sonnet is overloaded",
-                    required=False,
-                    default="claude-haiku-4-5",
-                    requires_model=True,
-                    show_when={
-                        "fallback_on_overload": "true",
-                        "default_model": "not_contains:haiku",
-                    },
+                    # show_when REMOVED (A-04): enable_prompt_caching is no
+                    # longer a ConfigField (demoted to settings-only below),
+                    # so the condition could never be satisfied in the
+                    # wizard. The inert combination (this on, prompt caching
+                    # off) is already handled loudly by the constructor
+                    # guard, which logs and continues.
                 ),
             ],
         )
