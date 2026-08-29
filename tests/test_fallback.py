@@ -529,7 +529,19 @@ class TestTemporaryFallbackOnOverload:
         ]
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_429_overloaded_body_also_triggers_fallback(self, mock_sleep):
+    def test_429_overloaded_body_does_not_trigger_fallback(self, mock_sleep):
+        """Inverts the pre-overhaul behavior: a 429 (rate_limit_error) is
+        per-account, per Anthropic's own error docs
+        (platform.claude.com/docs/en/api/errors, verified 2026-08-29) --
+        "Your organization has hit a rate limit, reached its usage tier's
+        monthly spend cap, or reached a spend limit". A lower-tier model
+        draws on the SAME org quota, so downgrading cannot help. The
+        previous substring test for "overload"/"overloaded" in a 429 body
+        is removed: a 429 now always falls through to the FULL retry
+        budget on the SAME model (exponential backoff honoring
+        retry-after), never a downgrade -- regardless of what the error
+        body's text happens to contain.
+        """
         provider = _make_provider(
             "claude-opus-4-6",
             fallback_on_overload=True,
@@ -540,7 +552,7 @@ class TestTemporaryFallbackOnOverload:
             side_effect=[
                 _make_sdk_rate_limit_overloaded_error(),
                 _make_sdk_rate_limit_overloaded_error(),
-                _make_raw_success("claude-sonnet-5"),
+                _make_raw_success("claude-opus-4-6"),
             ]
         )
 
@@ -551,8 +563,9 @@ class TestTemporaryFallbackOnOverload:
             call.kwargs["model"]
             for call in provider.client.messages.with_raw_response.create.await_args_list
         ]
+        # Every attempt stays on the SAME model -- never downgraded.
         assert models == [
             "claude-opus-4-6",
             "claude-opus-4-6",
-            "claude-sonnet-5",
+            "claude-opus-4-6",
         ]

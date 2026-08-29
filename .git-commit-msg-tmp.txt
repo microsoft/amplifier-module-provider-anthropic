@@ -1,89 +1,75 @@
-feat(fallback)!: family ladder fable/mythos -> opus -> sonnet -> haiku
+fix(fallback)!: a 429 is per-account -- back off, never downgrade; refusal fallback follows the same ladder
 
-Replaces the hardcoded if/elif fallback-target resolution with an
-explicit successor map (_FALLBACK_NEXT_FAMILY) walked downward from the
-requested model's family, skipping any unusable rung instead of
-terminating the whole ladder there. Fixes three defects, reproduced
-against a fresh clone before this change:
+**B-06 -- 429 is not overload.** `_is_overload_fallback_error` classified
+a 429 as an overload trigger when its body happened to contain the
+substring "overload"/"overloaded". Per Anthropic's error docs
+(platform.claude.com/docs/en/api/errors, verified 2026-08-29): a 429 is
+`rate_limit_error` -- "Your organization has hit a rate limit, reached
+its usage tier's monthly spend cap, or reached a spend limit" -- i.e.
+PER-ACCOUNT. A lower-tier model draws on the SAME org quota, so
+downgrading cannot relieve it; it only hides the real fix (back off,
+ramp up gradually, or raise the quota). The substring branch is deleted
+entirely -- a 429 now always falls through to the full retry budget on
+the SAME model (exponential backoff honoring retry-after), which is the
+documented correct response. No new code path was required; deleting
+the 429 branch is sufficient.
 
-  - D-1: fable (and any non-opus/sonnet family) returned None --
-    completely dead. The owner's live `fable` instance has fallback
-    fully configured (fallback_on_overload, retry_count, cooldown,
-    both target models) and NONE of it did anything. This is the
-    release's headline fix: fable -> opus -> sonnet -> haiku all now
-    resolve.
-  - D-2: a blank or self-referential target terminated the ladder
-    instead of walking to the rung below it.
-  - D-3: targets were hardcoded config-default strings
-    (claude-sonnet-4-6) that go stale the moment a newer model ships.
-    Target resolution is now three-source: `fallback_models` config
-    override (settings-only, per-family map, replacing the two deleted
-    scalar keys) -> a live "newest model per family" cache warmed for
-    free as a side effect of any list_models() call (or once,
-    best-effort, healthy-path-only, via _warm_family_latest) ->
-    _STATIC_FALLBACK_MODELS backstop, which always resolves and can
-    never silently die the way `fable` did.
+**B-07 -- refusal fallback: owner-adjudicated Q-1, option (a).**
+Decision: the fable->opus->sonnet->haiku downgrade ladder now applies to
+BOTH fallback types -- overload AND refusal. Rationale (owner's, recorded
+here verbatim): (1) Anthropic's own guidance for a refusal is to retry
+with a less-restrictive model, i.e. downward, not up to the most
+expensive tier; (2) there is a product expectation that fallback never
+lands on a model MORE expensive than the one the user selected -- which
+the old hardcoded refusal-escalation target (always claude-opus-4-8)
+actually violated for sonnet/haiku users. This is not a pure regression:
+inspection shows both `opus` instances' refusal fallback was ALREADY
+silently dead under the old chain (opus -> claude-opus-4-8 -> same
+family -> None).
 
-Also lands, in the same commit (interlocked with the ladder):
+`refusal_fallback_model` (the explicit hardcoded-escalation override) is
+RETIRED ENTIRELY -- not merely defaulted to None with an override path
+retained. `_refusal_fallback_target` now delegates straight to
+`_fallback_target_for_model`, using the EXACT SAME three-source
+resolution as overload fallback (fallback_models override -> live
+list_models cache -> static backstop, skipping unusable rungs).
+`refusal_fallback_enabled` remains the gate, default unchanged. Haiku
+refusal is now terminal -- the refusal surfaces normally, exactly as a
+haiku response always has. Thinking-block stripping on the refusal
+retry (`_strip_thinking_blocks`) is unchanged and still runs -- still
+required cross-model. The key moves to _INERT_CONFIG_KEY_MESSAGES with
+a targeted migration message naming the replacement mechanism.
 
-  - B-02/X-2: `mythos` added to _detect_family and _get_capabilities.
-    claude-mythos-5 previously fell through to "sonnet" (wrong
-    capability row, wrong context window, wrong ladder position, wrong
-    fallback target) -- Anthropic ships Mythos 5 as a top-tier,
-    1M-context, 128K-output family priced identically to Fable 5.
-    Enters the ladder as fable's PEER (both step down to opus), not
-    between fable and opus.
-  - B-08: a mount-time LOUD warning when fallback_on_overload is
-    enabled on an instance whose default_model is already the ladder's
-    terminal rung (haiku) -- there is no lower tier, so the setting has
-    no effect. The wizard already hides this ConfigField for Haiku, so
-    this specifically catches hand-edited settings.yaml.
-  - B-09: corrected defaults. fallback_retry_count 1 -> 2,
-    fallback_cooldown_seconds 1800.0 -> 300.0 -- matching what 4 of the
-    owner's 5 real instances already set explicitly by hand (a
-    30-minute cooldown after a transient capacity blip stranded a whole
-    session on a downgraded model long after real capacity returned).
-  - C-04: `fallback_sonnet_model` / `fallback_haiku_model` retired.
-    Superseded by `fallback_models` (a per-family map: `{opus:
-    claude-opus-4-8, sonnet: ..., haiku: ...}`). Both keys move to
-    _INERT_CONFIG_KEY_MESSAGES with a targeted migration message naming
-    the replacement -- the four owner instances that set them get an
-    actionable warning at mount, not silence. Their ConfigField wizard
-    entries are removed later in this series (A-08), once the wizard
-    slims to 5 fields.
+Deviation from the draft spec, called out explicitly per task
+instruction: the spec's own text for "option (a)" retained
+`refusal_fallback_model` as a still-functional override that "wins" over
+the ladder (so an owner could set it on sonnet/haiku to preserve the old
+escalation behavior). The owner's adjudication supersedes that: the key
+is removed entirely, with no override path -- refusal fallback follows
+the ladder unconditionally once refusal_fallback_enabled is true. This
+also means T-B16 as originally specified ("explicit refusal_fallback_model
+still wins over the ladder") does not apply; it is replaced with tests
+asserting the key is retired and inert, and that refusal fallback uses
+the same fallback_models-based resolution as overload.
 
-New tests (tests/test_fallback_ladder.py, new file): T-B01/T-B02 (fable
-resolves and the full 4-rung walk), T-B03 (haiku terminal, regression
-guard), T-B04 (an unusable/self-referential rung is skipped, not
-fatal -- the actual D-2 fix; plus a companion test showing a truly
-*blank* override falls through to the static backstop rather than being
-treated as a disabled rung), T-B05/T-B06 (fallback_models override and
-live-cache precedence), T-B07/T-B08 (_warm_family_latest error
-swallowing and at-most-once), T-B12 (terminal-family mount warning),
-T-B13/T-B14 (mythos family detection and capabilities), T-B17 (cycle
-guard), T-B18 (corrected defaults). 20 new tests.
-
-New test (tests/test_migration_owner_instances.py, new file): the
-release's actual migration merge gate -- mounts each of the owner's 5
-real settings.yaml instances verbatim and asserts ONLY the expected
-targeted inert-key warnings fire (fallback_sonnet_model /
-fallback_haiku_model where set) and zero generic unknown-key
-warnings. Extended in a later commit once refusal_fallback_model also
-retires.
-
-Updated tests (tests/test_fallback.py): three existing tests asserted
-the OLD hardcoded fallback target (`claude-sonnet-4-6`, the previous
-config default). The ladder's static backstop is now
-`claude-sonnet-5` (the newest GA sonnet as of 2026-08-29) --
-test_529_opus_overload_falls_back_to_sonnet,
-test_persisted_breaker_state_is_used_by_fresh_provider, and
-test_429_overloaded_body_also_triggers_fallback (whose 429-triggers-fallback
-*logic* is inverted in the next commit; only its expected model id is
-fixed here) updated to match.
+New/updated tests: tests/test_fallback_ladder.py gains T-B15 (refusal on
+opus resolves to the ladder's claude-sonnet-5 target, not the old
+claude-opus-4-8, and not None). tests/test_fallback.py's
+`test_429_overloaded_body_also_triggers_fallback` is INVERTED to
+`test_429_overloaded_body_does_not_trigger_fallback` -- every attempt now
+stays on the same model. tests/test_refusal_fallback.py rewritten:
+the fallback-target assertion updates from the hardcoded
+claude-opus-4-8 to the ladder's claude-sonnet-5 (fable's actual next
+rung); the same-family loop-guard test is rebuilt against a pathological
+`fallback_models` override (since the old `refusal_fallback_model`
+override no longer exists to construct the scenario with); a new
+terminal-rung test confirms haiku refusals have no fallback target; a
+new test confirms the refusal ladder shares fallback_models' override
+precedence with overload fallback.
 
 Part of the config-surface + fallback-ladder + docs-alignment overhaul.
-Spec: anthropic-surface-spec.md B-01..B-04, B-08, B-09, C-04, B-02/X-2
-(commit 5/9).
+Spec: anthropic-surface-spec.md B-06, B-07 (owner-adjudicated Q-1,
+option (a) as amended) (commit 6/9).
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 

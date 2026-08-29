@@ -1,19 +1,30 @@
-"""Tests for the refusal-fallback-to-opus feature.
+"""Tests for the refusal-fallback feature.
 
 When a model returns finish_reason="refusal", complete() retries exactly once
-against a configured fallback model (default: claude-opus-4-8), with
-thinking/redacted_thinking blocks stripped from assistant messages in the
-retried request. Non-refusal responses pass through untouched, and the
-fallback is skipped entirely when disabled or when it would route onto a
-model in the same family that just refused (loop guard).
+against the SAME fallback ladder overload fallback uses (owner-adjudicated:
+refusal fallback is not a separate escalation path -- it downgrades one rung,
+resolved via the same three-source precedence: fallback_models override ->
+live list_models cache -> static backstop), with thinking/redacted_thinking
+blocks stripped from assistant messages in the retried request (still
+required cross-model). Non-refusal responses pass through untouched, and the
+fallback is skipped entirely when disabled, or when the ladder is exhausted
+(haiku, the terminal rung), or when a rung would route onto a model in the
+same family that just refused (loop guard, e.g. via a pathological
+fallback_models override).
+
+The old `refusal_fallback_model` explicit-override key (a hardcoded
+escalation target, always Opus) is RETIRED -- see
+test_config_surface.py / _INERT_CONFIG_KEY_MESSAGES for its migration
+message.
 
 Covers:
-  (a) Refusal triggers exactly one fallback call to the configured model;
-      the fallback response is returned.
+  (a) Refusal triggers exactly one fallback call to the ladder's resolved
+      target; the fallback response is returned.
   (b) Non-refusal responses are returned untouched; no fallback call made.
   (c) _refusal_fallback_target returns None when disabled via config.
-  (d) _refusal_fallback_target returns None when the configured target
-      resolves to the same family as the refusing model (loop guard).
+  (d) _refusal_fallback_target returns None when the ladder is exhausted
+      (haiku, terminal) or a pathological fallback_models override would
+      route onto the same family that just refused (loop guard).
   (e) _strip_thinking_blocks does not mutate the original request, only
       removes thinking/redacted_thinking blocks from assistant messages,
       and leaves everything else untouched.
@@ -102,8 +113,10 @@ def test_refusal_triggers_single_fallback_call_with_thinking_stripped():
 
     _, second_call = provider._complete_chat_request.await_args_list
 
-    # Second (fallback) call goes to the configured fallback model.
-    assert second_call.kwargs["model"] == "claude-opus-4-8"
+    # Second (fallback) call goes to the ladder's resolved target for
+    # fable's next-lower rung (opus) -- the static backstop, since no
+    # fallback_models override or live cache entry is set.
+    assert second_call.kwargs["model"] == "claude-opus-5"
 
     # The fallback request has thinking/redacted_thinking stripped from the
     # assistant message, other content untouched.
@@ -146,13 +159,35 @@ def test_refusal_fallback_target_none_when_disabled():
 
 
 # ---------------------------------------------------------------------------
-# (d) _refusal_fallback_target returns None on same-family loop guard
+# (d) _refusal_fallback_target returns None on ladder exhaustion / loop guard
 # ---------------------------------------------------------------------------
+def test_refusal_fallback_target_none_when_ladder_exhausted_at_haiku():
+    """haiku is the ladder's terminal rung -- a haiku refusal has no
+    fallback target and surfaces normally."""
+    provider = _make_provider("claude-haiku-4-5-20251001")
+    assert provider._refusal_fallback_target("claude-haiku-4-5-20251001") is None
+
+
 def test_refusal_fallback_target_none_when_same_family():
+    """A pathological fallback_models override that resolves back into the
+    same family as the refusing model is rejected by the ladder's
+    same-family guard, exactly like overload fallback's."""
     provider = _make_provider(
-        "claude-opus-4-5", refusal_fallback_model="claude-opus-4-1"
+        "claude-opus-4-5",
+        fallback_models={"sonnet": "claude-opus-4-1"},  # still "opus" family
     )
-    assert provider._refusal_fallback_target("claude-opus-4-5") is None
+    # opus -> sonnet override resolves to an opus-family id -> rejected ->
+    # walk continues to haiku, which IS a valid (different-family) target.
+    assert provider._refusal_fallback_target("claude-opus-4-5") == "claude-haiku-4-5"
+
+
+def test_refusal_fallback_uses_same_target_resolution_as_overload():
+    """The refusal ladder resolves through the exact same three-source
+    precedence as overload fallback: fallback_models override wins."""
+    provider = _make_provider(
+        "claude-opus-4-5", fallback_models={"sonnet": "claude-sonnet-4-6"}
+    )
+    assert provider._refusal_fallback_target("claude-opus-4-5") == "claude-sonnet-4-6"
 
 
 # ---------------------------------------------------------------------------

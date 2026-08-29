@@ -679,7 +679,6 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "fallback_state_path",
         "fallback_models",
         "refusal_fallback_enabled",
-        "refusal_fallback_model",
         "throttle_threshold",
         "throttle_delay",
         "rate_limit_state_path",
@@ -739,6 +738,13 @@ _INERT_CONFIG_KEY_MESSAGES: dict[str, str] = {
     "fallback_haiku_model": (
         "removed -- see fallback_sonnet_model. Use "
         "`fallback_models: {haiku: <model-id>}` to pin a target."
+    ),
+    "refusal_fallback_model": (
+        "removed -- refusals now follow the same never-more-expensive "
+        "downgrade ladder as overload (fable/mythos -> opus -> sonnet -> "
+        "haiku), resolved via `fallback_models` the same way overload "
+        "fallback is. `refusal_fallback_enabled` still gates whether a "
+        "refusal is retried at all."
     ),
 }
 _RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = frozenset(_INERT_CONFIG_KEY_MESSAGES)
@@ -1030,14 +1036,17 @@ class AnthropicProvider:
                 )
 
         # Refusal fallback: when a model returns finish_reason="refusal", retry
-        # once against a configured fallback model (default: Opus). Orthogonal
-        # to the overload-fallback machinery above -- this is a single-shot
-        # retry triggered by response content, not by request errors.
+        # once against the SAME fallback ladder overload fallback uses.
+        # Orthogonal to the overload-fallback machinery above -- this is a
+        # single-shot retry triggered by response content, not by request
+        # errors. `refusal_fallback_model` (a hardcoded escalation target,
+        # always Opus) is RETIRED (owner-adjudicated): refusals now follow
+        # the same never-more-expensive downgrade ladder as overload,
+        # resolved via the same three-source precedence
+        # (fallback_models override -> live list_models cache -> static
+        # backstop). See _refusal_fallback_target.
         self._refusal_fallback_enabled = self._config_bool(
             self.config.get("refusal_fallback_enabled", True)
-        )
-        self._refusal_fallback_model = self.config.get(
-            "refusal_fallback_model", "claude-opus-4-8"
         )
 
         # Pre-emptive throttle configuration
@@ -2358,25 +2367,31 @@ class AnthropicProvider:
         return None
 
     def _refusal_fallback_target(self, current_model: str) -> str | None:
-        """Resolve the configured refusal-fallback model, or None if fallback
-        should not be attempted (disabled, unconfigured, or would fall back
-        onto a model in the same family that just refused)."""
+        """Resolve the model to retry against after a refusal.
+
+        Owner-adjudicated: uses the SAME ladder as overload fallback --
+        refusal fallback is not a separate escalation path (the old
+        default hardcoded every family to Opus, which on inspection was
+        already silently dead for both `opus` instances: opus ->
+        claude-opus-4-8 -> same family -> None). Refusals now downgrade one
+        rung exactly like overload, via the same three-source target
+        resolution (fallback_models override -> live list_models cache ->
+        static backstop, skipping unusable rungs). Rationale: Anthropic's
+        own guidance for a refusal is to retry with a less-restrictive
+        model (i.e. downward, not up to the most expensive tier), and
+        fallback should never land on a model MORE expensive than the one
+        the user selected -- which the old hardcoded Opus-escalation
+        target violated for sonnet/haiku users. `refusal_fallback_model`
+        (the old explicit-override escape hatch) is RETIRED; see
+        _INERT_CONFIG_KEY_MESSAGES.
+
+        haiku is the ladder's terminal rung, so a haiku refusal has no
+        fallback target -- the refusal surfaces normally, exactly as
+        before for that instance.
+        """
         if not self._refusal_fallback_enabled:
             return None
-        target = self._refusal_fallback_model
-        if not target:
-            return None
-        target = str(target)
-        current_family = self._get_capabilities(current_model).family
-        target_family = self._get_capabilities(target).family
-        if target_family == current_family:
-            logger.warning(
-                "[PROVIDER] Ignoring invalid refusal fallback %s -> %s (same family)",
-                current_model,
-                target,
-            )
-            return None
-        return target
+        return self._fallback_target_for_model(current_model)
 
     @staticmethod
     def _strip_thinking_blocks(request: ChatRequest) -> ChatRequest:
@@ -2400,14 +2415,32 @@ class AnthropicProvider:
 
     @staticmethod
     def _is_overload_fallback_error(error: KernelLLMError) -> bool:
-        """Return True when the error indicates model overload, not generic throttling."""
+        """True only for genuine CAPACITY errors, which a downgrade can relieve.
+
+        529 (overloaded_error) is capacity pressure "across all users"
+        (platform.claude.com/docs/en/api/errors, verified 2026-08-29) -- a
+        lower-tier model is a different capacity pool, so the ladder helps.
+
+        429 (rate_limit_error) is NOT capacity. Per the same page it means
+        the ORGANIZATION hit a rate limit, a usage-tier spend cap, or a
+        workspace spend limit -- and "in rare cases, if your organization
+        has a sharp increase in usage, you might see 429 errors because of
+        acceleration limits ... ramp up your traffic gradually". Every one
+        of those is per-account: the lower-tier model draws on the SAME
+        org quota, so downgrading cannot help and merely hides the real
+        fix (back off / ramp gradually / raise the quota). The previous
+        substring test for "overload" in a 429 body is removed for that
+        reason -- a 429 now always falls through to the full retry budget
+        on the SAME model (exponential backoff honoring retry-after),
+        which is the documented correct response.
+
+        Spend-cap caveat, worth noting here: a tier spend-cap 429 has no
+        retry-after header and keeps failing until access resumes.
+        Retrying that is futile but harmless and bounded by max_retries;
+        detecting it specifically is out of scope.
+        """
         status_code = getattr(error, "status_code", None)
-        if isinstance(error, KernelProviderUnavailableError) and status_code == 529:
-            return True
-        if isinstance(error, KernelRateLimitError) and status_code == 429:
-            msg = str(error).lower()
-            return "overload" in msg or "overloaded" in msg
-        return False
+        return isinstance(error, KernelProviderUnavailableError) and status_code == 529
 
     def _resolve_effective_model(
         self, requested_model: str

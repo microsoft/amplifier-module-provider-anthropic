@@ -228,6 +228,16 @@ def test_ladder_cycle_guard_returns_none_and_warns(caplog):
     assert result == "claude-haiku-4-5"
 
 
+def test_refusal_on_opus_resolves_to_ladder_target():
+    """T-B15: a refusal on an opus model resolves to the ladder's target
+    (claude-sonnet-5, the static backstop) -- not the old hardcoded
+    claude-opus-4-8 escalation target, and not None (both opus instances'
+    refusal fallback was silently dead under the old
+    opus->claude-opus-4-8->same-family->None chain)."""
+    provider = _make_provider("claude-opus-5")
+    assert provider._refusal_fallback_target("claude-opus-5") == "claude-sonnet-5"
+
+
 def test_fallback_ladder_defaults_corrected():
     """T-B18: fallback_retry_count defaults to 2 (was 1), fallback_cooldown_seconds
     defaults to 300.0 (was 1800.0) -- matching 4 of the owner's 5 real instances."""
