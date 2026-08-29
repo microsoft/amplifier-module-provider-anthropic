@@ -485,6 +485,12 @@ class ModelCapabilities:
     supports_manual_thinking: bool = (
         True  # False on Opus 4.7+ (type="enabled" returns HTTP 400)
     )
+    manual_thinking_deprecated: bool = (
+        False  # True = type="enabled" still works (HTTP 200) but is deprecated --
+        # verified live 2026-08-29 (T-C08-live) on Opus 4.6. Only meaningful
+        # when supports_manual_thinking is True (the two never both apply on
+        # the same model: 4.7+/5+ already hard-gate to adaptive).
+    )
     supports_output_config: bool = False  # True = model accepts output_config.effort
     supports_sampling: bool = True  # False = temperature silently ignored by model
     thinking_display_required: bool = (
@@ -515,6 +521,12 @@ class ModelCapabilities:
         # None means this model does not support the tool at all.
     )
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
+    min_cacheable_tokens: int = (
+        1024  # Below this, the API silently skips caching (no error) --
+        # platform.claude.com/en/docs/build-with-claude/prompt-caching,
+        # verified 2026-08-29. Per-family values set explicitly below;
+        # this is only the dataclass fallback.
+    )
 
 
 @dataclass(frozen=True)
@@ -1126,17 +1138,23 @@ class AnthropicProvider:
         # Default OFF. The system prompt + tool definitions are the most stable,
         # least-often-changing part of the request, so a 1h TTL is *structurally*
         # justified for them (unlike the conversation region, which changes most
-        # turns). But it is not free: (a) Anthropic bills 1h-TTL cache *writes*
-        # at a higher multiplier than the 5m default, and (b) it requires opting
-        # in to the `extended-cache-ttl-2025-04-11` beta header. Rather than
+        # turns). But it is not free: Anthropic bills 1h-TTL cache *writes* at a
+        # higher (2x vs 1.25x) multiplier than the 5m default. Rather than
         # silently changing billing behavior, this stays opt-in until a
         # deployment has measured that its system prompt is stable long enough
         # (and reused often enough) for the longer TTL to pay for itself.
         #
-        # NOTE: the beta header this requires is registered just below, once
-        # `self._beta_headers` exists (see "Beta headers support") -- and only
-        # when `enable_prompt_caching` is also on, since the knob has no
-        # effect at all when caching itself is disabled.
+        # C-10: NO beta header is required or sent for this. Anthropic's
+        # prompt-caching docs (platform.claude.com/en/docs/build-with-claude/
+        # prompt-caching, verified 2026-08-29) document the mechanism as the
+        # `ttl` field alone: "To use the extended cache, include ttl in the
+        # cache_control definition". The `extended-cache-ttl-2025-04-11` beta
+        # header does not appear anywhere on that page, and was confirmed live
+        # (2026-08-29) to be unnecessary: a request with `ttl: "1h"` and no
+        # beta header produces `cache_creation.ephemeral_1h_input_tokens > 0`
+        # exactly as expected. Sending it is harmless (also confirmed live --
+        # no 400), but there is no reason to keep code that adds a header the
+        # current docs don't mention.
         self.cache_stable_region_ttl_1h = self._config_bool(
             self.config.get("cache_stable_region_ttl_1h", False)
         )
@@ -1176,24 +1194,16 @@ class AnthropicProvider:
                 else list(beta_headers_config)
             )
 
-        if self.cache_stable_region_ttl_1h:
-            if self.enable_prompt_caching:
-                _ttl_beta = "extended-cache-ttl-2025-04-11"
-                if _ttl_beta not in self._beta_headers:
-                    self._beta_headers.append(_ttl_beta)
-            else:
-                # The knob only affects cache breakpoints, which are never
-                # placed at all when prompt caching is off -- sending the
-                # beta header in that state would be pure noise (and would
-                # silently opt the account into 1h-TTL billing semantics for
-                # a feature that never fires). Log once so a user who set
-                # this expecting an effect isn't left guessing why nothing
-                # changed.
-                logger.info(
-                    "[PROVIDER] cache_stable_region_ttl_1h is set but "
-                    "enable_prompt_caching is False -- the 1h cache TTL "
-                    "knob has no effect without prompt caching enabled."
-                )
+        if self.cache_stable_region_ttl_1h and not self.enable_prompt_caching:
+            # The knob only affects cache breakpoints, which are never
+            # placed at all when prompt caching is off. Log once so a user
+            # who set this expecting an effect isn't left guessing why
+            # nothing changed.
+            logger.info(
+                "[PROVIDER] cache_stable_region_ttl_1h is set but "
+                "enable_prompt_caching is False -- the 1h cache TTL "
+                "knob has no effect without prompt caching enabled."
+            )
 
         if self._beta_headers:
             # Build anthropic-beta header value (comma-separated)
@@ -1785,6 +1795,7 @@ class AnthropicProvider:
                 # enabled", HTTP 400, 2026-08-03) — the tool-support question
                 # itself could not be asked live. Left at the conservative
                 # dataclass default (False/None) rather than assumed.
+                min_cacheable_tokens=512,
                 capability_tags=(
                     "tools",
                     "thinking",
@@ -1826,9 +1837,7 @@ class AnthropicProvider:
                 supports_speed=False,
                 supports_inline_system=True,
                 default_thinking_budget=0,  # not used — adaptive only
-                # min_cacheable_tokens (2048 if is_preview else 512) is added
-                # to this branch in the docs-alignment commit that adds the
-                # field to ModelCapabilities (C-08).
+                min_cacheable_tokens=2048 if is_preview else 512,
                 capability_tags=(
                     "tools",
                     "thinking",
@@ -1839,9 +1848,11 @@ class AnthropicProvider:
             )
 
         if family == "opus":
+            is_45_plus = not version_known or (major, minor) >= (4, 5)
             is_46_plus = not version_known or (major, minor) >= (4, 6)
             is_47_plus = not version_known or (major, minor) >= (4, 7)
             is_48_plus = not version_known or (major, minor) >= (4, 8)
+            is_5_plus = not version_known or (major, minor) >= (5, 0)
             # Computer-use wire type, live-probed against api.anthropic.com
             # 2026-08-03 (bare {"type": ..., "name": "computer", "display_width_px":
             # 1024, "display_height_px": 768} declarations, matching anthropic-beta
@@ -1870,15 +1881,36 @@ class AnthropicProvider:
                 supports_thinking=True,
                 supports_adaptive_thinking=is_46_plus,
                 supports_manual_thinking=not is_47_plus,
-                supports_output_config=is_47_plus,
+                # Deprecated (still HTTP 200, verified live 2026-08-29,
+                # T-C08-live) on the one version where supports_manual_thinking
+                # is still True but the API considers "enabled" legacy: 4.6.
+                # 4.7+ already hard-gates to adaptive, so the two flags never
+                # both apply on the same model.
+                manual_thinking_deprecated=is_46_plus and not is_47_plus,
+                # Widened from is_47_plus to is_45_plus (X-1/Q-2): Anthropic's
+                # docs state the compatibility set directly --
+                # "Supported models: ... Opus 4.5, 4.6, 4.7, 4.8, and 5 ..."
+                # (platform.claude.com/en/docs/build-with-claude/effort,
+                # verified 2026-08-29). Confirmed live (T-C06-live, merge
+                # gate): output_config.effort="max" -> HTTP 200 on
+                # claude-opus-4-6.
+                supports_output_config=is_45_plus,
                 supports_task_budget=is_47_plus,
                 supports_sampling=not is_47_plus,
                 thinking_display_required=is_47_plus,
+                # xhigh: Fable 5/Mythos 5/Opus 5/4.8/4.7/Sonnet 5 (doc:
+                # "Available on Claude Fable 5, Claude Mythos 5, Claude Opus
+                # 5, Claude Opus 4.8, Claude Opus 4.7, and Claude Sonnet 5").
+                # max: the above PLUS Opus 4.6 and Sonnet 4.6 (doc's own
+                # explanation: "xhigh is a newer level; some models that
+                # support max don't support xhigh"). Both verified against
+                # platform.claude.com/en/docs/build-with-claude/effort,
+                # 2026-08-29.
                 supported_efforts=(
                     ("low", "medium", "high", "xhigh", "max")
-                    if is_48_plus
-                    else ("low", "medium", "high", "xhigh")
                     if is_47_plus
+                    else ("low", "medium", "high", "max")
+                    if is_46_plus
                     else ("low", "medium", "high")
                 ),
                 supports_speed=is_48_plus,
@@ -1886,6 +1918,21 @@ class AnthropicProvider:
                 default_thinking_budget=64000 if is_46_plus else 32000,
                 supports_native_computer_use=computer_use_tool_type is not None,
                 computer_use_tool_type=computer_use_tool_type,
+                # Non-monotonic by design -- 4.6->4096, 4.7->2048, 4.8->1024,
+                # 5->512 -- verified against
+                # platform.claude.com/en/docs/build-with-claude/prompt-caching,
+                # 2026-08-29. Written as an explicit descending version
+                # chain, not a >= threshold, so a future "simplification"
+                # doesn't flatten a real non-monotonic API constraint.
+                min_cacheable_tokens=(
+                    512
+                    if is_5_plus
+                    else 1024
+                    if is_48_plus
+                    else 2048
+                    if is_47_plus
+                    else 4096
+                ),
                 capability_tags=(
                     "tools",
                     "thinking",
@@ -1945,15 +1992,33 @@ class AnthropicProvider:
                 supports_thinking=True,
                 supports_adaptive_thinking=is_46_plus,
                 supports_manual_thinking=not is_5_plus,
-                supports_output_config=is_5_plus,
+                # Deprecated (still HTTP 200) but not yet hard-gated on 4.6 --
+                # mirrors the opus branch's manual_thinking_deprecated. 5+
+                # already hard-gates to adaptive via supports_manual_thinking.
+                manual_thinking_deprecated=is_46_plus and not is_5_plus,
+                # Widened from is_5_plus to is_46_plus (X-1/Q-2): doc states
+                # "Supported models: ... Sonnet 4.6 and 5"
+                # (platform.claude.com/en/docs/build-with-claude/effort,
+                # verified 2026-08-29). Confirmed live (T-C06-live, merge
+                # gate): output_config.effort="max" -> HTTP 200 on
+                # claude-sonnet-4-6.
+                supports_output_config=is_46_plus,
                 supports_task_budget=is_5_plus,
                 thinking_display_required=is_5_plus,
                 # Sonnet 5 rejects `temperature` ("deprecated for this model");
                 # omit it, matching the Opus 4.7+ pattern. amplifier-support#299.
                 supports_sampling=not is_5_plus,
+                # xhigh: Sonnet 5 only (doc: "Available on ... Claude Sonnet
+                # 5"). max: Sonnet 5 AND Sonnet 4.6 (doc: "some models that
+                # support max don't support xhigh" -- Sonnet 4.6 is exactly
+                # that case). Both verified against
+                # platform.claude.com/en/docs/build-with-claude/effort,
+                # 2026-08-29.
                 supported_efforts=(
                     ("low", "medium", "high", "xhigh", "max")
                     if is_5_plus
+                    else ("low", "medium", "high", "max")
+                    if is_46_plus
                     else ("low", "medium", "high")
                 ),
                 default_thinking_budget=32000,
@@ -1987,6 +2052,7 @@ class AnthropicProvider:
                 default_thinking_budget=32000 if is_45_plus else 0,
                 supports_native_computer_use=computer_use_tool_type is not None,
                 computer_use_tool_type=computer_use_tool_type,
+                min_cacheable_tokens=4096,
                 capability_tags=("tools", "streaming", "json_mode", "fast", "vision")
                 + (("thinking",) if is_45_plus else ()),
             )

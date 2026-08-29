@@ -1,54 +1,107 @@
-fix(docs-align)!: 1M context is GA -- delete the beta-header path
+fix(caps): correct xhigh/max gating, widen output_config, deprecate manual thinking on x.6, drop extended-cache-ttl header
 
-Verified against platform.claude.com/en/docs/build-with-claude/context-windows
-on 2026-08-29: "For every model with a 1M-token context window, 1M is the
-default: you don't need a beta header, and long-context requests are
-billed at standard pricing." The string "context-1m" appears zero times
-on that page.
+All four items in this commit were gated on live merge-gate probes run
+against the real Anthropic API before implementation, per the release
+plan -- results recorded below and in the PR body.
 
-C-01: deletes `_should_add_context_1m_beta` entirely (it computed which
-models still needed the header, on a version threshold that was already
-wrong -- Sonnet 4.5 was included when Anthropic's own docs say it has a
-200K window, not 1M), deletes the `BETA_HEADER_1M_CONTEXT` constant, and
-deletes the call site in `_build_request_beta_headers`. The now-unused
-`model_id` parameter is removed from `_build_request_beta_headers`'s
-signature and its one call site (verified via grep that no other caller
-depends on it).
+**C-05 -- corrected xhigh/max effort gating.** Anthropic's own docs
+(platform.claude.com/en/docs/build-with-claude/effort, verified
+2026-08-29) place the xhigh/max split at 4.6/4.7, not 4.7/4.8 as the
+pre-overhaul code assumed:
+  - xhigh: Fable 5, Mythos 5, Opus 5/4.8/4.7, Sonnet 5
+  - max: all of the above PLUS Opus 4.6 and Sonnet 4.6 (the doc's own
+    explanation: "xhigh is a newer level; some models that support max
+    don't support xhigh")
+  Opus branch: `is_47_plus` gets xhigh+max (was is_48_plus for max,
+  is_47_plus for xhigh-only); Opus 4.6 gains `max`. Sonnet branch:
+  Sonnet 4.6 gains `max` (previously neither).
 
-C-02/A-03: `enable_1m_context`'s constructor default flips `True` ->
-`False`, with the ConfigField's declared default flipped to match in the
-same commit (both must change together or the wizard and the
-constructor disagree; the ConfigField's prompt text reword is deferred
-to the wizard-slimming commit later in this series). A comment at the
-assignment site encodes the no-premium-tier invariant so cost modeling
-never re-adds a long-context price tier: `enable_1m_context`'s only
-remaining effect is the ADVERTISED context window handed to the context
-manager (how much history is kept per request), which is a cost
-decision, not a capability one -- it no longer changes what the API
-will accept or send.
+**C-06 (scope expansion X-1, owner-adjudicated Q-2 = yes, GATED on
+live probe) -- widened supports_output_config.** Was `is_47_plus`
+(opus) / `is_5_plus` (sonnet); without this, C-05's `max` addition to
+Opus 4.6/Sonnet 4.6 would be INERT (output_config.effort is only
+emitted when supports_output_config is True). Doc: "Supported models:
+... Opus 4.5, 4.6, 4.7, 4.8, and 5 ... Sonnet 4.6 and 5." Widened to
+`is_45_plus` (opus) / `is_46_plus` (sonnet).
+  MERGE-GATE PROBE (T-C06-live, run against api.anthropic.com,
+  max_tokens=16): `output_config: {"effort": "max"}` on both
+  claude-sonnet-4-6 and claude-opus-4-6 -> HTTP 200 on both. PASS --
+  shipped as specified.
 
-Test changes:
-  - tests/test_fallback.py: 3 of the 4 existing 1M-beta-header tests are
-    deleted (they asserted the header's conditional presence, which no
-    longer exists at all); the 4th
-    (test_enable_1m_context_does_not_become_global_beta_header) is
-    RE-POINTED to test_enable_1m_context_never_adds_a_beta_header --
-    asserting the real invariant (no 1M header, ever, for any value of
-    enable_1m_context) rather than the narrower "not a GLOBAL header"
-    claim. A new end-to-end variant confirms no header reaches a live
-    request either.
-  - tests/test_model_capabilities.py: TestContextBetaHeaderOpus48 (which
-    asserted the header's presence threshold) is replaced with
-    TestContextBetaHeaderNeverSent (the header is absent for every
-    version, opus included). TestFastModeBetaHeader and
-    TestSpeedConfigPlumbing updated to drop the now-removed `model_id=`
-    kwarg from `_build_request_beta_headers` call sites.
-  - tests/test_opus_47.py: TestBetaHeader1MFix (8 tests asserting the
-    now-deleted `_should_add_context_1m_beta`'s per-version threshold
-    behavior) is removed; a comment points to its replacement coverage.
+**C-07 -- manual-thinking deprecation tier (owner-adjudicated Q-3 =
+CONSERVATIVE, GATED on live probe).** New `manual_thinking_deprecated`
+capability field, True for Opus 4.6 and Sonnet 4.6 specifically (the
+one version where `supports_manual_thinking` is still True but the API
+already considers `type="enabled"` legacy -- 4.7+/5+ already hard-gate
+to adaptive via the existing `supports_manual_thinking=False` path, so
+the two flags never both apply on the same model). When
+`thinking.type="enabled"` reaches the wire on a deprecated-tier model,
+`_build_params` now logs a loud deprecation warning naming the adaptive
+migration path -- the hard 400-on-4.7+/5+ gate is UNCHANGED (per the
+conservative adjudication: the request still sends `type="enabled"` on
+4.6, it is not silently coerced).
+  MERGE-GATE PROBE (T-C08-live, max_tokens=1040, budget_tokens=1024):
+  `thinking: {"type": "enabled", "budget_tokens": 1024}` on
+  claude-opus-4-6 -> HTTP 200 (thinking block returned). PASS --
+  confirms "deprecated but working"; shipped as specified.
+
+**C-08 -- min_cacheable_tokens capability data (C-09: decline the
+behavioral gate).** New field on ModelCapabilities, populated per family
+from Anthropic's prompt-caching page (verified 2026-08-29): fable/mythos
+512 (mythos preview 2048), opus non-monotonic 512(5+)/1024(4.8)/2048(4.7)/
+4096(4.6, written as an explicit descending chain, not a >= threshold,
+so a future "simplification" doesn't flatten a real non-monotonic API
+constraint), sonnet 1024 flat, haiku 4096. Per C-09's recommendation,
+deliberately NO client-side gate is added to suppress cache_control
+placement below this threshold: the API's own failure mode is already
+optimal ("processed without caching, and no error is returned" --
+Anthropic docs) at zero cost, while a client-side gate would require
+counting tokens before every request to avoid a cost that is already
+zero. Data lands for diagnostics/README only.
+
+**C-10 -- extended-cache-ttl-2025-04-11 beta header dropped (GATED on
+live probe, two-part).** The header appears zero times on Anthropic's
+current prompt-caching docs; the documented mechanism is the `ttl`
+field on `cache_control` alone.
+  MERGE-GATE PROBE (T-C10-live, part A, max_tokens=16, ~8000-char
+  system block, ttl:"1h", NO beta header): HTTP 200,
+  usage.cache_creation.ephemeral_1h_input_tokens=4293 (>0),
+  ephemeral_5m_input_tokens=0 -> the 1h TTL is honored WITHOUT the
+  header -> header not required.
+  MERGE-GATE PROBE (part B, same request WITH the header): HTTP 200,
+  cache_read_input_tokens=4293 (reused the part-A write) -> the header
+  is also harmless to keep, but is undocumented and unnecessary. Per the
+  probe's own decision rule (part A PASS -> DROP), the header-append
+  logic for `cache_stable_region_ttl_1h` is removed entirely; the knob's
+  behavior (opt-in 1h TTL on system/tool cache breakpoints) is
+  unchanged.
+
+Test changes (re-baselining the largest mechanical surface in the
+release, as flagged in the spec's own risk table):
+  - tests/test_model_capabilities.py: test_opus_47_no_max_effort ->
+    test_opus_47_has_xhigh_and_max (inverted); test_opus_5_capabilities_
+    match_opus_48_gate updated for the one EXPECTED non-monotonic
+    exception (min_cacheable_tokens: Opus 5=512, Opus 4.8=1024) instead
+    of whole-object equality; test_sonnet_46_unchanged_by_sonnet5_gate
+    updated for Sonnet 4.6 now getting `max` + output_config + the
+    deprecation flag.
+  - tests/test_opus_47.py: test_opus_46_no_output_config inverted to
+    test_opus_46_output_config_now_supported; test_opus_47_supported_
+    efforts and test_opus_46_no_xhigh updated for the corrected xhigh/max
+    split; test_opus_47_invalid_effort_omits_output_config re-targeted at
+    a value outside ANY model's supported_efforts (since 'max' -- its old
+    example -- is now valid on Opus 4.7); test_task_budget_ignored_on_
+    unsupported_model updated to assert the task_budget sub-key is absent
+    rather than output_config as a whole (which now legitimately exists).
+  - tests/test_reasoning_effort.py: test_opus_47_max_still_logs_
+    original_gate_b_warning_only inverted to test_opus_47_max_now_
+    supported_no_gate_b_warning.
+  - tests/test_prompt_cache_breakpoints.py: updated to assert the
+    extended-cache-ttl header is ABSENT.
 
 Part of the config-surface + fallback-ladder + docs-alignment overhaul.
-Spec: anthropic-surface-spec.md C-01, C-02, A-03 (default only) (commit 7/9).
+Spec: anthropic-surface-spec.md C-05, C-06 (X-1/Q-2), C-07 (Q-3), C-08,
+C-09, C-10 (commit 8/9).
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 

@@ -902,9 +902,7 @@ class TestUndifferentiatedEffortWarning:
 
         assert not any("has no effect on" in r.message for r in caplog.records)
 
-    def test_xhigh_on_sonnet_5_does_not_warn_and_still_sets_output_config(
-        self, caplog
-    ):
+    def test_xhigh_on_sonnet_5_does_not_warn_and_still_sets_output_config(self, caplog):
         """Regression guard: on a model WITH output_config support, xhigh is
         NOT degenerate -- no new warning, and output_config.effort is still
         set (behavior unchanged)."""
@@ -925,29 +923,30 @@ class TestUndifferentiatedEffortWarning:
         params = _get_api_params(provider.client.messages.with_raw_response.create)
         assert params["output_config"] == {"effort": "xhigh"}
 
-    def test_opus_47_max_still_logs_original_gate_b_warning_only(self, caplog):
-        """Regression guard: Opus 4.7 supports output_config, so the NEW
-        warning must not fire. The ORIGINAL Gate B warning ('max' not in
-        Opus 4.7's supported_efforts) must still fire, and output_config must
-        still be omitted -- no double-warning."""
-        import logging
-
+    def test_opus_47_max_now_supported_no_gate_b_warning(self, caplog):
+        """C-05 correction: Opus 4.7 now legitimately supports 'max' (the
+        doc's xhigh/max split is at 4.6/4.7, not 4.7/4.8 as pre-overhaul
+        code assumed). The original Gate B warning ('max' not supported)
+        must NOT fire anymore -- it would be a false warning about a value
+        that is now valid -- and output_config must be emitted, not
+        omitted."""
         provider = _make_provider(default_model="claude-opus-4-7-20260416")
         provider.client.messages.with_raw_response.create = AsyncMock(
             return_value=_make_raw_mock()
         )
         request = ChatRequest(
             messages=[Message(role="user", content="Hello")],
-            reasoning_effort="max",  # not in supported_efforts for 4.7
+            reasoning_effort="max",
         )
+        import logging
+
         with caplog.at_level(logging.WARNING):
             asyncio.run(provider.complete(request))
 
         params = _get_api_params(provider.client.messages.with_raw_response.create)
-        assert "output_config" not in params
+        assert params["output_config"] == {"effort": "max"}
 
-        # Original Gate B warning still fires unchanged
-        assert any(
+        assert not any(
             "not supported by" in r.message and "omitting output_config" in r.message
             for r in caplog.records
         )
@@ -1097,9 +1096,7 @@ class TestExtendedThinkingFalseSuppressesOutputConfig:
         )
 
         request = ChatRequest(messages=[Message(role="user", content="Hello")])
-        asyncio.run(
-            provider.complete(request, extended_thinking=False, effort="high")
-        )
+        asyncio.run(provider.complete(request, extended_thinking=False, effort="high"))
 
         params = _get_api_params(provider.client.messages.with_raw_response.create)
         assert params["output_config"] == {"effort": "high"}
