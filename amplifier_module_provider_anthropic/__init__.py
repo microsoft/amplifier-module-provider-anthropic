@@ -96,6 +96,49 @@ def _route_wire_only_params(params: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
+# Messages API parameters the installed SDK exposes as TYPED keyword
+# arguments. Anything NOT in this set must travel in extra_body: passing an
+# unknown keyword raises "got an unexpected keyword argument", which
+# _do_complete's catch-all translates into a RETRYABLE KernelLLMError -- so a
+# permanent config typo would be retried max_retries times before surfacing.
+# See the _WIRE_ONLY_PARAMS comment above for the incident this prevents.
+#
+# Verified live against the INSTALLED SDK (anthropic==1.0.0, this repo's
+# floor pin) via inspect.signature(AsyncMessages.create) -- not assumed from
+# API docs. `top_k`, `top_p`, and `betas` are NOT present on 1.0.0's typed
+# surface (the same fate as `temperature`, already documented above: dropped
+# from the typed Messages surface in the 1.0.0 major bump) -- listing them
+# here would route a config value onto the typed surface and reproduce
+# exactly the unexpected-keyword-argument retry bug this allowlist exists to
+# prevent. Guarded by test_sdk_contract.py::TestTypedRequestParamsMatchSdkSignature,
+# which fails loud on any future SDK drift instead of silently trusting this
+# list.
+_TYPED_REQUEST_PARAMS: frozenset[str] = frozenset(
+    {
+        "model",
+        "messages",
+        "max_tokens",
+        "system",
+        "tools",
+        "tool_choice",
+        "stop_sequences",
+        "stream",
+        "metadata",
+        "thinking",
+        "output_config",
+        "service_tier",
+        "cache_control",
+        "container",
+        "inference_geo",
+        "user_profile_id",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
+        "timeout",
+    }
+)
+
+
 @dataclass
 class WebSearchContent:
     """Content block for web search results from native Anthropic web search."""
@@ -615,6 +658,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "cache_stable_region_ttl_1h",
         "enable_web_search",
         "beta_headers",
+        "extra_request_params",
         # --- deferred: read in _build_params (:3056-3230 pre-overhaul) ---
         "thinking_budget_tokens",
         "thinking_budget_buffer",
@@ -914,6 +958,22 @@ class AnthropicProvider:
         self._max_concurrent_requests = self._config_int(
             self.config.get("max_concurrent_requests"), 5
         )
+
+        # extra_request_params: the documented escape hatch for Messages API
+        # parameters this provider does not model. Merged into `params` LAST
+        # (see _merge_extra_request_params / _build_params), so it overrides
+        # every value the provider computed -- deliberately. Never a
+        # ConfigField; settings-only.
+        _extra = self.config.get("extra_request_params") or {}
+        if not isinstance(_extra, dict):
+            raise ValueError(  # noqa: TRY004 -- mount-time config-validation contract
+                f"Invalid config 'extra_request_params'={_extra!r} for "
+                f"provider-anthropic: must be a mapping of Messages API "
+                f"parameter names to values (got {type(_extra).__name__}). "
+                f"Fix the provider config (settings.yaml / bundle config block)."
+            )
+        self.extra_request_params: dict[str, Any] = dict(_extra)
+        self._extra_params_warned_keys: set[str] = set()
 
         # Use streaming API by default to support large context windows (Anthropic requires streaming
         # for operations that may take > 10 minutes, e.g. with 300k+ token contexts)
@@ -2895,6 +2955,42 @@ class AnthropicProvider:
 
         return [block]
 
+    def _merge_extra_request_params(self, params: dict[str, Any]) -> None:
+        """Merge config ``extra_request_params`` into *params*, user-wins-loudly.
+
+        Known typed params go onto the typed surface; everything else goes
+        into extra_body, where the API will see it on the wire without the
+        SDK ever inspecting it. Whoever sets this owns the consequences.
+
+        Must run BEFORE ``_route_wire_only_params`` (see the call site in
+        ``_complete_chat_request``): a user-supplied ``temperature`` or
+        ``speed`` would otherwise land back on the typed SDK surface,
+        reproducing the exact "got an unexpected keyword argument" retry
+        bug ``_route_wire_only_params`` exists to prevent.
+        """
+        if not self.extra_request_params:
+            return
+        for key, value in self.extra_request_params.items():
+            if key in _TYPED_REQUEST_PARAMS:
+                if (
+                    key in params
+                    and params[key] != value
+                    and key not in self._extra_params_warned_keys
+                ):
+                    self._extra_params_warned_keys.add(key)
+                    logger.warning(
+                        "[PROVIDER] extra_request_params overrides provider-computed "
+                        "'%s' (%r -> %r).",
+                        key,
+                        params[key],
+                        value,
+                    )
+                params[key] = value
+            else:
+                extra_body = dict(params.get("extra_body") or {})
+                extra_body[key] = value  # user-wins: overwrite, NOT setdefault
+                params["extra_body"] = extra_body
+
     async def _complete_chat_request(
         self,
         request: ChatRequest,
@@ -3439,6 +3535,12 @@ class AnthropicProvider:
             extra_headers = dict(params.get("extra_headers", {}))
             extra_headers["anthropic-beta"] = ",".join(request_beta_headers)
             params["extra_headers"] = extra_headers
+
+        # The documented escape hatch, merged LAST -- after every provider-computed
+        # value, and BEFORE _route_wire_only_params so that a user-supplied
+        # `temperature`/`speed` is relocated to extra_body by the same router that
+        # handles the provider's own.
+        self._merge_extra_request_params(params)
 
         # Move wire-only params off the typed SDK surface. Must be the last
         # mutation of `params` before the call -- everything above may still

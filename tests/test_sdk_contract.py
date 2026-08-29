@@ -32,7 +32,7 @@ from anthropic.resources.messages import AsyncMessages
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message
 
-from amplifier_module_provider_anthropic import AnthropicProvider
+from amplifier_module_provider_anthropic import _TYPED_REQUEST_PARAMS, AnthropicProvider
 
 from tests._helpers import DummyResponse, FakeCoordinator
 
@@ -133,3 +133,26 @@ class TestBuiltParamsBindToSdkSignature:
                     f"AsyncMessages.{method.__name__}() on the installed anthropic "
                     f"SDK: {exc}"
                 ) from exc
+
+
+class TestTypedRequestParamsMatchSdkSignature:
+    """T-D15: every name _merge_extra_request_params treats as "typed"
+    must actually be a parameter the installed SDK's create() accepts --
+    otherwise a config key routed onto the typed surface would raise
+    "unexpected keyword argument" and trigger the retry-storm bug
+    extra_request_params exists to avoid.
+    """
+
+    def test_typed_request_params_subset_of_create_signature(self):
+        sdk_params = set(inspect.signature(AsyncMessages.create).parameters)
+        # `messages.create()` is a keyword-only method on `self`; drop the
+        # non-parameter names inspect always reports (args/kwargs catch-alls
+        # are absent here, so this is just documentation of intent).
+        missing = _TYPED_REQUEST_PARAMS - sdk_params
+        assert not missing, (
+            f"_TYPED_REQUEST_PARAMS names not present on the installed SDK's "
+            f"AsyncMessages.create() signature: {missing}. Routing one of "
+            f"these onto the typed surface would raise 'unexpected keyword "
+            f"argument' and trigger the 5x retry-storm bug this allowlist "
+            f"exists to prevent."
+        )

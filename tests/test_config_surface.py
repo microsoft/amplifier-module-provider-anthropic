@@ -10,12 +10,16 @@ Spec: anthropic-surface-spec.md, Workstream D (\u00a75), test plan \u00a78.1
 (test_config_surface.py, T-D01..T-D15).
 """
 
+import asyncio
 import logging
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_anthropic import _CONSUMED_CONFIG_KEYS
 from amplifier_module_provider_anthropic import AnthropicProvider
+from tests._helpers import DummyResponse
 
 # ---------------------------------------------------------------------------
 # The owner's 5 live provider-anthropic settings.yaml instances, verbatim
@@ -298,3 +302,96 @@ def test_extra_known_config_keys_subclass_extension_point(caplog):
     with caplog.at_level(logging.WARNING):
         _SubclassProvider(api_key="test-key", config={"my_custom_key": "value"})
     assert not any("Unknown config key" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# D-07 -- extra_request_params escape hatch (typed / extra_body routing)
+# ---------------------------------------------------------------------------
+
+
+def _capture_params(provider: AnthropicProvider) -> dict:
+    captured: dict = {}
+
+    async def _fake_create(**params):
+        captured.update(params)
+        raw = MagicMock()
+        raw.parse = AsyncMock(return_value=DummyResponse())
+        raw.headers = {}
+        return raw
+
+    provider.client.messages.with_raw_response.create = AsyncMock(
+        side_effect=_fake_create
+    )
+    return captured
+
+
+def _run_complete(provider: AnthropicProvider) -> dict:
+    params = _capture_params(provider)
+    messages = [
+        Message(role="user", content="question"),
+        Message(role="assistant", content="answer"),
+    ]
+    request = ChatRequest(messages=messages)
+
+    async def _go():
+        await provider.complete(request)
+        await provider.close()
+
+    asyncio.run(_go())
+    return params
+
+
+def test_extra_request_params_typed_key_lands_on_typed_surface():
+    """T-D10: a known typed param (e.g. service_tier) lands directly on
+    params, not routed into extra_body."""
+    provider = _make_provider(
+        {"use_streaming": False, "extra_request_params": {"service_tier": "standard"}}
+    )
+    params = _run_complete(provider)
+    assert params.get("service_tier") == "standard"
+
+
+def test_extra_request_params_unknown_key_routes_to_extra_body():
+    """T-D11: an unrecognized key must NOT reach the typed SDK surface --
+    it goes into extra_body, where an unexpected-keyword TypeError (and
+    the 5x retry storm it triggers) cannot happen."""
+    provider = _make_provider(
+        {"use_streaming": False, "extra_request_params": {"an_unknown_param": 1}}
+    )
+    params = _run_complete(provider)
+    assert "an_unknown_param" not in params
+    assert params.get("extra_body", {}).get("an_unknown_param") == 1
+
+
+def test_extra_request_params_temperature_routes_to_extra_body():
+    """T-D12: extra_request_params merges BEFORE _route_wire_only_params,
+    so a user-supplied `temperature` still ends up in extra_body rather
+    than reintroducing the SDK unexpected-kwarg bug."""
+    provider = _make_provider(
+        {"use_streaming": False, "extra_request_params": {"temperature": 0.3}}
+    )
+    params = _run_complete(provider)
+    assert "temperature" not in params
+    assert params.get("extra_body", {}).get("temperature") == 0.3
+
+
+def test_extra_request_params_override_warns_exactly_once(caplog):
+    """T-D13: overriding a provider-computed value warns once per key per
+    provider instance, not once per call (primary + continuation)."""
+    provider = _make_provider(
+        {"use_streaming": False, "extra_request_params": {"max_tokens": 111}}
+    )
+    with caplog.at_level(logging.WARNING):
+        _run_complete(provider)
+        _run_complete(provider)
+    override_warnings = [
+        r.message for r in caplog.records if "overrides provider-computed" in r.message
+    ]
+    assert len(override_warnings) == 1
+
+
+def test_extra_request_params_non_dict_raises_at_mount():
+    """T-D14: a non-mapping extra_request_params raises ValueError at
+    mount, naming settings.yaml so the fix is obvious."""
+    with pytest.raises(ValueError, match="extra_request_params"):
+        _make_provider({"extra_request_params": "nope"})
