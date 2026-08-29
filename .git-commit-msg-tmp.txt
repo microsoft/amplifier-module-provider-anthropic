@@ -1,53 +1,89 @@
-feat(config): extra_request_params escape hatch with typed/extra_body routing
+feat(fallback)!: family ladder fable/mythos -> opus -> sonnet -> haiku
 
-Ports the extra_request_params pattern from provider-openai's v2 overhaul,
-adapted for Anthropic's typed SDK surface. Settings-only (never a
-ConfigField), merged into params LAST so it overrides every
-provider-computed value -- deliberately, since whoever sets this owns the
-consequences.
+Replaces the hardcoded if/elif fallback-target resolution with an
+explicit successor map (_FALLBACK_NEXT_FAMILY) walked downward from the
+requested model's family, skipping any unusable rung instead of
+terminating the whole ladder there. Fixes three defects, reproduced
+against a fresh clone before this change:
 
-The Anthropic wrinkle: unlike provider-openai (whose Responses API client
-tolerates extra kwargs), an unrecognized keyword here raises "got an
-unexpected keyword argument", which _do_complete's catch-all translates
-into a RETRYABLE KernelLLMError -- so a permanent config typo would be
-retried max_retries times before surfacing. This module already carries
-the scar (see the _WIRE_ONLY_PARAMS comment for `temperature`/`speed`).
-So extra_request_params routes PER KEY: known typed params land on the
-typed surface, everything else goes to extra_body. The merge runs BEFORE
-_route_wire_only_params, so a user-supplied `temperature` still ends up
-relocated to extra_body by the same router that handles the provider's
-own -- merging after it would reintroduce the exact bug this avoids.
+  - D-1: fable (and any non-opus/sonnet family) returned None --
+    completely dead. The owner's live `fable` instance has fallback
+    fully configured (fallback_on_overload, retry_count, cooldown,
+    both target models) and NONE of it did anything. This is the
+    release's headline fix: fable -> opus -> sonnet -> haiku all now
+    resolve.
+  - D-2: a blank or self-referential target terminated the ladder
+    instead of walking to the rung below it.
+  - D-3: targets were hardcoded config-default strings
+    (claude-sonnet-4-6) that go stale the moment a newer model ships.
+    Target resolution is now three-source: `fallback_models` config
+    override (settings-only, per-family map, replacing the two deleted
+    scalar keys) -> a live "newest model per family" cache warmed for
+    free as a side effect of any list_models() call (or once,
+    best-effort, healthy-path-only, via _warm_family_latest) ->
+    _STATIC_FALLBACK_MODELS backstop, which always resolves and can
+    never silently die the way `fable` did.
 
-Deviation from the draft spec, found by this commit's own SDK-contract
-test: the spec's _TYPED_REQUEST_PARAMS list included `top_k`, `top_p`,
-and `betas`, none of which are present on the installed SDK's typed
-surface (anthropic==1.0.0, this repo's floor pin) -- verified via
-inspect.signature(AsyncMessages.create), not assumed. They met the same
-fate as `temperature`: dropped from the typed Messages surface in the
-1.0.0 major bump. Listing them as "typed" would have routed a config
-value onto the typed surface and reproduced the exact
-unexpected-keyword-argument retry bug this allowlist exists to prevent.
-Replaced with the four typed params the installed SDK actually has that
-the draft list missed: `cache_control`, `container`, `inference_geo`,
-`user_profile_id`. Guarded going forward by
-test_sdk_contract.py::TestTypedRequestParamsMatchSdkSignature, which
-fails loud on any future SDK drift instead of silently trusting the list.
+Also lands, in the same commit (interlocked with the ladder):
 
-Also adds `extra_request_params` to _CONSUMED_CONFIG_KEYS (D-01/D-04) --
-omitting it would have made every user of this new key see a false
-"Unknown config key" warning from the sweep landed in commit 3.
+  - B-02/X-2: `mythos` added to _detect_family and _get_capabilities.
+    claude-mythos-5 previously fell through to "sonnet" (wrong
+    capability row, wrong context window, wrong ladder position, wrong
+    fallback target) -- Anthropic ships Mythos 5 as a top-tier,
+    1M-context, 128K-output family priced identically to Fable 5.
+    Enters the ladder as fable's PEER (both step down to opus), not
+    between fable and opus.
+  - B-08: a mount-time LOUD warning when fallback_on_overload is
+    enabled on an instance whose default_model is already the ladder's
+    terminal rung (haiku) -- there is no lower tier, so the setting has
+    no effect. The wizard already hides this ConfigField for Haiku, so
+    this specifically catches hand-edited settings.yaml.
+  - B-09: corrected defaults. fallback_retry_count 1 -> 2,
+    fallback_cooldown_seconds 1800.0 -> 300.0 -- matching what 4 of the
+    owner's 5 real instances already set explicitly by hand (a
+    30-minute cooldown after a transient capacity blip stranded a whole
+    session on a downgraded model long after real capacity returned).
+  - C-04: `fallback_sonnet_model` / `fallback_haiku_model` retired.
+    Superseded by `fallback_models` (a per-family map: `{opus:
+    claude-opus-4-8, sonnet: ..., haiku: ...}`). Both keys move to
+    _INERT_CONFIG_KEY_MESSAGES with a targeted migration message naming
+    the replacement -- the four owner instances that set them get an
+    actionable warning at mount, not silence. Their ConfigField wizard
+    entries are removed later in this series (A-08), once the wizard
+    slims to 5 fields.
 
-New tests (tests/test_config_surface.py): T-D10 (typed key lands on
-typed surface), T-D11 (unknown key routes to extra_body), T-D12
-(temperature still routes to extra_body even via the escape hatch),
-T-D13 (override warns exactly once across primary + continuation calls,
-not once per call), T-D14 (non-mapping value raises ValueError at mount,
-naming settings.yaml). New test (tests/test_sdk_contract.py): T-D15 (SDK
-contract -- every _TYPED_REQUEST_PARAMS name binds to the installed
-SDK's create() signature). 6 new tests.
+New tests (tests/test_fallback_ladder.py, new file): T-B01/T-B02 (fable
+resolves and the full 4-rung walk), T-B03 (haiku terminal, regression
+guard), T-B04 (an unusable/self-referential rung is skipped, not
+fatal -- the actual D-2 fix; plus a companion test showing a truly
+*blank* override falls through to the static backstop rather than being
+treated as a disabled rung), T-B05/T-B06 (fallback_models override and
+live-cache precedence), T-B07/T-B08 (_warm_family_latest error
+swallowing and at-most-once), T-B12 (terminal-family mount warning),
+T-B13/T-B14 (mythos family detection and capabilities), T-B17 (cycle
+guard), T-B18 (corrected defaults). 20 new tests.
+
+New test (tests/test_migration_owner_instances.py, new file): the
+release's actual migration merge gate -- mounts each of the owner's 5
+real settings.yaml instances verbatim and asserts ONLY the expected
+targeted inert-key warnings fire (fallback_sonnet_model /
+fallback_haiku_model where set) and zero generic unknown-key
+warnings. Extended in a later commit once refusal_fallback_model also
+retires.
+
+Updated tests (tests/test_fallback.py): three existing tests asserted
+the OLD hardcoded fallback target (`claude-sonnet-4-6`, the previous
+config default). The ladder's static backstop is now
+`claude-sonnet-5` (the newest GA sonnet as of 2026-08-29) --
+test_529_opus_overload_falls_back_to_sonnet,
+test_persisted_breaker_state_is_used_by_fresh_provider, and
+test_429_overloaded_body_also_triggers_fallback (whose 429-triggers-fallback
+*logic* is inverted in the next commit; only its expected model id is
+fixed here) updated to match.
 
 Part of the config-surface + fallback-ladder + docs-alignment overhaul.
-Spec: anthropic-surface-spec.md D-07 (commit 4/9).
+Spec: anthropic-surface-spec.md B-01..B-04, B-08, B-09, C-04, B-02/X-2
+(commit 5/9).
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 

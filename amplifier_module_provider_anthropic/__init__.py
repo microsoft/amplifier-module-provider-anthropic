@@ -331,6 +331,40 @@ PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
 FALLBACK_STATE_VERSION = 1
 
+# Overload/refusal fallback ladder: which family a request steps DOWN to.
+#
+# Signed chain: fable -> opus -> sonnet -> haiku. `mythos` is a top-tier PEER
+# of fable (Anthropic prices Claude Mythos 5 identically to Claude Fable 5 at
+# $10/MTok base, 2026-08-29), so it enters the ladder at the same rung rather
+# than between fable and opus -- this keeps the signed fable->opus edge exact.
+#
+# "haiku" is deliberately ABSENT: it is the terminal rung. A missing key means
+# "no lower tier exists", which is a real answer, not an omission.
+#
+# This same ladder now drives BOTH overload fallback AND refusal fallback
+# (owner-adjudicated: Anthropic's own guidance for a refusal is to retry
+# with a less-restrictive model, and there is a product expectation that
+# fallback never lands on a model MORE expensive than the one the user
+# selected -- which the old hardcoded refusal-escalation target violated
+# for sonnet/haiku users). See _refusal_fallback_target.
+_FALLBACK_NEXT_FAMILY: dict[str, str] = {
+    "fable": "opus",
+    "mythos": "opus",
+    "opus": "sonnet",
+    "sonnet": "haiku",
+}
+
+# Backstop targets, used when neither an explicit per-family override nor a
+# live list_models() refresh has supplied one. Values are the newest GA model
+# in each family as of 2026-08-29. Going stale here degrades gracefully (the
+# fallback still works, aimed at a slightly older model) -- it never fails.
+# fable/mythos never appear as VALUES: nothing steps UP the ladder.
+_STATIC_FALLBACK_MODELS: dict[str, str] = {
+    "opus": "claude-opus-5",
+    "sonnet": "claude-sonnet-5",
+    "haiku": "claude-haiku-4-5",
+}
+
 # ---------------------------------------------------------------------------
 # Context-overflow detection markers
 # ---------------------------------------------------------------------------
@@ -643,8 +677,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "fallback_cooldown_seconds",
         "persist_fallback_state",
         "fallback_state_path",
-        "fallback_sonnet_model",
-        "fallback_haiku_model",
+        "fallback_models",
         "refusal_fallback_enabled",
         "refusal_fallback_model",
         "throttle_threshold",
@@ -697,6 +730,15 @@ _INERT_CONFIG_KEY_MESSAGES: dict[str, str] = {
         "not consumed by provider-anthropic and has no effect. See `debug`; "
         "use `raw: true` for full request/response payloads in llm:request / "
         "llm:response events."
+    ),
+    "fallback_sonnet_model": (
+        "removed -- fallback targets are now resolved from the model ladder "
+        "(fable/mythos -> opus -> sonnet -> haiku). To pin a specific target, "
+        "use `fallback_models: {sonnet: <model-id>}`."
+    ),
+    "fallback_haiku_model": (
+        "removed -- see fallback_sonnet_model. Use "
+        "`fallback_models: {haiku: <model-id>}` to pin a target."
     ),
 }
 _RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = frozenset(_INERT_CONFIG_KEY_MESSAGES)
@@ -903,27 +945,89 @@ class AnthropicProvider:
         self._fallback_on_overload = self._config_bool(
             self.config.get("fallback_on_overload", False)
         )
+        # Defaults corrected to the values actually used in practice: 4 of 5
+        # real deployed instances set retry_count='2' (one sets '3') and
+        # cooldown_seconds='300' explicitly. A 30-minute cooldown after a
+        # transient capacity blip stranded a whole session on a downgraded
+        # model long after real capacity had returned.
         self._fallback_retry_count = max(
-            0, self._config_int(self.config.get("fallback_retry_count", 1), 1)
+            0, self._config_int(self.config.get("fallback_retry_count", 2), 2)
         )
         self._fallback_cooldown_seconds = max(
             0.0,
             self._config_float(
-                self.config.get("fallback_cooldown_seconds", 1800.0), 1800.0
+                self.config.get("fallback_cooldown_seconds", 300.0), 300.0
             ),
         )
         self._enable_1m_context = self._config_bool(
             self.config.get("enable_1m_context", True)
         )
-        self._fallback_sonnet_model = str(
-            self.config.get("fallback_sonnet_model", "claude-sonnet-4-6")
-        )
-        self._fallback_haiku_model = str(
-            self.config.get("fallback_haiku_model", "claude-haiku-4-5")
-        )
+
+        # Fallback target resolution: fallback_models (settings-only,
+        # per-family override) supersedes the two deleted scalar keys
+        # (fallback_sonnet_model / fallback_haiku_model). See
+        # _resolve_fallback_model for the full three-source precedence and
+        # _INERT_CONFIG_KEY_MESSAGES for the migration message the two
+        # retired keys now produce.
+        _raw_fallback_models = self.config.get("fallback_models")
+        self._fallback_models: dict[str, str] = {}
+        if _raw_fallback_models:
+            if isinstance(_raw_fallback_models, dict):
+                for _fam, _target in _raw_fallback_models.items():
+                    if _fam not in _FALLBACK_NEXT_FAMILY and _fam != "haiku":
+                        _suggestion = difflib.get_close_matches(
+                            str(_fam),
+                            (*_FALLBACK_NEXT_FAMILY.values(), *_FALLBACK_NEXT_FAMILY),
+                            n=1,
+                        )
+                        _hint = (
+                            f" Did you mean '{_suggestion[0]}'?" if _suggestion else ""
+                        )
+                        logger.warning(
+                            "[PROVIDER] Unknown family '%s' in config "
+                            "'fallback_models' -- ignoring.%s",
+                            _fam,
+                            _hint,
+                        )
+                        continue
+                    if _target:
+                        self._fallback_models[str(_fam)] = str(_target)
+            else:
+                raise ValueError(
+                    f"Invalid config 'fallback_models'={_raw_fallback_models!r} for "
+                    f"provider-anthropic: must be a mapping of family name "
+                    f"(opus/sonnet/haiku) to model id "
+                    f"(got {type(_raw_fallback_models).__name__}). Fix the "
+                    f"provider config (settings.yaml / bundle config block)."
+                )
+        # Live-refreshed "newest model per family" cache -- see
+        # _resolve_fallback_model (source 2) and _warm_family_latest.
+        self._family_latest: dict[str, str] = {}
+        self._family_latest_attempted = False
+
         self._persist_fallback_state = self._config_bool(
             self.config.get("persist_fallback_state", False)
         )
+
+        # Mount-time LOUD warning: fallback_on_overload has NO EFFECT on an
+        # instance whose default_model is already on the ladder's terminal
+        # rung (haiku) -- there is no lower tier to downgrade to. The wizard
+        # already hides this ConfigField for Haiku (show_when), so this
+        # specifically catches hand-edited settings.yaml.
+        if self._fallback_on_overload:
+            _fam = self._detect_family(self.default_model)
+            if _fam not in _FALLBACK_NEXT_FAMILY:
+                logger.warning(
+                    "[PROVIDER] fallback_on_overload is enabled for "
+                    "default_model=%r (family %r), but %r is the lowest tier "
+                    "on the Anthropic fallback ladder -- there is no "
+                    "lower-tier model to downgrade to, so this setting has "
+                    "NO EFFECT. Remove it, or point this instance at a "
+                    "higher-tier model (fable/mythos/opus/sonnet).",
+                    self.default_model,
+                    _fam,
+                    _fam,
+                )
 
         # Refusal fallback: when a model returns finish_reason="refusal", retry
         # once against a configured fallback model (default: Opus). Orthogonal
@@ -1341,7 +1445,9 @@ class AnthropicProvider:
             ],
         )
 
-    async def list_models(self) -> list[ModelInfo]:
+    async def list_models(
+        self, retry_config: RetryConfig | None = None
+    ) -> list[ModelInfo]:
         """
         List available Claude models dynamically from Anthropic API.
 
@@ -1356,9 +1462,15 @@ class AnthropicProvider:
         for non-retryable errors (401/403/404) -- no fallback; caller
         handles empty lists.
 
+        `retry_config` lets a caller (namely `_warm_family_latest`) use a
+        cheaper retry policy than the instance default -- passed explicitly
+        rather than by mutating `self._retry_config`, which would not be
+        concurrency-safe under the process-wide semaphore.
+
         Returns:
             List of ModelInfo for available Claude models.
         """
+        active_retry_config = retry_config or self._retry_config
 
         async def _do_list_models():
             """Single API call attempt with SDK -> kernel error translation.
@@ -1461,7 +1573,7 @@ class AnthropicProvider:
             logger.warning(
                 "[PROVIDER] Retry %d/%d for list_models(): %s, sleeping %.1fs",
                 attempt,
-                self._retry_config.max_retries,
+                active_retry_config.max_retries,
                 error_type,
                 delay,
             )
@@ -1471,7 +1583,7 @@ class AnthropicProvider:
                     {
                         "provider": "anthropic",
                         "attempt": attempt,
-                        "max_retries": self._retry_config.max_retries,
+                        "max_retries": active_retry_config.max_retries,
                         "delay": delay,
                         "error_type": error_type,
                         "error_message": str(error),
@@ -1506,6 +1618,13 @@ class AnthropicProvider:
 
             # Sort by model_id descending (IDs contain dates like claude-sonnet-4-5-20250929)
             models.sort(key=lambda x: x[0], reverse=True)
+
+            # Free side-channel population of the fallback ladder's live
+            # "newest model per family" cache (B-03/_resolve_fallback_model
+            # source 2). Correct regardless of self.filtered -- models[0] is
+            # the latest either way; only models_to_include below branches
+            # on filtered.
+            self._family_latest[family] = models[0][0]
 
             # When filtered, only include the latest; otherwise include all
             models_to_include = [models[0]] if self.filtered else models
@@ -1547,7 +1666,7 @@ class AnthropicProvider:
     def _detect_family(model_id: str) -> str:
         """Detect the Claude model family from a model ID string."""
         model_lower = model_id.lower()
-        for family in ("fable", "opus", "sonnet", "haiku"):
+        for family in ("fable", "mythos", "opus", "sonnet", "haiku"):
             if family in model_lower:
                 return family
         return "sonnet"  # Default to sonnet for unknown models
@@ -1631,6 +1750,50 @@ class AnthropicProvider:
                 # enabled", HTTP 400, 2026-08-03) — the tool-support question
                 # itself could not be asked live. Left at the conservative
                 # dataclass default (False/None) rather than assumed.
+                capability_tags=(
+                    "tools",
+                    "thinking",
+                    "streaming",
+                    "json_mode",
+                    "vision",
+                ),
+            )
+
+        if family == "mythos":
+            # Cloned from the fable branch above -- Mythos 5 is Anthropic's
+            # other top-tier, always-on-adaptive-thinking family, priced
+            # identically to Fable 5 ($10/MTok base, 2026-08-29). Mythos
+            # PREVIEW differs from Mythos 5: no `xhigh` effort tier, and a
+            # 2048-token (not 512) prompt-cache minimum -- version-gated on
+            # (major, minor) exactly as the opus branch does; an unparseable
+            # version is treated as Mythos 5 (the newer, more-capable member),
+            # matching this provider's existing "unknown version assumes
+            # latest" convention.
+            major, minor = cls._detect_version(model_id, family)
+            is_preview = (major, minor) == (0, 0) and "preview" in model_id.lower()
+            return ModelCapabilities(
+                family=family,
+                max_output_tokens=128000,
+                supports_1m=True,
+                supports_thinking=True,
+                supports_adaptive_thinking=True,
+                supports_manual_thinking=False,
+                thinking_always_on=True,
+                supports_output_config=True,
+                supports_task_budget=True,
+                supports_sampling=False,
+                thinking_display_required=True,
+                supported_efforts=(
+                    ("low", "medium", "high", "max")
+                    if is_preview
+                    else ("low", "medium", "high", "xhigh", "max")
+                ),
+                supports_speed=False,
+                supports_inline_system=True,
+                default_thinking_budget=0,  # not used — adaptive only
+                # min_cacheable_tokens (2048 if is_preview else 512) is added
+                # to this branch in the docs-alignment commit that adds the
+                # field to ModelCapabilities (C-08).
                 capability_tags=(
                     "tools",
                     "thinking",
@@ -2107,30 +2270,92 @@ class AnthropicProvider:
             jitter=self._retry_jitter,
         )
 
-    def _fallback_target_for_model(self, model_id: str) -> str | None:
-        """Return the configured lower-tier fallback for a requested model."""
-        family = self._detect_family(model_id)
-        target: str | None
-        if family == "opus":
-            target = self._fallback_sonnet_model
-        elif family == "sonnet":
-            target = self._fallback_haiku_model
-        else:
-            return None
+    def _resolve_fallback_model(self, family: str) -> str | None:
+        """Concrete model id for a target FAMILY. Pure/synchronous by design.
 
-        if not target or target == model_id:
-            return None
+        Precedence:
+          1. `fallback_models` config override  -- explicit operator intent
+          2. live latest-per-family cache       -- refreshed from list_models()
+          3. _STATIC_FALLBACK_MODELS backstop   -- always present, never stale-fails
 
-        target_family = self._detect_family(target)
-        if target_family == family:
-            logger.warning(
-                "[PROVIDER] Ignoring invalid overload fallback %s -> %s (same family)",
-                model_id,
-                target,
+        This must NOT do network I/O: it is called from the 529 error path
+        (_open_fallback_window) and from the hot loop in complete(). A
+        list_models() call there would add latency and its own 529 risk at
+        exactly the moment the API is already saturated.
+        """
+        override = self._fallback_models.get(family)
+        if override:
+            return override
+        live = self._family_latest.get(family)
+        if live:
+            return live
+        return _STATIC_FALLBACK_MODELS.get(family)
+
+    async def _warm_family_latest(self) -> None:
+        """One best-effort list_models() to learn the newest model per family.
+
+        Runs on the HEALTHY path (before the first completion), never on the
+        error path -- so an overload event never pays for it. Single attempt
+        (max_retries=0) under a short timeout: this is an optimisation over
+        _STATIC_FALLBACK_MODELS, and a failure must cost nothing more than the
+        timeout. Attempted at most once per provider instance.
+        """
+        if self._family_latest_attempted:
+            return
+        self._family_latest_attempted = True
+        try:
+            async with asyncio.timeout(10.0):
+                await self.list_models(retry_config=self._build_retry_config(0))
+        except Exception as e:  # noqa: BLE001 -- optimisation only
+            logger.debug(
+                "[PROVIDER] Could not refresh fallback model list (%s: %s); "
+                "using static fallback targets.",
+                type(e).__name__,
+                e,
             )
-            return None
 
-        return target
+    def _fallback_target_for_model(self, model_id: str) -> str | None:
+        """Return the next lower-tier model on the fallback ladder, or None.
+
+        Walks _FALLBACK_NEXT_FAMILY downward from the model's own family,
+        SKIPPING any rung that resolves to nothing / to the model itself /
+        to the same family, rather than terminating there (the pre-overhaul
+        behaviour, which turned one blank config value into a dead ladder --
+        this is exactly what silently killed fallback for the `fable`
+        family, which had no rung at all in the old if/elif).
+
+        Returns None only when the ladder is genuinely exhausted -- i.e. the
+        model is already on the terminal rung (haiku), or every rung below it
+        resolved to something unusable.
+        """
+        source_family = self._detect_family(model_id)
+        family = source_family
+        seen: set[str] = {family}
+
+        while (family := _FALLBACK_NEXT_FAMILY.get(family)) is not None:
+            if family in seen:  # cycle guard against a pathological override map
+                logger.warning(
+                    "[PROVIDER] Fallback ladder cycle at family %r while "
+                    "resolving %s -- stopping.",
+                    family,
+                    model_id,
+                )
+                return None
+            seen.add(family)
+
+            target = self._resolve_fallback_model(family)
+            if not target or target == model_id:
+                continue  # rung unusable -- try the one below it
+            if self._detect_family(target) == source_family:
+                logger.warning(
+                    "[PROVIDER] Ignoring invalid overload fallback %s -> %s (same family)",
+                    model_id,
+                    target,
+                )
+                continue  # was: return None
+            return target
+
+        return None
 
     def _refusal_fallback_target(self, current_model: str) -> str | None:
         """Resolve the configured refusal-fallback model, or None if fallback
