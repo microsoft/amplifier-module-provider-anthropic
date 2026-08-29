@@ -658,7 +658,9 @@ class AnthropicProvider:
         )
         self.temperature = self.config.get("temperature", 0.7)
         self.priority = self.config.get("priority", 100)  # Store priority for selection
-        self.raw = self.config.get("raw", False)  # Include raw payload in events
+        self.raw = self._config_bool(
+            self.config.get("raw", False)
+        )  # Include raw payload in events
         self.timeout = self.config.get(
             "timeout", 600.0
         )  # API timeout in seconds (default 10 minutes)
@@ -745,13 +747,15 @@ class AnthropicProvider:
 
         # Use streaming API by default to support large context windows (Anthropic requires streaming
         # for operations that may take > 10 minutes, e.g. with 300k+ token contexts)
-        self.use_streaming = self.config.get("use_streaming", True)
-        self.filtered = self.config.get(
-            "filtered", True
+        self.use_streaming = self._config_bool(self.config.get("use_streaming", True))
+        self.filtered = self._config_bool(
+            self.config.get("filtered", True)
         )  # Filter to curated model list by default
-        self.enable_prompt_caching = self.config.get("enable_prompt_caching", True)
-        self.enable_web_search = self.config.get(
-            "enable_web_search", False
+        self.enable_prompt_caching = self._config_bool(
+            self.config.get("enable_prompt_caching", True)
+        )
+        self.enable_web_search = self._config_bool(
+            self.config.get("enable_web_search", False)
         )  # Enable native web search tool
 
         # Extended (1-hour) TTL for the stable system/tools cache breakpoints.
