@@ -5,6 +5,7 @@ thinking budgets, and feature flags for each model family and version.
 """
 
 import asyncio
+import dataclasses
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -193,11 +194,14 @@ class TestGetCapabilitiesOpus48:
         assert caps.supports_speed is False
         assert caps.supports_inline_system is False
 
-    def test_opus_47_no_max_effort(self):
-        """Opus 4.7 does not have the 'max' effort tier."""
+    def test_opus_47_has_xhigh_and_max(self):
+        """Opus 4.7 has both 'xhigh' and 'max' effort tiers (C-05 correction:
+        the doc's compatibility table places the xhigh/max split at 4.6/4.7,
+        not 4.7/4.8 -- 'max' \u2287 'xhigh', so 4.7+ gets both)."""
         caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
-        assert "max" not in caps.supported_efforts
-        assert caps.supported_efforts == ("low", "medium", "high", "xhigh")
+        assert "xhigh" in caps.supported_efforts
+        assert "max" in caps.supported_efforts
+        assert caps.supported_efforts == ("low", "medium", "high", "xhigh", "max")
 
     def test_opus_unknown_version_assumes_48(self):
         """Unknown opus version (e.g. claude-opus-latest) assumes 4.8 for forward compatibility."""
@@ -212,6 +216,18 @@ class TestGetCapabilitiesSonnet:
     def test_sonnet_max_output_tokens_is_default(self):
         caps = AnthropicProvider._get_capabilities("claude-sonnet-4-5-20250929")
         assert caps.max_output_tokens == 64000
+
+    def test_sonnet_46_plus_max_output_tokens_is_128k(self):
+        """Sonnet 4.6+ has a 1M context window and is entitled to 128K output
+        (platform.claude.com/en/docs/build-with-claude/context-windows,
+        2026-08-29). Regression guard for the bug where the sonnet branch
+        never set max_output_tokens and silently inherited the dataclass
+        default of 64000, clamping claude-sonnet-5 to half its real ceiling.
+        """
+        caps = AnthropicProvider._get_capabilities("claude-sonnet-4-6")
+        assert caps.max_output_tokens == 128000
+        caps5 = AnthropicProvider._get_capabilities("claude-sonnet-5")
+        assert caps5.max_output_tokens == 128000
 
     def test_sonnet_supports_thinking(self):
         caps = AnthropicProvider._get_capabilities("claude-sonnet-4-5-20250929")
@@ -310,7 +326,6 @@ class TestFastModeBetaHeader:
         provider = AnthropicProvider(api_key="test-key", config={"max_retries": 0})
         caps = AnthropicProvider._get_capabilities("claude-opus-4-8")
         headers = provider._build_request_beta_headers(
-            model_id="claude-opus-4-8",
             request_caps=caps,
             tools_present=False,
             resolved_thinking_type=None,
@@ -325,7 +340,6 @@ class TestFastModeBetaHeader:
         provider = AnthropicProvider(api_key="test-key", config={"max_retries": 0})
         caps = AnthropicProvider._get_capabilities("claude-opus-4-8")
         headers = provider._build_request_beta_headers(
-            model_id="claude-opus-4-8",
             request_caps=caps,
             tools_present=False,
             resolved_thinking_type=None,
@@ -334,48 +348,42 @@ class TestFastModeBetaHeader:
         assert BETA_HEADER_FAST_MODE not in headers
 
 
-class TestContextBetaHeaderOpus48:
-    """Opus 4.8+ should NOT get the 1M context beta header (1M is GA)."""
+class TestContextBetaHeaderNeverSent:
+    """1M context is GA/default/standard-priced on every model that has it
+    (platform.claude.com/en/docs/build-with-claude/context-windows, verified
+    2026-08-29) -- no beta header is EVER required or sent for it, on any
+    model, regardless of version. _should_add_context_1m_beta and
+    BETA_HEADER_1M_CONTEXT are removed entirely (C-01)."""
 
     def test_opus_48_no_1m_beta_header(self):
-        from amplifier_module_provider_anthropic import BETA_HEADER_1M_CONTEXT
-
         provider = AnthropicProvider(api_key="test-key", config={"max_retries": 0})
         caps = AnthropicProvider._get_capabilities("claude-opus-4-8")
         headers = provider._build_request_beta_headers(
-            model_id="claude-opus-4-8",
             request_caps=caps,
             tools_present=False,
             resolved_thinking_type=None,
         )
-        assert BETA_HEADER_1M_CONTEXT not in headers
+        assert "context-1m-2025-08-07" not in headers
 
-    def test_opus_47_still_gets_1m_beta_header(self):
-        from amplifier_module_provider_anthropic import BETA_HEADER_1M_CONTEXT
-
+    def test_opus_47_no_1m_beta_header(self):
         provider = AnthropicProvider(api_key="test-key", config={"max_retries": 0})
         caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
         headers = provider._build_request_beta_headers(
-            model_id="claude-opus-4-7-20260416",
             request_caps=caps,
             tools_present=False,
             resolved_thinking_type=None,
         )
-        assert BETA_HEADER_1M_CONTEXT in headers
+        assert "context-1m-2025-08-07" not in headers
 
     def test_opus_unknown_version_no_1m_beta_header(self):
-        """Unknown opus version assumes latest (4.8+), so no 1M header needed."""
-        from amplifier_module_provider_anthropic import BETA_HEADER_1M_CONTEXT
-
         provider = AnthropicProvider(api_key="test-key", config={"max_retries": 0})
         caps = AnthropicProvider._get_capabilities("claude-opus-latest")
         headers = provider._build_request_beta_headers(
-            model_id="claude-opus-latest",
             request_caps=caps,
             tools_present=False,
             resolved_thinking_type=None,
         )
-        assert BETA_HEADER_1M_CONTEXT not in headers
+        assert "context-1m-2025-08-07" not in headers
 
 
 class TestSpeedConfigPlumbing:
@@ -391,7 +399,6 @@ class TestSpeedConfigPlumbing:
         caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
         assert caps.supports_speed is False
         headers = provider._build_request_beta_headers(
-            model_id="claude-opus-4-7-20260416",
             request_caps=caps,
             tools_present=False,
             resolved_thinking_type=None,
@@ -419,12 +426,17 @@ class TestThinkingAlwaysOn:
         assert caps.thinking_always_on is False
 
     def test_opus_5_capabilities_match_opus_48_gate(self):
-        """claude-opus-5 must match claude-opus-4-8's capability matrix.
+        """claude-opus-5 must match claude-opus-4-8's capability matrix on
+        every gate keyed to is_48_plus (the existing numeric version-gate
+        already handles Opus 5 correctly, since (5, 0) >= (4, 8) -- no code
+        change was required for Opus 5 capability detection on those axes).
 
-        This is a regression guard proving the existing numeric version-gate
-        (is_48_plus = not version_known or (major, minor) >= (4, 8)) already
-        handles Opus 5 correctly, since (5, 0) >= (4, 8). No code change is
-        required for Opus 5 capability detection.
+        min_cacheable_tokens is the one EXPECTED exception: it is gated on
+        is_5_plus specifically (Opus 5 = 512, Opus 4.8 = 1024) per
+        Anthropic's own non-monotonic per-model cache-minimum table
+        (platform.claude.com/en/docs/build-with-claude/prompt-caching,
+        verified 2026-08-29) -- so a whole-object equality is no longer
+        the right check here.
         """
         caps_5 = AnthropicProvider._get_capabilities("claude-opus-5")
         caps_48 = AnthropicProvider._get_capabilities("claude-opus-4-8")
@@ -437,7 +449,9 @@ class TestThinkingAlwaysOn:
         assert caps_5.supported_efforts == ("low", "medium", "high", "xhigh", "max")
         assert caps_5.supports_speed is True
         assert caps_5.supports_inline_system is True
-        assert caps_5 == caps_48
+        assert caps_5.min_cacheable_tokens == 512
+        assert caps_48.min_cacheable_tokens == 1024
+        assert dataclasses.replace(caps_5, min_cacheable_tokens=1024) == caps_48
 
 
 class TestGetCapabilitiesFable5:
@@ -564,11 +578,17 @@ class TestGetCapabilitiesSonnet5:
         assert caps.supports_sampling is False
 
     def test_sonnet_46_unchanged_by_sonnet5_gate(self):
-        """Regression guard: Sonnet 4.6 keeps default efforts and no output_config."""
+        """Sonnet 4.6 does NOT get Sonnet 5's is_5_plus-gated features
+        (xhigh, manual-thinking hard-gate) -- but DOES get 'max' and
+        output_config (C-05/C-06 widening: doc states "Supported models:
+        ... Sonnet 4.6 and 5"; "max" \\ "xhigh" is Sonnet 4.6's exact case,
+        confirmed live 2026-08-29 T-C06-live)."""
         caps = AnthropicProvider._get_capabilities("claude-sonnet-4-6")
-        assert caps.supported_efforts == ("low", "medium", "high")
-        assert caps.supports_output_config is False
+        assert caps.supported_efforts == ("low", "medium", "high", "max")
+        assert "xhigh" not in caps.supported_efforts
+        assert caps.supports_output_config is True
         assert caps.supports_manual_thinking is True
+        assert caps.manual_thinking_deprecated is True
 
     def test_sonnet_unknown_version_assumes_5(self):
         """Forward-compat: a version-less sonnet id assumes latest (5+) so new

@@ -41,7 +41,7 @@ def _extract_section(content: str, heading: str) -> str:
 @pytest.fixture(scope="module")
 def readme_content():
     """Load README.md content once per module (shared across all 44 tests)."""
-    return README_PATH.read_text()
+    return README_PATH.read_text(encoding="utf-8")
 
 
 class TestOldSectionRemoved:

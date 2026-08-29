@@ -117,7 +117,7 @@ class TestTemporaryFallbackOnOverload:
             side_effect=[
                 _make_sdk_overloaded_error(),
                 _make_sdk_overloaded_error(),
-                _make_raw_success("claude-sonnet-4-6"),
+                _make_raw_success("claude-sonnet-5"),
             ]
         )
 
@@ -128,17 +128,22 @@ class TestTemporaryFallbackOnOverload:
             call.kwargs["model"]
             for call in provider.client.messages.with_raw_response.create.await_args_list
         ]
+        # Fallback ladder target for opus is now resolved from
+        # _STATIC_FALLBACK_MODELS ("claude-sonnet-5", the newest GA sonnet as
+        # of 2026-08-29), not a hardcoded config default -- see B-01/B-04.
         assert models == [
             "claude-opus-4-6",
             "claude-opus-4-6",
-            "claude-sonnet-4-6",
+            "claude-sonnet-5",
         ]
 
         fake_coord = cast(FakeCoordinator, provider.coordinator)
-        open_events = [e for e in fake_coord.hooks.events if e[0] == "provider:fallback_open"]
+        open_events = [
+            e for e in fake_coord.hooks.events if e[0] == "provider:fallback_open"
+        ]
         assert len(open_events) == 1
         assert open_events[0][1]["requested_model"] == "claude-opus-4-6"
-        assert open_events[0][1]["fallback_model"] == "claude-sonnet-4-6"
+        assert open_events[0][1]["fallback_model"] == "claude-sonnet-5"
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
     def test_fallback_clamps_max_tokens_to_lower_model_ceiling(self, mock_sleep):
@@ -214,20 +219,29 @@ class TestTemporaryFallbackOnOverload:
         )
 
         assert result is not None
-        fallback_call = provider.client.messages.with_raw_response.create.await_args_list[
-            -1
-        ]
+        fallback_call = (
+            provider.client.messages.with_raw_response.create.await_args_list[-1]
+        )
         assert fallback_call.kwargs["model"] == "claude-haiku-4-5"
         assert fallback_call.kwargs["max_tokens"] == 64_000
         assert fallback_call.kwargs["thinking"]["type"] == "enabled"
         assert fallback_call.kwargs["thinking"]["budget_tokens"] == 63_999
 
-    def test_enable_1m_context_does_not_become_global_beta_header(self):
-        provider = _make_provider("claude-sonnet-4-6", enable_1m_context=True)
-        assert anthropic_module.BETA_HEADER_1M_CONTEXT not in provider._beta_headers
+    def test_enable_1m_context_never_adds_a_beta_header(self):
+        """1M context is GA, default, and standard-priced on every model
+        that has it (platform.claude.com/en/docs/build-with-claude/context-windows,
+        verified 2026-08-29) -- no beta header is ever required or sent,
+        regardless of enable_1m_context's value. The context-1m-2025-08-07
+        beta header and _should_add_context_1m_beta are removed entirely
+        (C-01); this test is re-pointed from asserting a narrow "not a
+        GLOBAL header" claim to the real invariant: no 1M header, ever."""
+        for enabled in (True, False):
+            provider = _make_provider("claude-sonnet-4-6", enable_1m_context=enabled)
+            assert not hasattr(anthropic_module, "BETA_HEADER_1M_CONTEXT")
+            assert "context-1m-2025-08-07" not in provider._beta_headers
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_sonnet_46_adds_context_beta_header_when_enabled(self, mock_sleep):
+    def test_enable_1m_context_true_sends_no_beta_header_end_to_end(self, mock_sleep):
         provider = _make_provider("claude-sonnet-4-6", enable_1m_context=True)
         provider._get_runtime_model_info = AsyncMock(
             return_value=_runtime_model_info(
@@ -242,66 +256,11 @@ class TestTemporaryFallbackOnOverload:
         result = asyncio.run(provider.complete(_simple_request()))
 
         assert result is not None
-        call_kwargs = provider.client.messages.with_raw_response.create.await_args.kwargs
+        call_kwargs = (
+            provider.client.messages.with_raw_response.create.await_args.kwargs
+        )
         beta_header = call_kwargs.get("extra_headers", {}).get("anthropic-beta", "")
-        assert anthropic_module.BETA_HEADER_1M_CONTEXT in beta_header
-
-    @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_haiku_fallback_does_not_inherit_context_beta_header(self, mock_sleep):
-        provider = _make_provider(
-            "claude-sonnet-4-6",
-            enable_1m_context=True,
-            fallback_on_overload=True,
-            fallback_retry_count=1,
-            fallback_cooldown_seconds=300,
-        )
-        provider._get_runtime_model_info = AsyncMock(
-            side_effect=[
-                _runtime_model_info(max_input_tokens=1_000_000, max_tokens=64_000),
-                _runtime_model_info(max_input_tokens=200_000, max_tokens=64_000),
-            ]
-        )
-        provider.client.messages.with_raw_response.create = AsyncMock(
-            side_effect=[
-                _make_sdk_overloaded_error(),
-                _make_sdk_overloaded_error(),
-                _make_raw_success("claude-haiku-4-5"),
-            ]
-        )
-
-        result = asyncio.run(provider.complete(_simple_request()))
-
-        assert result is not None
-        first_call = provider.client.messages.with_raw_response.create.await_args_list[0]
-        fallback_call = provider.client.messages.with_raw_response.create.await_args_list[
-            -1
-        ]
-        first_header = first_call.kwargs.get("extra_headers", {}).get("anthropic-beta", "")
-        fallback_header = fallback_call.kwargs.get("extra_headers", {}).get(
-            "anthropic-beta", ""
-        )
-        assert anthropic_module.BETA_HEADER_1M_CONTEXT in first_header
-        assert anthropic_module.BETA_HEADER_1M_CONTEXT not in fallback_header
-
-    @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_sonnet_45_still_adds_context_beta_header_when_enabled(self, mock_sleep):
-        provider = _make_provider("claude-sonnet-4-5", enable_1m_context=True)
-        provider._get_runtime_model_info = AsyncMock(
-            return_value=_runtime_model_info(
-                max_input_tokens=200_000,
-                max_tokens=64_000,
-            )
-        )
-        provider.client.messages.with_raw_response.create = AsyncMock(
-            return_value=_make_raw_success("claude-sonnet-4-5")
-        )
-
-        result = asyncio.run(provider.complete(_simple_request()))
-
-        assert result is not None
-        call_kwargs = provider.client.messages.with_raw_response.create.await_args.kwargs
-        beta_header = call_kwargs.get("extra_headers", {}).get("anthropic-beta", "")
-        assert anthropic_module.BETA_HEADER_1M_CONTEXT in beta_header
+        assert "context-1m-2025-08-07" not in beta_header
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
     def test_persisted_breaker_state_is_opt_in(self, mock_sleep, tmp_path):
@@ -344,7 +303,7 @@ class TestTemporaryFallbackOnOverload:
             side_effect=[
                 _make_sdk_overloaded_error(),
                 _make_sdk_overloaded_error(),
-                _make_raw_success("claude-sonnet-4-6"),
+                _make_raw_success("claude-sonnet-5"),
             ]
         )
 
@@ -355,7 +314,7 @@ class TestTemporaryFallbackOnOverload:
 
         persisted = json.loads(state_path.read_text())
         assert persisted["version"] == 1
-        assert persisted["windows"]["opus"]["fallback_model"] == "claude-sonnet-4-6"
+        assert persisted["windows"]["opus"]["fallback_model"] == "claude-sonnet-5"
 
         anthropic_module._clear_fallback_windows()
 
@@ -366,7 +325,7 @@ class TestTemporaryFallbackOnOverload:
             fallback_state_path=str(state_path),
         )
         fresh_provider.client.messages.with_raw_response.create = AsyncMock(
-            return_value=_make_raw_success("claude-sonnet-4-6")
+            return_value=_make_raw_success("claude-sonnet-5")
         )
 
         second_result = asyncio.run(fresh_provider.complete(_simple_request()))
@@ -376,7 +335,7 @@ class TestTemporaryFallbackOnOverload:
             call.kwargs["model"]
             for call in fresh_provider.client.messages.with_raw_response.create.await_args_list
         ]
-        assert models == ["claude-sonnet-4-6"]
+        assert models == ["claude-sonnet-5"]
 
     def test_expired_persisted_breaker_state_is_ignored(self, tmp_path):
         state_path = tmp_path / "anthropic-fallback-state.json"
@@ -452,9 +411,7 @@ class TestTemporaryFallbackOnOverload:
         assert active_events[0][1]["effective_model"] == "claude-sonnet-4-6"
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_non_overload_errors_keep_full_retry_budget_on_same_model(
-        self, mock_sleep
-    ):
+    def test_non_overload_errors_keep_full_retry_budget_on_same_model(self, mock_sleep):
         provider = _make_provider(
             "claude-opus-4-6",
             fallback_on_overload=True,
@@ -483,7 +440,9 @@ class TestTemporaryFallbackOnOverload:
         ]
 
         fake_coord = cast(FakeCoordinator, provider.coordinator)
-        open_events = [e for e in fake_coord.hooks.events if e[0] == "provider:fallback_open"]
+        open_events = [
+            e for e in fake_coord.hooks.events if e[0] == "provider:fallback_open"
+        ]
         assert open_events == []
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
@@ -516,7 +475,19 @@ class TestTemporaryFallbackOnOverload:
         ]
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_429_overloaded_body_also_triggers_fallback(self, mock_sleep):
+    def test_429_overloaded_body_does_not_trigger_fallback(self, mock_sleep):
+        """Inverts the pre-overhaul behavior: a 429 (rate_limit_error) is
+        per-account, per Anthropic's own error docs
+        (platform.claude.com/docs/en/api/errors, verified 2026-08-29) --
+        "Your organization has hit a rate limit, reached its usage tier's
+        monthly spend cap, or reached a spend limit". A lower-tier model
+        draws on the SAME org quota, so downgrading cannot help. The
+        previous substring test for "overload"/"overloaded" in a 429 body
+        is removed: a 429 now always falls through to the FULL retry
+        budget on the SAME model (exponential backoff honoring
+        retry-after), never a downgrade -- regardless of what the error
+        body's text happens to contain.
+        """
         provider = _make_provider(
             "claude-opus-4-6",
             fallback_on_overload=True,
@@ -527,7 +498,7 @@ class TestTemporaryFallbackOnOverload:
             side_effect=[
                 _make_sdk_rate_limit_overloaded_error(),
                 _make_sdk_rate_limit_overloaded_error(),
-                _make_raw_success("claude-sonnet-4-6"),
+                _make_raw_success("claude-opus-4-6"),
             ]
         )
 
@@ -538,8 +509,9 @@ class TestTemporaryFallbackOnOverload:
             call.kwargs["model"]
             for call in provider.client.messages.with_raw_response.create.await_args_list
         ]
+        # Every attempt stays on the SAME model -- never downgraded.
         assert models == [
             "claude-opus-4-6",
             "claude-opus-4-6",
-            "claude-sonnet-4-6",
+            "claude-opus-4-6",
         ]

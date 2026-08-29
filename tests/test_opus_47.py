@@ -259,44 +259,14 @@ class TestOpus47ThinkingFallback:
 
 
 # ---------------------------------------------------------------------------
-# TestBetaHeader1MFix — 1M context beta header uses >= instead of ==
-# ---------------------------------------------------------------------------
-
-
-class TestBetaHeader1MFix:
-    """1M context beta header uses >= instead of ==."""
-
-    def _check(self, model_id: str) -> bool:
-        provider = _make_provider(default_model=model_id)
-        caps = AnthropicProvider._get_capabilities(model_id)
-        return provider._should_add_context_1m_beta(model_id, caps)
-
-    def test_opus_46_gets_1m_header(self):
-        assert self._check("claude-opus-4-6-20260101") is True
-
-    def test_opus_47_gets_1m_header(self):
-        assert self._check("claude-opus-4-7-20260416") is True
-
-    def test_opus_unknown_no_1m_header(self):
-        # Unknown opus versions assume latest (4.8+) where 1M is GA — no header needed.
-        assert self._check("claude-opus-latest") is False
-
-    def test_opus_45_no_1m_header(self):
-        assert self._check("claude-opus-4-5-20251101") is False
-
-    def test_haiku_never_gets_1m_header(self):
-        assert self._check("claude-haiku-4-5-20251001") is False
-
-    def test_sonnet_46_gets_1m_header(self):
-        assert self._check("claude-sonnet-4-6-20260101") is True
-
-    def test_sonnet_45_gets_1m_header(self):
-        assert self._check("claude-sonnet-4-5-20250929") is True
-
-    def test_sonnet_unknown_gets_1m_header(self):
-        assert self._check("claude-sonnet-latest") is True
-
-
+# NOTE: TestBetaHeader1MFix (the old ">= instead of ==" 1M-beta-header
+# threshold tests) is REMOVED here. 1M context is GA, default, and
+# standard-priced on every model that has it -- no beta header is ever
+# required, on any model or version. _should_add_context_1m_beta is
+# deleted entirely (see anthropic-surface-spec.md C-01); its replacement
+# invariant ("no 1M header, ever") is covered by
+# test_model_capabilities.py::TestContextBetaHeaderNeverSent and
+# test_fallback.py::test_enable_1m_context_never_adds_a_beta_header.
 # ---------------------------------------------------------------------------
 # TestOpus47OutputConfig — output_config.effort on Opus 4.7
 # ---------------------------------------------------------------------------
@@ -357,8 +327,11 @@ class TestOpus47OutputConfig:
         params = _get_api_params(provider.client.messages.with_raw_response.create)
         assert "output_config" not in params
 
-    def test_opus_46_no_output_config(self):
-        """Opus 4.6 doesn't support output_config — never sent."""
+    def test_opus_46_output_config_now_supported(self):
+        """Opus 4.6 DOES support output_config (C-06/X-1 widening,
+        confirmed live 2026-08-29 T-C06-live: output_config.effort='max'
+        -> HTTP 200 on claude-opus-4-6). This inverts the pre-overhaul
+        assertion: supports_output_config was is_47_plus, now is_45_plus."""
         provider = _make_provider(default_model="claude-opus-4-6-20260101")
         provider.client.messages.with_raw_response.create = AsyncMock(
             return_value=_make_raw_mock()
@@ -369,30 +342,46 @@ class TestOpus47OutputConfig:
         )
         asyncio.run(provider.complete(request))
         params = _get_api_params(provider.client.messages.with_raw_response.create)
-        assert "output_config" not in params
+        assert params.get("output_config") == {"effort": "high"}
 
     def test_opus_47_supported_efforts(self):
-        """Opus 4.7 capabilities include xhigh."""
+        """Opus 4.7 capabilities include both xhigh and max (C-05
+        correction: the doc's xhigh/max split is at 4.6/4.7, not 4.7/4.8)."""
         caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
         assert "xhigh" in caps.supported_efforts
-        assert caps.supported_efforts == ("low", "medium", "high", "xhigh")
+        assert "max" in caps.supported_efforts
+        assert caps.supported_efforts == ("low", "medium", "high", "xhigh", "max")
 
-    def test_opus_46_no_xhigh(self):
-        """Opus 4.6 capabilities don't include xhigh."""
+    def test_opus_46_no_xhigh_but_has_max(self):
+        """Opus 4.6 capabilities don't include xhigh, but DO include max
+        (C-05: the doc's own explanation is "xhigh is a newer level; some
+        models that support max don't support xhigh" -- Opus 4.6 is
+        exactly that case)."""
         caps = AnthropicProvider._get_capabilities("claude-opus-4-6-20260101")
         assert "xhigh" not in caps.supported_efforts
+        assert "max" in caps.supported_efforts
 
     def test_opus_47_invalid_effort_omits_output_config(self):
-        """Unknown effort level → output_config omitted (not a hard error)."""
+        """Unknown effort level → output_config omitted (not a hard error).
+
+        Uses a genuinely-unsupported value: 'max' is now a valid effort on
+        Opus 4.7 (C-05), so the true "not in supported_efforts" case must
+        use a value outside the whole valid-effort enum, not one this
+        release moved between tiers.
+        """
         provider = _make_provider(default_model="claude-opus-4-7-20260416")
         provider.client.messages.with_raw_response.create = AsyncMock(
             return_value=_make_raw_mock()
         )
         request = ChatRequest(
             messages=[Message(role="user", content="Hello")],
-            reasoning_effort="max",  # not in supported_efforts for 4.7
+            reasoning_effort="low",  # enables thinking; a valid tier
         )
-        asyncio.run(provider.complete(request))
+        # kwargs["effort"] overrides output_config.effort independently of
+        # reasoning_effort (see _build_params) -- use a value that is not in
+        # ANY model's supported_efforts, unlike "max" which C-05 moved onto
+        # Opus 4.7's valid list.
+        asyncio.run(provider.complete(request, effort="not-a-real-effort"))
         params = _get_api_params(provider.client.messages.with_raw_response.create)
         assert "output_config" not in params
 
@@ -830,7 +819,10 @@ class TestTaskBudgets:
         assert "task-budgets-2026-03-13" not in beta_header
 
     def test_task_budget_ignored_on_unsupported_model(self):
-        """task_budget_tokens on Opus 4.6 (unsupported) is silently ignored."""
+        """task_budget_tokens on Opus 4.6 (task-budget unsupported until
+        4.7+) is silently ignored -- the task_budget sub-key must be
+        absent. output_config ITSELF now legitimately exists on 4.6 (C-06
+        widened supports_output_config to 4.5+), carrying only `effort`."""
         provider = _make_provider(default_model="claude-opus-4-6-20260101")
         provider.client.messages.with_raw_response.create = AsyncMock(
             return_value=_make_raw_mock()
@@ -841,8 +833,8 @@ class TestTaskBudgets:
         )
         asyncio.run(provider.complete(request, task_budget_tokens=50000))
         params = _get_api_params(provider.client.messages.with_raw_response.create)
-        # output_config should not exist for 4.6 at all
-        assert "output_config" not in params
+        assert params.get("output_config") == {"effort": "high"}
+        assert "task_budget" not in params.get("output_config", {})
 
     def test_runtime_overrides_preserve_task_budget(self):
         """_apply_runtime_capability_overrides passes through supports_task_budget."""
@@ -872,7 +864,9 @@ class TestSonnet5Temperature:
         provider.client.messages.with_raw_response.create = AsyncMock(
             return_value=_make_raw_mock()
         )
-        request = ChatRequest(messages=[Message(role="user", content="Name this session")])
+        request = ChatRequest(
+            messages=[Message(role="user", content="Name this session")]
+        )
         asyncio.run(provider.complete(request))
         params = _get_api_params(provider.client.messages.with_raw_response.create)
         assert "temperature" not in params

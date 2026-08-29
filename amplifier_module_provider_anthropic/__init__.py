@@ -10,6 +10,7 @@ __all__ = ["mount", "AnthropicProvider"]
 __amplifier_module_type__ = "provider"
 
 import asyncio
+import difflib
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ import uuid
 from decimal import Decimal
 from threading import Lock
 from typing import Any
+from typing import ClassVar
 
 from dataclasses import dataclass
 from dataclasses import field
@@ -92,6 +94,49 @@ def _route_wire_only_params(params: dict[str, Any]) -> dict[str, Any]:
         extra_body.setdefault(key, value)
         params["extra_body"] = extra_body
     return params
+
+
+# Messages API parameters the installed SDK exposes as TYPED keyword
+# arguments. Anything NOT in this set must travel in extra_body: passing an
+# unknown keyword raises "got an unexpected keyword argument", which
+# _do_complete's catch-all translates into a RETRYABLE KernelLLMError -- so a
+# permanent config typo would be retried max_retries times before surfacing.
+# See the _WIRE_ONLY_PARAMS comment above for the incident this prevents.
+#
+# Verified live against the INSTALLED SDK (anthropic==1.0.0, this repo's
+# floor pin) via inspect.signature(AsyncMessages.create) -- not assumed from
+# API docs. `top_k`, `top_p`, and `betas` are NOT present on 1.0.0's typed
+# surface (the same fate as `temperature`, already documented above: dropped
+# from the typed Messages surface in the 1.0.0 major bump) -- listing them
+# here would route a config value onto the typed surface and reproduce
+# exactly the unexpected-keyword-argument retry bug this allowlist exists to
+# prevent. Guarded by test_sdk_contract.py::TestTypedRequestParamsMatchSdkSignature,
+# which fails loud on any future SDK drift instead of silently trusting this
+# list.
+_TYPED_REQUEST_PARAMS: frozenset[str] = frozenset(
+    {
+        "model",
+        "messages",
+        "max_tokens",
+        "system",
+        "tools",
+        "tool_choice",
+        "stop_sequences",
+        "stream",
+        "metadata",
+        "thinking",
+        "output_config",
+        "service_tier",
+        "cache_control",
+        "container",
+        "inference_geo",
+        "user_profile_id",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
+        "timeout",
+    }
+)
 
 
 @dataclass
@@ -278,13 +323,46 @@ NATIVE_TOOL_BETA_HEADERS: dict[str, str] = {
     "computer_20251124": "computer-use-2025-11-24",
 }
 
-BETA_HEADER_1M_CONTEXT = "context-1m-2025-08-07"
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
 BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
 BETA_HEADER_FAST_MODE = "fast-mode-2026-02-01"
 PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
 FALLBACK_STATE_VERSION = 1
+
+# Overload/refusal fallback ladder: which family a request steps DOWN to.
+#
+# Signed chain: fable -> opus -> sonnet -> haiku. `mythos` is a top-tier PEER
+# of fable (Anthropic prices Claude Mythos 5 identically to Claude Fable 5 at
+# $10/MTok base, 2026-08-29), so it enters the ladder at the same rung rather
+# than between fable and opus -- this keeps the signed fable->opus edge exact.
+#
+# "haiku" is deliberately ABSENT: it is the terminal rung. A missing key means
+# "no lower tier exists", which is a real answer, not an omission.
+#
+# This same ladder now drives BOTH overload fallback AND refusal fallback
+# (owner-adjudicated: Anthropic's own guidance for a refusal is to retry
+# with a less-restrictive model, and there is a product expectation that
+# fallback never lands on a model MORE expensive than the one the user
+# selected -- which the old hardcoded refusal-escalation target violated
+# for sonnet/haiku users). See _refusal_fallback_target.
+_FALLBACK_NEXT_FAMILY: dict[str, str] = {
+    "fable": "opus",
+    "mythos": "opus",
+    "opus": "sonnet",
+    "sonnet": "haiku",
+}
+
+# Backstop targets, used when neither an explicit per-family override nor a
+# live list_models() refresh has supplied one. Values are the newest GA model
+# in each family as of 2026-08-29. Going stale here degrades gracefully (the
+# fallback still works, aimed at a slightly older model) -- it never fails.
+# fable/mythos never appear as VALUES: nothing steps UP the ladder.
+_STATIC_FALLBACK_MODELS: dict[str, str] = {
+    "opus": "claude-opus-5",
+    "sonnet": "claude-sonnet-5",
+    "haiku": "claude-haiku-4-5",
+}
 
 # ---------------------------------------------------------------------------
 # Context-overflow detection markers
@@ -407,6 +485,12 @@ class ModelCapabilities:
     supports_manual_thinking: bool = (
         True  # False on Opus 4.7+ (type="enabled" returns HTTP 400)
     )
+    manual_thinking_deprecated: bool = (
+        False  # True = type="enabled" still works (HTTP 200) but is deprecated --
+        # verified live 2026-08-29 (T-C08-live) on Opus 4.6. Only meaningful
+        # when supports_manual_thinking is True (the two never both apply on
+        # the same model: 4.7+/5+ already hard-gate to adaptive).
+    )
     supports_output_config: bool = False  # True = model accepts output_config.effort
     supports_sampling: bool = True  # False = temperature silently ignored by model
     thinking_display_required: bool = (
@@ -437,6 +521,12 @@ class ModelCapabilities:
         # None means this model does not support the tool at all.
     )
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
+    min_cacheable_tokens: int = (
+        1024  # Below this, the API silently skips caching (no error) --
+        # platform.claude.com/en/docs/build-with-claude/prompt-caching,
+        # verified 2026-08-29. Per-family values set explicitly below;
+        # this is only the dataclass fallback.
+    )
 
 
 @dataclass(frozen=True)
@@ -561,6 +651,153 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     return cleanup
 
 
+# ---------------------------------------------------------------------------
+# Config-key allowlist -- unknown-key sweep with did-you-mean (D-01..D-04)
+# ---------------------------------------------------------------------------
+# Every config key this module actually reads -- audited against every
+# `self.config.get(...)` call site, in BOTH the constructor AND the deferred
+# request path. The eight *_build_params / _build_web_search_tool keys below
+# are the reason this list cannot be derived from __init__ alone: they are
+# never touched at construction, and an allowlist built only from the
+# constructor would false-positive on every extended-thinking user.
+#
+# NOTE: fallback_sonnet_model/fallback_haiku_model/refusal_fallback_model are
+# still consumed at this point in the release sequence -- they are moved to
+# _INERT_CONFIG_KEY_MESSAGES once the fallback-ladder commits that replace
+# them land (fallback_models supersedes the first two; the ladder itself
+# supersedes the third).
+_CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        # --- constructor / mount ---
+        "api_key",
+        "base_url",
+        "default_model",
+        "max_tokens",
+        "temperature",
+        "priority",
+        "raw",
+        "timeout",
+        "reasoning_effort",
+        "max_retries",
+        "min_retry_delay",
+        "max_retry_delay",
+        "retry_jitter",
+        "overloaded_delay_multiplier",
+        "fallback_on_overload",
+        "fallback_retry_count",
+        "fallback_cooldown_seconds",
+        "persist_fallback_state",
+        "fallback_state_path",
+        "fallback_models",
+        "refusal_fallback_enabled",
+        "throttle_threshold",
+        "throttle_delay",
+        "rate_limit_state_path",
+        "max_concurrent_requests",
+        "use_streaming",
+        "filtered",
+        "enable_1m_context",
+        "enable_prompt_caching",
+        "cache_stable_region_ttl_1h",
+        "enable_web_search",
+        "beta_headers",
+        "extra_request_params",
+        # --- deferred: read in _build_params (:3056-3230 pre-overhaul) ---
+        "thinking_budget_tokens",
+        "thinking_budget_buffer",
+        "thinking_type",
+        "thinking_display",
+        "task_budget_tokens",
+        "speed",
+        # --- deferred: read in _build_web_search_tool ---
+        "web_search_max_uses",
+        "web_search_user_location",
+    }
+)
+
+# Infrastructure keys the app/kernel places in (or alongside) a provider's
+# config block that this module does not itself read: metadata fields a
+# settings-shaped provider entry carries. `api_key` and `default_model` are
+# already in _CONSUMED_CONFIG_KEYS (this module reads both).
+_INFRASTRUCTURE_CONFIG_KEYS: frozenset[str] = frozenset({"id", "module", "source"})
+
+# Keys that are recognized but currently do nothing. Each gets its own
+# targeted warning naming what to do instead, and is therefore *excluded*
+# from the generic unknown-key sweep so no key ever produces two warnings.
+#
+# `debug` and `raw_debug` are ghosts: grep for '"debug"|raw_debug' across
+# this module returns zero matches. They exist only in README.md's
+# now-deleted "Debug Configuration" section, which documented two options
+# that were never implemented. Anyone who followed the README has them set
+# and gets nothing -- they must warn, not vanish silently.
+_INERT_CONFIG_KEY_MESSAGES: dict[str, str] = {
+    "debug": (
+        "not consumed by provider-anthropic and has no effect. It was never "
+        "implemented; the README documented it in error. For request/response "
+        "payload capture use `raw: true`."
+    ),
+    "raw_debug": (
+        "not consumed by provider-anthropic and has no effect. See `debug`; "
+        "use `raw: true` for full request/response payloads in llm:request / "
+        "llm:response events."
+    ),
+    "fallback_sonnet_model": (
+        "removed -- fallback targets are now resolved from the model ladder "
+        "(fable/mythos -> opus -> sonnet -> haiku). To pin a specific target, "
+        "use `fallback_models: {sonnet: <model-id>}`."
+    ),
+    "fallback_haiku_model": (
+        "removed -- see fallback_sonnet_model. Use "
+        "`fallback_models: {haiku: <model-id>}` to pin a target."
+    ),
+    "refusal_fallback_model": (
+        "removed -- refusals now follow the same never-more-expensive "
+        "downgrade ladder as overload (fable/mythos -> opus -> sonnet -> "
+        "haiku), resolved via `fallback_models` the same way overload "
+        "fallback is. `refusal_fallback_enabled` still gates whether a "
+        "refusal is retried at all."
+    ),
+}
+_RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = frozenset(_INERT_CONFIG_KEY_MESSAGES)
+
+# Deprecated aliases: still fully functional, but the canonical key should be
+# used. Must stay "known" or they would draw a SECOND, generic unknown-key
+# warning on top of the targeted deprecation warning each already gets.
+_DEPRECATED_ALIAS_CONFIG_KEYS: dict[str, str] = {
+    "effort": "reasoning_effort",
+}
+
+_KNOWN_CONFIG_KEYS: frozenset[str] = (
+    _CONSUMED_CONFIG_KEYS
+    | _RECOGNIZED_INERT_CONFIG_KEYS
+    | frozenset(_DEPRECATED_ALIAS_CONFIG_KEYS)
+    | _INFRASTRUCTURE_CONFIG_KEYS
+)
+
+
+def _warn_unknown_config_keys(
+    config: dict[str, Any], extra_known: frozenset[str] = frozenset()
+) -> None:
+    """Warn on any config key that is neither consumed, recognized-inert,
+    a deprecated alias, nor an infrastructure key -- with a did-you-mean
+    suggestion drawn from the full known-key set.
+
+    `extra_known` lets a subclass (via `EXTRA_KNOWN_CONFIG_KEYS`) extend the
+    allowlist without needing to fork this function.
+    """
+    known = _KNOWN_CONFIG_KEYS | extra_known
+    for key in config:
+        if key in known:
+            continue
+        suggestion = difflib.get_close_matches(key, known, n=1)
+        hint = f" Did you mean '{suggestion[0]}'?" if suggestion else ""
+        logger.warning(
+            "[PROVIDER] Unknown config key '%s' for provider-anthropic.%s",
+            key,
+            hint,
+        )
+
+
 class AnthropicProvider:
     """Anthropic API integration.
 
@@ -573,6 +810,12 @@ class AnthropicProvider:
 
     name = "anthropic"
     api_label = "Anthropic"
+
+    # Zero-cost extension point for subclasses that add their own config
+    # keys: provider-openai learned in practice that it needed one after
+    # the fact (its own unknown-key sweep shipped without it first). An
+    # empty frozenset here costs nothing and avoids that retrofit.
+    EXTRA_KNOWN_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset()
 
     @staticmethod
     def _config_bool(value: Any) -> bool:
@@ -641,28 +884,54 @@ class AnthropicProvider:
         # Effort-family config keys. Canonical key: "reasoning_effort" (matches
         # the kernel's portable request.reasoning_effort). Legacy alias:
         # "effort". Both are consumed in _build_params; when both are set the
-        # canonical key wins — warn at construction so precedence is never
-        # silent.
-        if (
-            self.config.get("reasoning_effort") is not None
-            and self.config.get("effort") is not None
-        ):
-            logger.warning(
-                "[PROVIDER] Both 'reasoning_effort' and 'effort' are set in "
-                "config; 'reasoning_effort' (canonical) wins and 'effort'=%r "
-                "is ignored.",
-                self.config.get("effort"),
-            )
-        self.max_tokens = self.config.get(
-            "max_tokens", self._default_caps.max_output_tokens
+        # canonical key wins. "effort" is a DEPRECATED alias (D-03): still
+        # fully functional, but now warns even when used alone -- it
+        # previously stayed silent unless BOTH keys were set, which meant an
+        # "effort"-only config never learned it should migrate.
+        if "effort" in self.config:
+            if self.config.get("reasoning_effort") is not None:
+                logger.warning(
+                    "[PROVIDER] Both 'reasoning_effort' and 'effort' are set in "
+                    "config; 'reasoning_effort' (canonical) wins and 'effort'=%r "
+                    "is ignored. Remove 'effort'.",
+                    self.config.get("effort"),
+                )
+            else:
+                logger.warning(
+                    "[PROVIDER] Config key 'effort' is a DEPRECATED alias for "
+                    "'reasoning_effort' (the canonical key, matching the "
+                    "kernel's portable request.reasoning_effort). It still "
+                    "works; rename it to 'reasoning_effort'.",
+                )
+
+        # Targeted messages for recognized-but-inert keys (D-02), then the
+        # generic unknown-key sweep with did-you-mean (D-04). Runs after all
+        # config is read but before any other work, so it covers every key
+        # this constructor is ever going to look at.
+        for _inert_key, _inert_msg in _INERT_CONFIG_KEY_MESSAGES.items():
+            if _inert_key in self.config:
+                logger.warning(
+                    "[PROVIDER] Config key '%s' is %s", _inert_key, _inert_msg
+                )
+        _warn_unknown_config_keys(self.config, self.EXTRA_KNOWN_CONFIG_KEYS)
+        # Numeric config keys are coerced via the warn-and-default helpers
+        # below (_config_int / _config_float), not raw self.config.get().
+        # Before this, a settings.yaml string value like max_tokens: '8192'
+        # stayed a str all the way to the wire, and a typo'd value (e.g.
+        # overloaded_delay_multiplier: 'ten') raised ValueError at mount --
+        # killing the whole provider instance instead of warning and using a
+        # safe default. Every numeric key gets the same shape: fail soft,
+        # log loudly, never crash mount on a config typo.
+        self.max_tokens = self._config_int(
+            self.config.get("max_tokens"), self._default_caps.max_output_tokens
         )
-        self.temperature = self.config.get("temperature", 0.7)
-        self.priority = self.config.get("priority", 100)  # Store priority for selection
+        self.temperature = self._config_float(self.config.get("temperature"), 0.7)
+        self.priority = self._config_int(self.config.get("priority"), 100)
         self.raw = self._config_bool(
             self.config.get("raw", False)
         )  # Include raw payload in events
-        self.timeout = self.config.get(
-            "timeout", 600.0
+        self.timeout = self._config_float(
+            self.config.get("timeout"), 600.0
         )  # API timeout in seconds (default 10 minutes)
 
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
@@ -682,8 +951,8 @@ class AnthropicProvider:
             max_delay=self._retry_max_delay,
             jitter=self._retry_jitter,
         )
-        self._overloaded_delay_multiplier = float(
-            self.config.get("overloaded_delay_multiplier", 10.0)
+        self._overloaded_delay_multiplier = self._config_float(
+            self.config.get("overloaded_delay_multiplier"), 10.0
         )
 
         # Temporary model downgrade on persistent overloads.
@@ -693,37 +962,123 @@ class AnthropicProvider:
         self._fallback_on_overload = self._config_bool(
             self.config.get("fallback_on_overload", False)
         )
+        # Defaults corrected to the values actually used in practice: 4 of 5
+        # real deployed instances set retry_count='2' (one sets '3') and
+        # cooldown_seconds='300' explicitly. A 30-minute cooldown after a
+        # transient capacity blip stranded a whole session on a downgraded
+        # model long after real capacity had returned.
         self._fallback_retry_count = max(
-            0, self._config_int(self.config.get("fallback_retry_count", 1), 1)
+            0, self._config_int(self.config.get("fallback_retry_count", 2), 2)
         )
         self._fallback_cooldown_seconds = max(
             0.0,
             self._config_float(
-                self.config.get("fallback_cooldown_seconds", 1800.0), 1800.0
+                self.config.get("fallback_cooldown_seconds", 300.0), 300.0
             ),
         )
+        # 1M context is GA, DEFAULT, and billed at STANDARD PRICING on every
+        # model that has it (Opus 5/4.8/4.7/4.6, Sonnet 5/4.6, Fable 5,
+        # Mythos 5/Preview) -- verified against
+        # platform.claude.com/en/docs/build-with-claude/context-windows on
+        # 2026-08-29: "For every model with a 1M-token context window, 1M is
+        # the default: you don't need a beta header, and long-context
+        # requests are billed at standard pricing."
+        #
+        # There is NO long-context premium tier. Do not add one to _cost.py.
+        # The context-1m-2025-08-07 beta header is gone from Anthropic's
+        # docs and has been removed from this provider (C-01); sending an
+        # unrecognised beta header is a hard 400.
+        #
+        # This flag's ONLY remaining effect is the ADVERTISED context window
+        # handed to the context manager (get_info().defaults["context_window"]
+        # and ModelInfo.context_window in list_models()) -- i.e. how much
+        # conversation history the caller keeps per request, which is a COST
+        # decision, not a capability one. Default flipped True -> False: an
+        # honest default now that the flag no longer changes what the API
+        # will accept, only how much history is kept (and therefore billed
+        # for) per request.
         self._enable_1m_context = self._config_bool(
-            self.config.get("enable_1m_context", True)
+            self.config.get("enable_1m_context", False)
         )
-        self._fallback_sonnet_model = str(
-            self.config.get("fallback_sonnet_model", "claude-sonnet-4-6")
-        )
-        self._fallback_haiku_model = str(
-            self.config.get("fallback_haiku_model", "claude-haiku-4-5")
-        )
+
+        # Fallback target resolution: fallback_models (settings-only,
+        # per-family override) supersedes the two deleted scalar keys
+        # (fallback_sonnet_model / fallback_haiku_model). See
+        # _resolve_fallback_model for the full three-source precedence and
+        # _INERT_CONFIG_KEY_MESSAGES for the migration message the two
+        # retired keys now produce.
+        _raw_fallback_models = self.config.get("fallback_models")
+        self._fallback_models: dict[str, str] = {}
+        if _raw_fallback_models:
+            if isinstance(_raw_fallback_models, dict):
+                for _fam, _target in _raw_fallback_models.items():
+                    if _fam not in _FALLBACK_NEXT_FAMILY and _fam != "haiku":
+                        _suggestion = difflib.get_close_matches(
+                            str(_fam),
+                            (*_FALLBACK_NEXT_FAMILY.values(), *_FALLBACK_NEXT_FAMILY),
+                            n=1,
+                        )
+                        _hint = (
+                            f" Did you mean '{_suggestion[0]}'?" if _suggestion else ""
+                        )
+                        logger.warning(
+                            "[PROVIDER] Unknown family '%s' in config "
+                            "'fallback_models' -- ignoring.%s",
+                            _fam,
+                            _hint,
+                        )
+                        continue
+                    if _target:
+                        self._fallback_models[str(_fam)] = str(_target)
+            else:
+                raise ValueError(
+                    f"Invalid config 'fallback_models'={_raw_fallback_models!r} for "
+                    f"provider-anthropic: must be a mapping of family name "
+                    f"(opus/sonnet/haiku) to model id "
+                    f"(got {type(_raw_fallback_models).__name__}). Fix the "
+                    f"provider config (settings.yaml / bundle config block)."
+                )
+        # Live-refreshed "newest model per family" cache -- see
+        # _resolve_fallback_model (source 2) and _warm_family_latest.
+        self._family_latest: dict[str, str] = {}
+        self._family_latest_attempted = False
+
         self._persist_fallback_state = self._config_bool(
             self.config.get("persist_fallback_state", False)
         )
 
+        # Mount-time LOUD warning: fallback_on_overload has NO EFFECT on an
+        # instance whose default_model is already on the ladder's terminal
+        # rung (haiku) -- there is no lower tier to downgrade to. The wizard
+        # already hides this ConfigField for Haiku (show_when), so this
+        # specifically catches hand-edited settings.yaml.
+        if self._fallback_on_overload:
+            _fam = self._detect_family(self.default_model)
+            if _fam not in _FALLBACK_NEXT_FAMILY:
+                logger.warning(
+                    "[PROVIDER] fallback_on_overload is enabled for "
+                    "default_model=%r (family %r), but %r is the lowest tier "
+                    "on the Anthropic fallback ladder -- there is no "
+                    "lower-tier model to downgrade to, so this setting has "
+                    "NO EFFECT. Remove it, or point this instance at a "
+                    "higher-tier model (fable/mythos/opus/sonnet).",
+                    self.default_model,
+                    _fam,
+                    _fam,
+                )
+
         # Refusal fallback: when a model returns finish_reason="refusal", retry
-        # once against a configured fallback model (default: Opus). Orthogonal
-        # to the overload-fallback machinery above -- this is a single-shot
-        # retry triggered by response content, not by request errors.
+        # once against the SAME fallback ladder overload fallback uses.
+        # Orthogonal to the overload-fallback machinery above -- this is a
+        # single-shot retry triggered by response content, not by request
+        # errors. `refusal_fallback_model` (a hardcoded escalation target,
+        # always Opus) is RETIRED (owner-adjudicated): refusals now follow
+        # the same never-more-expensive downgrade ladder as overload,
+        # resolved via the same three-source precedence
+        # (fallback_models override -> live list_models cache -> static
+        # backstop). See _refusal_fallback_target.
         self._refusal_fallback_enabled = self._config_bool(
             self.config.get("refusal_fallback_enabled", True)
-        )
-        self._refusal_fallback_model = self.config.get(
-            "refusal_fallback_model", "claude-opus-4-8"
         )
 
         # Pre-emptive throttle configuration
@@ -731,8 +1086,12 @@ class AnthropicProvider:
         # Default 0.02 (2%) — only throttle when nearly exhausted, not at 10%.
         # Delay: fallback sleep when no reset timestamp is available.
         # Default 1.0s — just enough to ease pressure without punishing every request.
-        self._throttle_threshold = float(self.config.get("throttle_threshold", 0.02))
-        self._throttle_delay = float(self.config.get("throttle_delay", 1.0))
+        self._throttle_threshold = self._config_float(
+            self.config.get("throttle_threshold"), 0.02
+        )
+        self._throttle_delay = self._config_float(
+            self.config.get("throttle_delay"), 1.0
+        )
         self._rate_limit_state = _RateLimitState()
 
         # Process-wide concurrency gate.
@@ -741,9 +1100,25 @@ class AnthropicProvider:
         # This prevents blast patterns (e.g. parallel: true recipes spawning 20+
         # concurrent calls) that trigger Cloudflare bot-detection on api.anthropic.com.
         # Set to 0 to disable the semaphore entirely.
-        self._max_concurrent_requests = int(
-            self.config.get("max_concurrent_requests", 5)
+        self._max_concurrent_requests = self._config_int(
+            self.config.get("max_concurrent_requests"), 5
         )
+
+        # extra_request_params: the documented escape hatch for Messages API
+        # parameters this provider does not model. Merged into `params` LAST
+        # (see _merge_extra_request_params / _build_params), so it overrides
+        # every value the provider computed -- deliberately. Never a
+        # ConfigField; settings-only.
+        _extra = self.config.get("extra_request_params") or {}
+        if not isinstance(_extra, dict):
+            raise ValueError(  # noqa: TRY004 -- mount-time config-validation contract
+                f"Invalid config 'extra_request_params'={_extra!r} for "
+                f"provider-anthropic: must be a mapping of Messages API "
+                f"parameter names to values (got {type(_extra).__name__}). "
+                f"Fix the provider config (settings.yaml / bundle config block)."
+            )
+        self.extra_request_params: dict[str, Any] = dict(_extra)
+        self._extra_params_warned_keys: set[str] = set()
 
         # Use streaming API by default to support large context windows (Anthropic requires streaming
         # for operations that may take > 10 minutes, e.g. with 300k+ token contexts)
@@ -763,17 +1138,23 @@ class AnthropicProvider:
         # Default OFF. The system prompt + tool definitions are the most stable,
         # least-often-changing part of the request, so a 1h TTL is *structurally*
         # justified for them (unlike the conversation region, which changes most
-        # turns). But it is not free: (a) Anthropic bills 1h-TTL cache *writes*
-        # at a higher multiplier than the 5m default, and (b) it requires opting
-        # in to the `extended-cache-ttl-2025-04-11` beta header. Rather than
+        # turns). But it is not free: Anthropic bills 1h-TTL cache *writes* at a
+        # higher (2x vs 1.25x) multiplier than the 5m default. Rather than
         # silently changing billing behavior, this stays opt-in until a
         # deployment has measured that its system prompt is stable long enough
         # (and reused often enough) for the longer TTL to pay for itself.
         #
-        # NOTE: the beta header this requires is registered just below, once
-        # `self._beta_headers` exists (see "Beta headers support") -- and only
-        # when `enable_prompt_caching` is also on, since the knob has no
-        # effect at all when caching itself is disabled.
+        # C-10: NO beta header is required or sent for this. Anthropic's
+        # prompt-caching docs (platform.claude.com/en/docs/build-with-claude/
+        # prompt-caching, verified 2026-08-29) document the mechanism as the
+        # `ttl` field alone: "To use the extended cache, include ttl in the
+        # cache_control definition". The `extended-cache-ttl-2025-04-11` beta
+        # header does not appear anywhere on that page, and was confirmed live
+        # (2026-08-29) to be unnecessary: a request with `ttl: "1h"` and no
+        # beta header produces `cache_creation.ephemeral_1h_input_tokens > 0`
+        # exactly as expected. Sending it is harmless (also confirmed live --
+        # no 400), but there is no reason to keep code that adds a header the
+        # current docs don't mention.
         self.cache_stable_region_ttl_1h = self._config_bool(
             self.config.get("cache_stable_region_ttl_1h", False)
         )
@@ -813,24 +1194,16 @@ class AnthropicProvider:
                 else list(beta_headers_config)
             )
 
-        if self.cache_stable_region_ttl_1h:
-            if self.enable_prompt_caching:
-                _ttl_beta = "extended-cache-ttl-2025-04-11"
-                if _ttl_beta not in self._beta_headers:
-                    self._beta_headers.append(_ttl_beta)
-            else:
-                # The knob only affects cache breakpoints, which are never
-                # placed at all when prompt caching is off -- sending the
-                # beta header in that state would be pure noise (and would
-                # silently opt the account into 1h-TTL billing semantics for
-                # a feature that never fires). Log once so a user who set
-                # this expecting an effect isn't left guessing why nothing
-                # changed.
-                logger.info(
-                    "[PROVIDER] cache_stable_region_ttl_1h is set but "
-                    "enable_prompt_caching is False -- the 1h cache TTL "
-                    "knob has no effect without prompt caching enabled."
-                )
+        if self.cache_stable_region_ttl_1h and not self.enable_prompt_caching:
+            # The knob only affects cache breakpoints, which are never
+            # placed at all when prompt caching is off. Log once so a user
+            # who set this expecting an effect isn't left guessing why
+            # nothing changed.
+            logger.info(
+                "[PROVIDER] cache_stable_region_ttl_1h is set but "
+                "enable_prompt_caching is False -- the 1h cache TTL "
+                "knob has no effect without prompt caching enabled."
+            )
 
         if self._beta_headers:
             # Build anthropic-beta header value (comma-separated)
@@ -952,7 +1325,7 @@ class AnthropicProvider:
                     id="api_key",
                     display_name="API Key",
                     field_type="secret",
-                    prompt="Enter your Anthropic API key",
+                    prompt="Anthropic API key",
                     env_var="ANTHROPIC_API_KEY",
                 ),
                 ConfigField(
@@ -968,33 +1341,45 @@ class AnthropicProvider:
                     id="enable_1m_context",
                     display_name="1M Context Window",
                     field_type="boolean",
-                    prompt="Request 1M token context window when the selected model supports it",
+                    prompt=(
+                        "Use the full 1M-token context window "
+                        "(more context kept per request = higher cost)"
+                    ),
                     required=False,
-                    default="true",
+                    # Default flipped true -> false alongside the constructor
+                    # default (both must change together or the wizard and
+                    # the constructor disagree) -- see the enable_1m_context
+                    # comment in __init__ for the full C-01/C-02 rationale.
+                    default="false",
                     requires_model=True,  # Shown after model selection
                     show_when={
                         "default_model": "not_contains:haiku"
                     },  # Hide for Haiku (doesn't support 1M)
                 ),
                 ConfigField(
-                    id="enable_prompt_caching",
-                    display_name="Prompt Caching",
-                    field_type="boolean",
-                    prompt="Enable prompt caching? (Reduces cost by 90% on cached tokens)",
+                    # Canonical key -- matches the kernel's portable
+                    # request.reasoning_effort and the key used by the shipped
+                    # routing matrices. ConfigField.id is written verbatim into
+                    # settings.yaml, so this must be the canonical name, never
+                    # the legacy "effort" alias.
+                    id="reasoning_effort",
+                    display_name="Reasoning Effort",
+                    field_type="choice",
+                    choices=["low", "medium", "high", "xhigh", "max"],
+                    prompt="Reasoning effort -- higher is smarter, slower, costlier",
                     required=False,
-                    default="true",
+                    requires_model=True,  # Shown after model selection
+                    # Gate on the EFFECT surface (extended thinking), not on
+                    # output_config support: effort enables/sizes thinking on
+                    # every thinking-capable model, so hide it only for models
+                    # that don't support thinking at all (pre-4.5 Haiku).
+                    show_when={"default_model": "not_contains:haiku-3"},
                 ),
                 ConfigField(
                     id="cache_stable_region_ttl_1h",
                     display_name="1-Hour Cache TTL (Stable Regions)",
                     field_type="boolean",
-                    prompt=(
-                        "1-hour cache TTL for stable regions (system prompt + "
-                        "tools). Writes cost 2x vs 1.25x for the default "
-                        "5-minute TTL -- pays off when calls are >5 min apart "
-                        "or sessions are long. Leave unset for the 5-minute "
-                        "default."
-                    ),
+                    prompt="1-hour cache TTL -- 2x write cost, fewer writes",
                     required=False,
                     # No declared default -- an unset field is a real,
                     # visible third state ("use provider default") distinct
@@ -1007,111 +1392,19 @@ class AnthropicProvider:
                     # False)` above, so behavior is unchanged either way.
                     default=None,
                     requires_model=False,
-                    # Only meaningful once prompt caching itself is on --
-                    # both fields are pre-model, so enable_prompt_caching is
-                    # already collected by the time this is evaluated.
-                    show_when={"enable_prompt_caching": "true"},
-                ),
-                ConfigField(
-                    # Canonical key — matches the kernel's portable
-                    # request.reasoning_effort and the key used by the shipped
-                    # routing matrices. ConfigField.id is written verbatim into
-                    # settings.yaml, so this must be the canonical name, never
-                    # the legacy "effort" alias.
-                    id="reasoning_effort",
-                    display_name="Reasoning Effort",
-                    field_type="choice",
-                    choices=["low", "medium", "high", "xhigh", "max"],
-                    prompt=(
-                        "Default reasoning effort applied to every request. Like "
-                        "request.reasoning_effort, this ENABLES extended thinking "
-                        "and sets its depth, so it raises token cost on every call "
-                        "\u2014 leave blank unless you want stronger reasoning by default. "
-                        "low/medium/high work on all thinking-capable models; xhigh "
-                        "requires Opus 4.7+; max requires Opus 4.8+/Sonnet 4.6. "
-                        "On Opus 4.7+ it is also sent as output_config.effort. "
-                        "Unsupported values for the selected model are ignored."
-                    ),
-                    required=False,
-                    requires_model=True,  # Shown after model selection
-                    # Gate on the EFFECT surface (extended thinking), not on
-                    # output_config support: effort enables/sizes thinking on
-                    # every thinking-capable model, so hide it only for models
-                    # that don't support thinking at all (pre-4.5 Haiku).
-                    show_when={"default_model": "not_contains:haiku-3"},
-                ),
-                ConfigField(
-                    id="fallback_on_overload",
-                    display_name="Temporary Overload Downgrade",
-                    field_type="boolean",
-                    prompt="Downgrade temporarily if a higher-tier Claude model stays overloaded?",
-                    required=False,
-                    default="false",
-                    requires_model=True,
-                    show_when={
-                        "default_model": "not_contains:haiku"
-                    },  # No lower Anthropic family exists below Haiku
-                ),
-                ConfigField(
-                    id="fallback_retry_count",
-                    display_name="Retries Before Downgrade",
-                    field_type="text",
-                    prompt="How many overload retries before downgrading?",
-                    required=False,
-                    default="1",
-                    requires_model=True,
-                    show_when={"fallback_on_overload": "true"},
-                ),
-                ConfigField(
-                    id="fallback_cooldown_seconds",
-                    display_name="Downgrade Cooldown (seconds)",
-                    field_type="text",
-                    prompt="How long should the downgrade stay active before retrying the higher model?",
-                    required=False,
-                    default="1800",
-                    requires_model=True,
-                    show_when={"fallback_on_overload": "true"},
-                ),
-                ConfigField(
-                    id="persist_fallback_state",
-                    display_name="Share Downgrade State",
-                    field_type="boolean",
-                    prompt="Persist temporary downgrade state across separate Amplifier processes?",
-                    required=False,
-                    default="false",
-                    requires_model=True,
-                    show_when={"fallback_on_overload": "true"},
-                ),
-                ConfigField(
-                    id="fallback_sonnet_model",
-                    display_name="Opus Fallback Model",
-                    field_type="text",
-                    prompt="Model to use when Opus is overloaded",
-                    required=False,
-                    default="claude-sonnet-4-6",
-                    requires_model=True,
-                    show_when={
-                        "fallback_on_overload": "true",
-                        "default_model": "contains:opus",
-                    },
-                ),
-                ConfigField(
-                    id="fallback_haiku_model",
-                    display_name="Sonnet Fallback Model",
-                    field_type="text",
-                    prompt="Model to use when Sonnet is overloaded",
-                    required=False,
-                    default="claude-haiku-4-5",
-                    requires_model=True,
-                    show_when={
-                        "fallback_on_overload": "true",
-                        "default_model": "not_contains:haiku",
-                    },
+                    # show_when REMOVED (A-04): enable_prompt_caching is no
+                    # longer a ConfigField (demoted to settings-only below),
+                    # so the condition could never be satisfied in the
+                    # wizard. The inert combination (this on, prompt caching
+                    # off) is already handled loudly by the constructor
+                    # guard, which logs and continues.
                 ),
             ],
         )
 
-    async def list_models(self) -> list[ModelInfo]:
+    async def list_models(
+        self, retry_config: RetryConfig | None = None
+    ) -> list[ModelInfo]:
         """
         List available Claude models dynamically from Anthropic API.
 
@@ -1126,9 +1419,15 @@ class AnthropicProvider:
         for non-retryable errors (401/403/404) -- no fallback; caller
         handles empty lists.
 
+        `retry_config` lets a caller (namely `_warm_family_latest`) use a
+        cheaper retry policy than the instance default -- passed explicitly
+        rather than by mutating `self._retry_config`, which would not be
+        concurrency-safe under the process-wide semaphore.
+
         Returns:
             List of ModelInfo for available Claude models.
         """
+        active_retry_config = retry_config or self._retry_config
 
         async def _do_list_models():
             """Single API call attempt with SDK -> kernel error translation.
@@ -1231,7 +1530,7 @@ class AnthropicProvider:
             logger.warning(
                 "[PROVIDER] Retry %d/%d for list_models(): %s, sleeping %.1fs",
                 attempt,
-                self._retry_config.max_retries,
+                active_retry_config.max_retries,
                 error_type,
                 delay,
             )
@@ -1241,7 +1540,7 @@ class AnthropicProvider:
                     {
                         "provider": "anthropic",
                         "attempt": attempt,
-                        "max_retries": self._retry_config.max_retries,
+                        "max_retries": active_retry_config.max_retries,
                         "delay": delay,
                         "error_type": error_type,
                         "error_message": str(error),
@@ -1276,6 +1575,13 @@ class AnthropicProvider:
 
             # Sort by model_id descending (IDs contain dates like claude-sonnet-4-5-20250929)
             models.sort(key=lambda x: x[0], reverse=True)
+
+            # Free side-channel population of the fallback ladder's live
+            # "newest model per family" cache (B-03/_resolve_fallback_model
+            # source 2). Correct regardless of self.filtered -- models[0] is
+            # the latest either way; only models_to_include below branches
+            # on filtered.
+            self._family_latest[family] = models[0][0]
 
             # When filtered, only include the latest; otherwise include all
             models_to_include = [models[0]] if self.filtered else models
@@ -1317,7 +1623,7 @@ class AnthropicProvider:
     def _detect_family(model_id: str) -> str:
         """Detect the Claude model family from a model ID string."""
         model_lower = model_id.lower()
-        for family in ("fable", "opus", "sonnet", "haiku"):
+        for family in ("fable", "mythos", "opus", "sonnet", "haiku"):
             if family in model_lower:
                 return family
         return "sonnet"  # Default to sonnet for unknown models
@@ -1401,6 +1707,49 @@ class AnthropicProvider:
                 # enabled", HTTP 400, 2026-08-03) — the tool-support question
                 # itself could not be asked live. Left at the conservative
                 # dataclass default (False/None) rather than assumed.
+                min_cacheable_tokens=512,
+                capability_tags=(
+                    "tools",
+                    "thinking",
+                    "streaming",
+                    "json_mode",
+                    "vision",
+                ),
+            )
+
+        if family == "mythos":
+            # Cloned from the fable branch above -- Mythos 5 is Anthropic's
+            # other top-tier, always-on-adaptive-thinking family, priced
+            # identically to Fable 5 ($10/MTok base, 2026-08-29). Mythos
+            # PREVIEW differs from Mythos 5: no `xhigh` effort tier, and a
+            # 2048-token (not 512) prompt-cache minimum -- version-gated on
+            # (major, minor) exactly as the opus branch does; an unparseable
+            # version is treated as Mythos 5 (the newer, more-capable member),
+            # matching this provider's existing "unknown version assumes
+            # latest" convention.
+            major, minor = cls._detect_version(model_id, family)
+            is_preview = (major, minor) == (0, 0) and "preview" in model_id.lower()
+            return ModelCapabilities(
+                family=family,
+                max_output_tokens=128000,
+                supports_1m=True,
+                supports_thinking=True,
+                supports_adaptive_thinking=True,
+                supports_manual_thinking=False,
+                thinking_always_on=True,
+                supports_output_config=True,
+                supports_task_budget=True,
+                supports_sampling=False,
+                thinking_display_required=True,
+                supported_efforts=(
+                    ("low", "medium", "high", "max")
+                    if is_preview
+                    else ("low", "medium", "high", "xhigh", "max")
+                ),
+                supports_speed=False,
+                supports_inline_system=True,
+                default_thinking_budget=0,  # not used — adaptive only
+                min_cacheable_tokens=2048 if is_preview else 512,
                 capability_tags=(
                     "tools",
                     "thinking",
@@ -1411,9 +1760,11 @@ class AnthropicProvider:
             )
 
         if family == "opus":
+            is_45_plus = not version_known or (major, minor) >= (4, 5)
             is_46_plus = not version_known or (major, minor) >= (4, 6)
             is_47_plus = not version_known or (major, minor) >= (4, 7)
             is_48_plus = not version_known or (major, minor) >= (4, 8)
+            is_5_plus = not version_known or (major, minor) >= (5, 0)
             # Computer-use wire type, live-probed against api.anthropic.com
             # 2026-08-03 (bare {"type": ..., "name": "computer", "display_width_px":
             # 1024, "display_height_px": 768} declarations, matching anthropic-beta
@@ -1442,15 +1793,36 @@ class AnthropicProvider:
                 supports_thinking=True,
                 supports_adaptive_thinking=is_46_plus,
                 supports_manual_thinking=not is_47_plus,
-                supports_output_config=is_47_plus,
+                # Deprecated (still HTTP 200, verified live 2026-08-29,
+                # T-C08-live) on the one version where supports_manual_thinking
+                # is still True but the API considers "enabled" legacy: 4.6.
+                # 4.7+ already hard-gates to adaptive, so the two flags never
+                # both apply on the same model.
+                manual_thinking_deprecated=is_46_plus and not is_47_plus,
+                # Widened from is_47_plus to is_45_plus (X-1/Q-2): Anthropic's
+                # docs state the compatibility set directly --
+                # "Supported models: ... Opus 4.5, 4.6, 4.7, 4.8, and 5 ..."
+                # (platform.claude.com/en/docs/build-with-claude/effort,
+                # verified 2026-08-29). Confirmed live (T-C06-live, merge
+                # gate): output_config.effort="max" -> HTTP 200 on
+                # claude-opus-4-6.
+                supports_output_config=is_45_plus,
                 supports_task_budget=is_47_plus,
                 supports_sampling=not is_47_plus,
                 thinking_display_required=is_47_plus,
+                # xhigh: Fable 5/Mythos 5/Opus 5/4.8/4.7/Sonnet 5 (doc:
+                # "Available on Claude Fable 5, Claude Mythos 5, Claude Opus
+                # 5, Claude Opus 4.8, Claude Opus 4.7, and Claude Sonnet 5").
+                # max: the above PLUS Opus 4.6 and Sonnet 4.6 (doc's own
+                # explanation: "xhigh is a newer level; some models that
+                # support max don't support xhigh"). Both verified against
+                # platform.claude.com/en/docs/build-with-claude/effort,
+                # 2026-08-29.
                 supported_efforts=(
                     ("low", "medium", "high", "xhigh", "max")
-                    if is_48_plus
-                    else ("low", "medium", "high", "xhigh")
                     if is_47_plus
+                    else ("low", "medium", "high", "max")
+                    if is_46_plus
                     else ("low", "medium", "high")
                 ),
                 supports_speed=is_48_plus,
@@ -1458,6 +1830,21 @@ class AnthropicProvider:
                 default_thinking_budget=64000 if is_46_plus else 32000,
                 supports_native_computer_use=computer_use_tool_type is not None,
                 computer_use_tool_type=computer_use_tool_type,
+                # Non-monotonic by design -- 4.6->4096, 4.7->2048, 4.8->1024,
+                # 5->512 -- verified against
+                # platform.claude.com/en/docs/build-with-claude/prompt-caching,
+                # 2026-08-29. Written as an explicit descending version
+                # chain, not a >= threshold, so a future "simplification"
+                # doesn't flatten a real non-monotonic API constraint.
+                min_cacheable_tokens=(
+                    512
+                    if is_5_plus
+                    else 1024
+                    if is_48_plus
+                    else 2048
+                    if is_47_plus
+                    else 4096
+                ),
                 capability_tags=(
                     "tools",
                     "thinking",
@@ -1504,19 +1891,46 @@ class AnthropicProvider:
                 computer_use_tool_type = None
             return ModelCapabilities(
                 family="sonnet",
+                # 1M-context models are entitled to 128K output (verified
+                # platform.claude.com/en/docs/build-with-claude/context-windows,
+                # 2026-08-29: "A single request to any model with a 1M-token
+                # context window can generate up to 128k output tokens").
+                # Sonnet 4.6+ has 1M context (supports_1m below) but was never
+                # given the matching output ceiling and fell back to the
+                # dataclass default of 64000 -- clamping claude-sonnet-5 to
+                # half its real output capacity.
+                max_output_tokens=128000 if is_46_plus else 64000,
                 supports_1m=is_46_plus,
                 supports_thinking=True,
                 supports_adaptive_thinking=is_46_plus,
                 supports_manual_thinking=not is_5_plus,
-                supports_output_config=is_5_plus,
+                # Deprecated (still HTTP 200) but not yet hard-gated on 4.6 --
+                # mirrors the opus branch's manual_thinking_deprecated. 5+
+                # already hard-gates to adaptive via supports_manual_thinking.
+                manual_thinking_deprecated=is_46_plus and not is_5_plus,
+                # Widened from is_5_plus to is_46_plus (X-1/Q-2): doc states
+                # "Supported models: ... Sonnet 4.6 and 5"
+                # (platform.claude.com/en/docs/build-with-claude/effort,
+                # verified 2026-08-29). Confirmed live (T-C06-live, merge
+                # gate): output_config.effort="max" -> HTTP 200 on
+                # claude-sonnet-4-6.
+                supports_output_config=is_46_plus,
                 supports_task_budget=is_5_plus,
                 thinking_display_required=is_5_plus,
                 # Sonnet 5 rejects `temperature` ("deprecated for this model");
                 # omit it, matching the Opus 4.7+ pattern. amplifier-support#299.
                 supports_sampling=not is_5_plus,
+                # xhigh: Sonnet 5 only (doc: "Available on ... Claude Sonnet
+                # 5"). max: Sonnet 5 AND Sonnet 4.6 (doc: "some models that
+                # support max don't support xhigh" -- Sonnet 4.6 is exactly
+                # that case). Both verified against
+                # platform.claude.com/en/docs/build-with-claude/effort,
+                # 2026-08-29.
                 supported_efforts=(
                     ("low", "medium", "high", "xhigh", "max")
                     if is_5_plus
+                    else ("low", "medium", "high", "max")
+                    if is_46_plus
                     else ("low", "medium", "high")
                 ),
                 default_thinking_budget=32000,
@@ -1550,6 +1964,7 @@ class AnthropicProvider:
                 default_thinking_budget=32000 if is_45_plus else 0,
                 supports_native_computer_use=computer_use_tool_type is not None,
                 computer_use_tool_type=computer_use_tool_type,
+                min_cacheable_tokens=4096,
                 capability_tags=("tools", "streaming", "json_mode", "fast", "vision")
                 + (("thinking",) if is_45_plus else ()),
             )
@@ -1704,28 +2119,6 @@ class AnthropicProvider:
             deduped.append(header)
         return deduped
 
-    def _should_add_context_1m_beta(
-        self, model_id: str, request_caps: ModelCapabilities
-    ) -> bool:
-        """Return True when the effective model still needs the 1M beta header."""
-        if not self._enable_1m_context:
-            return False
-
-        family = self._detect_family(model_id)
-        if family == "haiku":
-            return False
-
-        major, minor = self._detect_version(model_id, family)
-        version = (major, minor)
-
-        if family == "opus":
-            # 1M context is GA for Opus 4.8+; beta header only needed for 4.6 and 4.7.
-            # Unknown versions (0, 0) assume latest (4.8+), so no header.
-            if version == (0, 0):
-                return False
-            return (4, 6) <= version < (4, 8)
-        return family == "sonnet" and (version == (0, 0) or version >= (4, 0))
-
     def _should_add_interleaved_beta(
         self,
         *,
@@ -1776,7 +2169,6 @@ class AnthropicProvider:
     def _build_request_beta_headers(
         self,
         *,
-        model_id: str,
         request_caps: ModelCapabilities,
         tools_present: bool,
         resolved_thinking_type: str | None,
@@ -1790,11 +2182,13 @@ class AnthropicProvider:
         required by model-native tool types present in it are derived here (see
         `NATIVE_TOOL_BETA_HEADERS`), so a caller declaring a beta-gated native
         tool does not also have to know - and inject - the matching header.
+
+        No 1M-context beta header is ever added here: 1M context is GA,
+        default, and standard-priced on every model that has it -- see the
+        `enable_1m_context` comment in __init__ for the verified citation.
         """
         headers = list(self._beta_headers)
         headers.extend(self._derive_native_tool_betas(tools))
-        if self._should_add_context_1m_beta(model_id, request_caps):
-            headers.append(BETA_HEADER_1M_CONTEXT)
         if self._should_add_interleaved_beta(
             request_caps=request_caps,
             tools_present=tools_present,
@@ -1868,51 +2262,119 @@ class AnthropicProvider:
             jitter=self._retry_jitter,
         )
 
-    def _fallback_target_for_model(self, model_id: str) -> str | None:
-        """Return the configured lower-tier fallback for a requested model."""
-        family = self._detect_family(model_id)
-        target: str | None
-        if family == "opus":
-            target = self._fallback_sonnet_model
-        elif family == "sonnet":
-            target = self._fallback_haiku_model
-        else:
-            return None
+    def _resolve_fallback_model(self, family: str) -> str | None:
+        """Concrete model id for a target FAMILY. Pure/synchronous by design.
 
-        if not target or target == model_id:
-            return None
+        Precedence:
+          1. `fallback_models` config override  -- explicit operator intent
+          2. live latest-per-family cache       -- refreshed from list_models()
+          3. _STATIC_FALLBACK_MODELS backstop   -- always present, never stale-fails
 
-        target_family = self._detect_family(target)
-        if target_family == family:
-            logger.warning(
-                "[PROVIDER] Ignoring invalid overload fallback %s -> %s (same family)",
-                model_id,
-                target,
+        This must NOT do network I/O: it is called from the 529 error path
+        (_open_fallback_window) and from the hot loop in complete(). A
+        list_models() call there would add latency and its own 529 risk at
+        exactly the moment the API is already saturated.
+        """
+        override = self._fallback_models.get(family)
+        if override:
+            return override
+        live = self._family_latest.get(family)
+        if live:
+            return live
+        return _STATIC_FALLBACK_MODELS.get(family)
+
+    async def _warm_family_latest(self) -> None:
+        """One best-effort list_models() to learn the newest model per family.
+
+        Runs on the HEALTHY path (before the first completion), never on the
+        error path -- so an overload event never pays for it. Single attempt
+        (max_retries=0) under a short timeout: this is an optimisation over
+        _STATIC_FALLBACK_MODELS, and a failure must cost nothing more than the
+        timeout. Attempted at most once per provider instance.
+        """
+        if self._family_latest_attempted:
+            return
+        self._family_latest_attempted = True
+        try:
+            async with asyncio.timeout(10.0):
+                await self.list_models(retry_config=self._build_retry_config(0))
+        except Exception as e:  # noqa: BLE001 -- optimisation only
+            logger.debug(
+                "[PROVIDER] Could not refresh fallback model list (%s: %s); "
+                "using static fallback targets.",
+                type(e).__name__,
+                e,
             )
-            return None
 
-        return target
+    def _fallback_target_for_model(self, model_id: str) -> str | None:
+        """Return the next lower-tier model on the fallback ladder, or None.
+
+        Walks _FALLBACK_NEXT_FAMILY downward from the model's own family,
+        SKIPPING any rung that resolves to nothing / to the model itself /
+        to the same family, rather than terminating there (the pre-overhaul
+        behaviour, which turned one blank config value into a dead ladder --
+        this is exactly what silently killed fallback for the `fable`
+        family, which had no rung at all in the old if/elif).
+
+        Returns None only when the ladder is genuinely exhausted -- i.e. the
+        model is already on the terminal rung (haiku), or every rung below it
+        resolved to something unusable.
+        """
+        source_family = self._detect_family(model_id)
+        family = source_family
+        seen: set[str] = {family}
+
+        while (family := _FALLBACK_NEXT_FAMILY.get(family)) is not None:
+            if family in seen:  # cycle guard against a pathological override map
+                logger.warning(
+                    "[PROVIDER] Fallback ladder cycle at family %r while "
+                    "resolving %s -- stopping.",
+                    family,
+                    model_id,
+                )
+                return None
+            seen.add(family)
+
+            target = self._resolve_fallback_model(family)
+            if not target or target == model_id:
+                continue  # rung unusable -- try the one below it
+            if self._detect_family(target) == source_family:
+                logger.warning(
+                    "[PROVIDER] Ignoring invalid overload fallback %s -> %s (same family)",
+                    model_id,
+                    target,
+                )
+                continue  # was: return None
+            return target
+
+        return None
 
     def _refusal_fallback_target(self, current_model: str) -> str | None:
-        """Resolve the configured refusal-fallback model, or None if fallback
-        should not be attempted (disabled, unconfigured, or would fall back
-        onto a model in the same family that just refused)."""
+        """Resolve the model to retry against after a refusal.
+
+        Owner-adjudicated: uses the SAME ladder as overload fallback --
+        refusal fallback is not a separate escalation path (the old
+        default hardcoded every family to Opus, which on inspection was
+        already silently dead for both `opus` instances: opus ->
+        claude-opus-4-8 -> same family -> None). Refusals now downgrade one
+        rung exactly like overload, via the same three-source target
+        resolution (fallback_models override -> live list_models cache ->
+        static backstop, skipping unusable rungs). Rationale: Anthropic's
+        own guidance for a refusal is to retry with a less-restrictive
+        model (i.e. downward, not up to the most expensive tier), and
+        fallback should never land on a model MORE expensive than the one
+        the user selected -- which the old hardcoded Opus-escalation
+        target violated for sonnet/haiku users. `refusal_fallback_model`
+        (the old explicit-override escape hatch) is RETIRED; see
+        _INERT_CONFIG_KEY_MESSAGES.
+
+        haiku is the ladder's terminal rung, so a haiku refusal has no
+        fallback target -- the refusal surfaces normally, exactly as
+        before for that instance.
+        """
         if not self._refusal_fallback_enabled:
             return None
-        target = self._refusal_fallback_model
-        if not target:
-            return None
-        target = str(target)
-        current_family = self._get_capabilities(current_model).family
-        target_family = self._get_capabilities(target).family
-        if target_family == current_family:
-            logger.warning(
-                "[PROVIDER] Ignoring invalid refusal fallback %s -> %s (same family)",
-                current_model,
-                target,
-            )
-            return None
-        return target
+        return self._fallback_target_for_model(current_model)
 
     @staticmethod
     def _strip_thinking_blocks(request: ChatRequest) -> ChatRequest:
@@ -1936,14 +2398,32 @@ class AnthropicProvider:
 
     @staticmethod
     def _is_overload_fallback_error(error: KernelLLMError) -> bool:
-        """Return True when the error indicates model overload, not generic throttling."""
+        """True only for genuine CAPACITY errors, which a downgrade can relieve.
+
+        529 (overloaded_error) is capacity pressure "across all users"
+        (platform.claude.com/docs/en/api/errors, verified 2026-08-29) -- a
+        lower-tier model is a different capacity pool, so the ladder helps.
+
+        429 (rate_limit_error) is NOT capacity. Per the same page it means
+        the ORGANIZATION hit a rate limit, a usage-tier spend cap, or a
+        workspace spend limit -- and "in rare cases, if your organization
+        has a sharp increase in usage, you might see 429 errors because of
+        acceleration limits ... ramp up your traffic gradually". Every one
+        of those is per-account: the lower-tier model draws on the SAME
+        org quota, so downgrading cannot help and merely hides the real
+        fix (back off / ramp gradually / raise the quota). The previous
+        substring test for "overload" in a 429 body is removed for that
+        reason -- a 429 now always falls through to the full retry budget
+        on the SAME model (exponential backoff honoring retry-after),
+        which is the documented correct response.
+
+        Spend-cap caveat, worth noting here: a tier spend-cap 429 has no
+        retry-after header and keeps failing until access resumes.
+        Retrying that is futile but harmless and bounded by max_retries;
+        detecting it specifically is out of scope.
+        """
         status_code = getattr(error, "status_code", None)
-        if isinstance(error, KernelProviderUnavailableError) and status_code == 529:
-            return True
-        if isinstance(error, KernelRateLimitError) and status_code == 429:
-            msg = str(error).lower()
-            return "overload" in msg or "overloaded" in msg
-        return False
+        return isinstance(error, KernelProviderUnavailableError) and status_code == 529
 
     def _resolve_effective_model(
         self, requested_model: str
@@ -2716,6 +3196,42 @@ class AnthropicProvider:
 
         return [block]
 
+    def _merge_extra_request_params(self, params: dict[str, Any]) -> None:
+        """Merge config ``extra_request_params`` into *params*, user-wins-loudly.
+
+        Known typed params go onto the typed surface; everything else goes
+        into extra_body, where the API will see it on the wire without the
+        SDK ever inspecting it. Whoever sets this owns the consequences.
+
+        Must run BEFORE ``_route_wire_only_params`` (see the call site in
+        ``_complete_chat_request``): a user-supplied ``temperature`` or
+        ``speed`` would otherwise land back on the typed SDK surface,
+        reproducing the exact "got an unexpected keyword argument" retry
+        bug ``_route_wire_only_params`` exists to prevent.
+        """
+        if not self.extra_request_params:
+            return
+        for key, value in self.extra_request_params.items():
+            if key in _TYPED_REQUEST_PARAMS:
+                if (
+                    key in params
+                    and params[key] != value
+                    and key not in self._extra_params_warned_keys
+                ):
+                    self._extra_params_warned_keys.add(key)
+                    logger.warning(
+                        "[PROVIDER] extra_request_params overrides provider-computed "
+                        "'%s' (%r -> %r).",
+                        key,
+                        params[key],
+                        value,
+                    )
+                params[key] = value
+            else:
+                extra_body = dict(params.get("extra_body") or {})
+                extra_body[key] = value  # user-wins: overwrite, NOT setdefault
+                params["extra_body"] = extra_body
+
     async def _complete_chat_request(
         self,
         request: ChatRequest,
@@ -3248,7 +3764,6 @@ class AnthropicProvider:
             params["stop_sequences"] = stop_sequences
 
         request_beta_headers = self._build_request_beta_headers(
-            model_id=params["model"],
             request_caps=request_caps,
             tools_present=bool(params.get("tools")),
             resolved_thinking_type=resolved_thinking_type,
@@ -3260,6 +3775,12 @@ class AnthropicProvider:
             extra_headers = dict(params.get("extra_headers", {}))
             extra_headers["anthropic-beta"] = ",".join(request_beta_headers)
             params["extra_headers"] = extra_headers
+
+        # The documented escape hatch, merged LAST -- after every provider-computed
+        # value, and BEFORE _route_wire_only_params so that a user-supplied
+        # `temperature`/`speed` is relocated to extra_body by the same router that
+        # handles the provider's own.
+        self._merge_extra_request_params(params)
 
         # Move wire-only params off the typed SDK surface. Must be the last
         # mutation of `params` before the call -- everything above may still

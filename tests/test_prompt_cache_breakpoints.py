@@ -106,7 +106,9 @@ def _long_tool_spec(name: str = "do_something") -> ToolSpec:
     )
 
 
-def _turn(user_text: str, assistant_text: str, ephemeral: bool = False) -> list[Message]:
+def _turn(
+    user_text: str, assistant_text: str, ephemeral: bool = False
+) -> list[Message]:
     """Build one simple user/assistant turn (no tool calls)."""
     return [
         Message(role="user", content=user_text),
@@ -157,7 +159,9 @@ def _run(provider: AnthropicProvider, request: ChatRequest) -> dict:
 def test_never_exceeds_four_breakpoints_with_system_tools_and_conversation():
     provider = _make_provider()
 
-    messages: list[Message] = [Message(role="system", content="You are a helpful assistant.")]
+    messages: list[Message] = [
+        Message(role="system", content="You are a helpful assistant.")
+    ]
     for i in range(6):
         messages.extend(_turn(f"question {i}", f"answer {i}"))
     messages.append(_ephemeral_tail("<system-reminder>live status</system-reminder>"))
@@ -270,8 +274,12 @@ def test_breakpoint_placement_stable_across_changing_ephemeral_tail():
         request = ChatRequest(messages=messages)
         return _run(provider, request)
 
-    params_a = _params_for_tail("<system-reminder>10:30:31 clean tree</system-reminder>")
-    params_b = _params_for_tail("<system-reminder>10:37:55 3 files changed</system-reminder>")
+    params_a = _params_for_tail(
+        "<system-reminder>10:30:31 clean tree</system-reminder>"
+    )
+    params_b = _params_for_tail(
+        "<system-reminder>10:37:55 3 files changed</system-reminder>"
+    )
 
     def _cached_block_texts(params: dict) -> list[str]:
         texts = []
@@ -397,7 +405,9 @@ def test_breakpoint_never_splits_a_tool_use_tool_result_pair():
         Message(role="user", content="do the thing"),
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_1", name="do_something", input={"value": "x"})],
+            content=[
+                ToolCallBlock(id="call_1", name="do_something", input={"value": "x"})
+            ],
         ),
         Message(role="tool", tool_call_id="call_1", content="tool output"),
         # No further stable content after the tool round -- the only
@@ -583,7 +593,9 @@ def test_multi_message_with_ephemeral_metadata_places_breakpoints_as_before(capl
         if isinstance(content, list):
             if any(isinstance(b, dict) and "cache_control" in b for b in content):
                 found_breakpoint = True
-    assert found_breakpoint, "expected at least one conversation-region cache breakpoint"
+    assert found_breakpoint, (
+        "expected at least one conversation-region cache breakpoint"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -610,7 +622,12 @@ def test_cache_stable_region_ttl_1h_defaults_off():
 def test_cache_stable_region_ttl_1h_opt_in_applies_to_system_and_tools_only():
     provider = _make_provider(cache_stable_region_ttl_1h=True)
     assert provider.cache_stable_region_ttl_1h is True
-    assert "extended-cache-ttl-2025-04-11" in provider._beta_headers
+    # C-10: NO beta header is required or sent for the 1h TTL. Confirmed
+    # live 2026-08-29 (T-C10-live): a request with ttl:"1h" and no beta
+    # header produces cache_creation.ephemeral_1h_input_tokens > 0. The
+    # `ttl` field on cache_control alone is the documented mechanism
+    # (platform.claude.com/en/docs/build-with-claude/prompt-caching).
+    assert "extended-cache-ttl-2025-04-11" not in provider._beta_headers
 
     messages = [Message(role="system", content="System prompt.")]
     messages.extend(_turn("question", "answer"))
@@ -691,9 +708,10 @@ def test_cache_stable_region_ttl_1h_config_field_advertised():
     # into an explicit True/False choice.
     assert field.default is None
     assert field.requires_model is False
-    # Both fields are pre-model, so this show_when is evaluated with
-    # enable_prompt_caching already collected -- see provider_config_utils.py.
-    assert field.show_when == {"enable_prompt_caching": "true"}
+    # show_when REMOVED (A-04): enable_prompt_caching is no longer a
+    # ConfigField (demoted to settings-only), so the condition could never
+    # be satisfied in the wizard.
+    assert field.show_when is None
 
 
 def test_cache_stable_region_ttl_1h_absent_key_still_defaults_to_false():
@@ -756,7 +774,9 @@ def test_breakpoint_never_lands_on_an_empty_text_block():
         Message(role="user", content="do the thing"),
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_1", name="do_something", input={"value": "x"})],
+            content=[
+                ToolCallBlock(id="call_1", name="do_something", input={"value": "x"})
+            ],
         ),
         Message(role="tool", tool_call_id="call_1", content="tool output"),
         # The content-less assistant turn: tool calls already replayed above, so
@@ -795,8 +815,7 @@ def test_breakpoint_never_lands_on_a_whitespace_only_text_block():
 
     offenders = _cache_controlled_empty_text_blocks(params)
     assert not offenders, (
-        "cache_control was stamped on a whitespace-only text block: "
-        f"{offenders}"
+        f"cache_control was stamped on a whitespace-only text block: {offenders}"
     )
 
 
@@ -1176,9 +1195,7 @@ def test_breakpoint_never_lands_on_a_thinking_only_turn():
 
     assert _thinking_blocks_on_wire(params) > 0
     offenders = _cache_controlled_thinking_blocks(params)
-    assert not offenders, (
-        f"cache_control landed on a thinking-only turn: {offenders}"
-    )
+    assert not offenders, f"cache_control landed on a thinking-only turn: {offenders}"
 
 
 def test_breakpoint_never_lands_on_a_redacted_thinking_block():

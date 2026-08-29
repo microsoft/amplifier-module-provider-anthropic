@@ -84,53 +84,68 @@ class TestBaseUrlConfigField:
 
 
 class TestFallbackConfigFields:
-    """Tests for overload fallback ConfigField declarations."""
+    """Fallback ConfigFields are all DEMOTED or REMOVED (A-06..A-08): the
+    wizard slims from 12 fields to 5. Demoted keys (fallback_on_overload,
+    persist_fallback_state, fallback_retry_count, fallback_cooldown_seconds,
+    enable_prompt_caching) keep working exactly as before -- settings-only.
+    fallback_sonnet_model/fallback_haiku_model are true removals (C-04)."""
 
-    def test_fallback_toggle_is_declared(self):
+    def test_fallback_toggle_no_longer_a_config_field(self):
         provider = AnthropicProvider("test-api-key", {})
         info = provider.get_info()
+        assert not any(f.id == "fallback_on_overload" for f in info.config_fields)
+        # Key still fully functional, settings-only.
+        provider2 = AnthropicProvider("test-api-key", {"fallback_on_overload": "true"})
+        assert provider2._fallback_on_overload is True
 
-        fallback_field = next(
-            (f for f in info.config_fields if f.id == "fallback_on_overload"),
-            None,
-        )
-
-        assert fallback_field is not None
-        assert fallback_field.display_name == "Temporary Overload Downgrade"
-        assert fallback_field.field_type == "boolean"
-        assert fallback_field.default == "false"
-        assert fallback_field.requires_model is True
-
-    def test_fallback_models_have_expected_defaults(self):
+    def test_fallback_sonnet_and_haiku_model_fields_removed(self):
+        """C-04: fallback_sonnet_model/fallback_haiku_model are retired
+        entirely (superseded by fallback_models), not just demoted."""
         provider = AnthropicProvider("test-api-key", {})
         info = provider.get_info()
+        assert not any(f.id == "fallback_sonnet_model" for f in info.config_fields)
+        assert not any(f.id == "fallback_haiku_model" for f in info.config_fields)
 
-        sonnet_field = next(
-            (f for f in info.config_fields if f.id == "fallback_sonnet_model"),
-            None,
-        )
-        haiku_field = next(
-            (f for f in info.config_fields if f.id == "fallback_haiku_model"),
-            None,
-        )
+        import logging
 
-        assert sonnet_field is not None
-        assert sonnet_field.default == "claude-sonnet-4-6"
+        with self._caplog_records() as records:
+            AnthropicProvider(
+                "test-api-key",
+                {"fallback_sonnet_model": "x", "fallback_haiku_model": "y"},
+            )
+        messages = [r.getMessage() for r in records]
+        assert any("fallback_sonnet_model" in m and "removed" in m for m in messages)
+        assert any("fallback_haiku_model" in m and "removed" in m for m in messages)
 
-        assert haiku_field is not None
-        assert haiku_field.default == "claude-haiku-4-5"
+    @staticmethod
+    def _caplog_records():
+        import logging
 
-    def test_persist_fallback_state_toggle_is_declared(self):
+        class _Capture:
+            def __enter__(self):
+                self.handler = logging.Handler()
+                self.records: list[logging.LogRecord] = []
+                self.handler.emit = self.records.append
+                logging.getLogger("amplifier_module_provider_anthropic").addHandler(
+                    self.handler
+                )
+                logging.getLogger("amplifier_module_provider_anthropic").setLevel(
+                    logging.WARNING
+                )
+                return self.records
+
+            def __exit__(self, *exc):
+                logging.getLogger("amplifier_module_provider_anthropic").removeHandler(
+                    self.handler
+                )
+
+        return _Capture()
+
+    def test_persist_fallback_state_no_longer_a_config_field(self):
         provider = AnthropicProvider("test-api-key", {})
         info = provider.get_info()
-
-        persist_field = next(
-            (f for f in info.config_fields if f.id == "persist_fallback_state"),
-            None,
+        assert not any(f.id == "persist_fallback_state" for f in info.config_fields)
+        provider2 = AnthropicProvider(
+            "test-api-key", {"persist_fallback_state": "true"}
         )
-
-        assert persist_field is not None
-        assert persist_field.display_name == "Share Downgrade State"
-        assert persist_field.field_type == "boolean"
-        assert persist_field.default == "false"
-        assert persist_field.requires_model is True
+        assert provider2._persist_fallback_state is True
