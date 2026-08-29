@@ -653,16 +653,24 @@ class AnthropicProvider:
                 "is ignored.",
                 self.config.get("effort"),
             )
-        self.max_tokens = self.config.get(
-            "max_tokens", self._default_caps.max_output_tokens
+        # Numeric config keys are coerced via the warn-and-default helpers
+        # below (_config_int / _config_float), not raw self.config.get().
+        # Before this, a settings.yaml string value like max_tokens: '8192'
+        # stayed a str all the way to the wire, and a typo'd value (e.g.
+        # overloaded_delay_multiplier: 'ten') raised ValueError at mount --
+        # killing the whole provider instance instead of warning and using a
+        # safe default. Every numeric key gets the same shape: fail soft,
+        # log loudly, never crash mount on a config typo.
+        self.max_tokens = self._config_int(
+            self.config.get("max_tokens"), self._default_caps.max_output_tokens
         )
-        self.temperature = self.config.get("temperature", 0.7)
-        self.priority = self.config.get("priority", 100)  # Store priority for selection
+        self.temperature = self._config_float(self.config.get("temperature"), 0.7)
+        self.priority = self._config_int(self.config.get("priority"), 100)
         self.raw = self._config_bool(
             self.config.get("raw", False)
         )  # Include raw payload in events
-        self.timeout = self.config.get(
-            "timeout", 600.0
+        self.timeout = self._config_float(
+            self.config.get("timeout"), 600.0
         )  # API timeout in seconds (default 10 minutes)
 
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
@@ -682,8 +690,8 @@ class AnthropicProvider:
             max_delay=self._retry_max_delay,
             jitter=self._retry_jitter,
         )
-        self._overloaded_delay_multiplier = float(
-            self.config.get("overloaded_delay_multiplier", 10.0)
+        self._overloaded_delay_multiplier = self._config_float(
+            self.config.get("overloaded_delay_multiplier"), 10.0
         )
 
         # Temporary model downgrade on persistent overloads.
@@ -731,8 +739,12 @@ class AnthropicProvider:
         # Default 0.02 (2%) — only throttle when nearly exhausted, not at 10%.
         # Delay: fallback sleep when no reset timestamp is available.
         # Default 1.0s — just enough to ease pressure without punishing every request.
-        self._throttle_threshold = float(self.config.get("throttle_threshold", 0.02))
-        self._throttle_delay = float(self.config.get("throttle_delay", 1.0))
+        self._throttle_threshold = self._config_float(
+            self.config.get("throttle_threshold"), 0.02
+        )
+        self._throttle_delay = self._config_float(
+            self.config.get("throttle_delay"), 1.0
+        )
         self._rate_limit_state = _RateLimitState()
 
         # Process-wide concurrency gate.
@@ -741,8 +753,8 @@ class AnthropicProvider:
         # This prevents blast patterns (e.g. parallel: true recipes spawning 20+
         # concurrent calls) that trigger Cloudflare bot-detection on api.anthropic.com.
         # Set to 0 to disable the semaphore entirely.
-        self._max_concurrent_requests = int(
-            self.config.get("max_concurrent_requests", 5)
+        self._max_concurrent_requests = self._config_int(
+            self.config.get("max_concurrent_requests"), 5
         )
 
         # Use streaming API by default to support large context windows (Anthropic requires streaming
