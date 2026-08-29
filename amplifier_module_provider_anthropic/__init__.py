@@ -1504,6 +1504,15 @@ class AnthropicProvider:
                 computer_use_tool_type = None
             return ModelCapabilities(
                 family="sonnet",
+                # 1M-context models are entitled to 128K output (verified
+                # platform.claude.com/en/docs/build-with-claude/context-windows,
+                # 2026-08-29: "A single request to any model with a 1M-token
+                # context window can generate up to 128k output tokens").
+                # Sonnet 4.6+ has 1M context (supports_1m below) but was never
+                # given the matching output ceiling and fell back to the
+                # dataclass default of 64000 -- clamping claude-sonnet-5 to
+                # half its real output capacity.
+                max_output_tokens=128000 if is_46_plus else 64000,
                 supports_1m=is_46_plus,
                 supports_thinking=True,
                 supports_adaptive_thinking=is_46_plus,

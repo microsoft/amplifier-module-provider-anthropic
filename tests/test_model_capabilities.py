@@ -213,6 +213,18 @@ class TestGetCapabilitiesSonnet:
         caps = AnthropicProvider._get_capabilities("claude-sonnet-4-5-20250929")
         assert caps.max_output_tokens == 64000
 
+    def test_sonnet_46_plus_max_output_tokens_is_128k(self):
+        """Sonnet 4.6+ has a 1M context window and is entitled to 128K output
+        (platform.claude.com/en/docs/build-with-claude/context-windows,
+        2026-08-29). Regression guard for the bug where the sonnet branch
+        never set max_output_tokens and silently inherited the dataclass
+        default of 64000, clamping claude-sonnet-5 to half its real ceiling.
+        """
+        caps = AnthropicProvider._get_capabilities("claude-sonnet-4-6")
+        assert caps.max_output_tokens == 128000
+        caps5 = AnthropicProvider._get_capabilities("claude-sonnet-5")
+        assert caps5.max_output_tokens == 128000
+
     def test_sonnet_supports_thinking(self):
         caps = AnthropicProvider._get_capabilities("claude-sonnet-4-5-20250929")
         assert caps.supports_thinking is True
