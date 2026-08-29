@@ -10,6 +10,7 @@ __all__ = ["mount", "AnthropicProvider"]
 __amplifier_module_type__ = "provider"
 
 import asyncio
+import difflib
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ import uuid
 from decimal import Decimal
 from threading import Lock
 from typing import Any
+from typing import ClassVar
 
 from dataclasses import dataclass
 from dataclasses import field
@@ -561,6 +563,138 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     return cleanup
 
 
+# ---------------------------------------------------------------------------
+# Config-key allowlist -- unknown-key sweep with did-you-mean (D-01..D-04)
+# ---------------------------------------------------------------------------
+# Every config key this module actually reads -- audited against every
+# `self.config.get(...)` call site, in BOTH the constructor AND the deferred
+# request path. The eight *_build_params / _build_web_search_tool keys below
+# are the reason this list cannot be derived from __init__ alone: they are
+# never touched at construction, and an allowlist built only from the
+# constructor would false-positive on every extended-thinking user.
+#
+# NOTE: fallback_sonnet_model/fallback_haiku_model/refusal_fallback_model are
+# still consumed at this point in the release sequence -- they are moved to
+# _INERT_CONFIG_KEY_MESSAGES once the fallback-ladder commits that replace
+# them land (fallback_models supersedes the first two; the ladder itself
+# supersedes the third).
+_CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        # --- constructor / mount ---
+        "api_key",
+        "base_url",
+        "default_model",
+        "max_tokens",
+        "temperature",
+        "priority",
+        "raw",
+        "timeout",
+        "reasoning_effort",
+        "max_retries",
+        "min_retry_delay",
+        "max_retry_delay",
+        "retry_jitter",
+        "overloaded_delay_multiplier",
+        "fallback_on_overload",
+        "fallback_retry_count",
+        "fallback_cooldown_seconds",
+        "persist_fallback_state",
+        "fallback_state_path",
+        "fallback_sonnet_model",
+        "fallback_haiku_model",
+        "refusal_fallback_enabled",
+        "refusal_fallback_model",
+        "throttle_threshold",
+        "throttle_delay",
+        "rate_limit_state_path",
+        "max_concurrent_requests",
+        "use_streaming",
+        "filtered",
+        "enable_1m_context",
+        "enable_prompt_caching",
+        "cache_stable_region_ttl_1h",
+        "enable_web_search",
+        "beta_headers",
+        # --- deferred: read in _build_params (:3056-3230 pre-overhaul) ---
+        "thinking_budget_tokens",
+        "thinking_budget_buffer",
+        "thinking_type",
+        "thinking_display",
+        "task_budget_tokens",
+        "speed",
+        # --- deferred: read in _build_web_search_tool ---
+        "web_search_max_uses",
+        "web_search_user_location",
+    }
+)
+
+# Infrastructure keys the app/kernel places in (or alongside) a provider's
+# config block that this module does not itself read: metadata fields a
+# settings-shaped provider entry carries. `api_key` and `default_model` are
+# already in _CONSUMED_CONFIG_KEYS (this module reads both).
+_INFRASTRUCTURE_CONFIG_KEYS: frozenset[str] = frozenset({"id", "module", "source"})
+
+# Keys that are recognized but currently do nothing. Each gets its own
+# targeted warning naming what to do instead, and is therefore *excluded*
+# from the generic unknown-key sweep so no key ever produces two warnings.
+#
+# `debug` and `raw_debug` are ghosts: grep for '"debug"|raw_debug' across
+# this module returns zero matches. They exist only in README.md's
+# now-deleted "Debug Configuration" section, which documented two options
+# that were never implemented. Anyone who followed the README has them set
+# and gets nothing -- they must warn, not vanish silently.
+_INERT_CONFIG_KEY_MESSAGES: dict[str, str] = {
+    "debug": (
+        "not consumed by provider-anthropic and has no effect. It was never "
+        "implemented; the README documented it in error. For request/response "
+        "payload capture use `raw: true`."
+    ),
+    "raw_debug": (
+        "not consumed by provider-anthropic and has no effect. See `debug`; "
+        "use `raw: true` for full request/response payloads in llm:request / "
+        "llm:response events."
+    ),
+}
+_RECOGNIZED_INERT_CONFIG_KEYS: frozenset[str] = frozenset(_INERT_CONFIG_KEY_MESSAGES)
+
+# Deprecated aliases: still fully functional, but the canonical key should be
+# used. Must stay "known" or they would draw a SECOND, generic unknown-key
+# warning on top of the targeted deprecation warning each already gets.
+_DEPRECATED_ALIAS_CONFIG_KEYS: dict[str, str] = {
+    "effort": "reasoning_effort",
+}
+
+_KNOWN_CONFIG_KEYS: frozenset[str] = (
+    _CONSUMED_CONFIG_KEYS
+    | _RECOGNIZED_INERT_CONFIG_KEYS
+    | frozenset(_DEPRECATED_ALIAS_CONFIG_KEYS)
+    | _INFRASTRUCTURE_CONFIG_KEYS
+)
+
+
+def _warn_unknown_config_keys(
+    config: dict[str, Any], extra_known: frozenset[str] = frozenset()
+) -> None:
+    """Warn on any config key that is neither consumed, recognized-inert,
+    a deprecated alias, nor an infrastructure key -- with a did-you-mean
+    suggestion drawn from the full known-key set.
+
+    `extra_known` lets a subclass (via `EXTRA_KNOWN_CONFIG_KEYS`) extend the
+    allowlist without needing to fork this function.
+    """
+    known = _KNOWN_CONFIG_KEYS | extra_known
+    for key in config:
+        if key in known:
+            continue
+        suggestion = difflib.get_close_matches(key, known, n=1)
+        hint = f" Did you mean '{suggestion[0]}'?" if suggestion else ""
+        logger.warning(
+            "[PROVIDER] Unknown config key '%s' for provider-anthropic.%s",
+            key,
+            hint,
+        )
+
+
 class AnthropicProvider:
     """Anthropic API integration.
 
@@ -573,6 +707,12 @@ class AnthropicProvider:
 
     name = "anthropic"
     api_label = "Anthropic"
+
+    # Zero-cost extension point for subclasses that add their own config
+    # keys: provider-openai learned in practice that it needed one after
+    # the fact (its own unknown-key sweep shipped without it first). An
+    # empty frozenset here costs nothing and avoids that retrofit.
+    EXTRA_KNOWN_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset()
 
     @staticmethod
     def _config_bool(value: Any) -> bool:
@@ -641,18 +781,36 @@ class AnthropicProvider:
         # Effort-family config keys. Canonical key: "reasoning_effort" (matches
         # the kernel's portable request.reasoning_effort). Legacy alias:
         # "effort". Both are consumed in _build_params; when both are set the
-        # canonical key wins — warn at construction so precedence is never
-        # silent.
-        if (
-            self.config.get("reasoning_effort") is not None
-            and self.config.get("effort") is not None
-        ):
-            logger.warning(
-                "[PROVIDER] Both 'reasoning_effort' and 'effort' are set in "
-                "config; 'reasoning_effort' (canonical) wins and 'effort'=%r "
-                "is ignored.",
-                self.config.get("effort"),
-            )
+        # canonical key wins. "effort" is a DEPRECATED alias (D-03): still
+        # fully functional, but now warns even when used alone -- it
+        # previously stayed silent unless BOTH keys were set, which meant an
+        # "effort"-only config never learned it should migrate.
+        if "effort" in self.config:
+            if self.config.get("reasoning_effort") is not None:
+                logger.warning(
+                    "[PROVIDER] Both 'reasoning_effort' and 'effort' are set in "
+                    "config; 'reasoning_effort' (canonical) wins and 'effort'=%r "
+                    "is ignored. Remove 'effort'.",
+                    self.config.get("effort"),
+                )
+            else:
+                logger.warning(
+                    "[PROVIDER] Config key 'effort' is a DEPRECATED alias for "
+                    "'reasoning_effort' (the canonical key, matching the "
+                    "kernel's portable request.reasoning_effort). It still "
+                    "works; rename it to 'reasoning_effort'.",
+                )
+
+        # Targeted messages for recognized-but-inert keys (D-02), then the
+        # generic unknown-key sweep with did-you-mean (D-04). Runs after all
+        # config is read but before any other work, so it covers every key
+        # this constructor is ever going to look at.
+        for _inert_key, _inert_msg in _INERT_CONFIG_KEY_MESSAGES.items():
+            if _inert_key in self.config:
+                logger.warning(
+                    "[PROVIDER] Config key '%s' is %s", _inert_key, _inert_msg
+                )
+        _warn_unknown_config_keys(self.config, self.EXTRA_KNOWN_CONFIG_KEYS)
         # Numeric config keys are coerced via the warn-and-default helpers
         # below (_config_int / _config_float), not raw self.config.get().
         # Before this, a settings.yaml string value like max_tokens: '8192'

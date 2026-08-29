@@ -1,0 +1,48 @@
+feat(config): unknown-key sweep with did-you-mean; targeted inert-key messages
+
+Ports the config-surface pattern from provider-openai's v2 overhaul
+(config-surface-v2-openai): a module-level allowlist of every config key
+this provider actually reads (_CONSUMED_CONFIG_KEYS, 41 keys -- audited
+against every self.config.get() call site in BOTH the constructor and
+the deferred request path, since 8 keys are read only in _build_params /
+_build_web_search_tool and a constructor-only audit would false-positive
+on every extended-thinking or web-search user), plus:
+
+  - _INERT_CONFIG_KEY_MESSAGES: targeted, actionable warnings for keys
+    that are recognized but currently do nothing. `debug` and `raw_debug`
+    are ghosts -- README.md's "Debug Configuration" section documented
+    both for as long as that section has existed, but neither was ever
+    implemented (grep for them across __init__.py returns zero matches).
+    Anyone who followed the README has them set and got silence; now
+    they get a warning naming the real key (`raw`).
+  - _DEPRECATED_ALIAS_CONFIG_KEYS + a two-case warning block: `effort`
+    (the legacy alias for `reasoning_effort`) now warns even when used
+    ALONE, not just when both keys are set -- previously an `effort`-only
+    config never learned it should migrate.
+  - _warn_unknown_config_keys(): the generic sweep, with a difflib
+    did-you-mean suggestion, run after all config is read.
+  - EXTRA_KNOWN_CONFIG_KEYS (ClassVar, empty by default): a zero-cost
+    subclass extension point. provider-openai needed to retrofit this
+    after the fact (its own sweep shipped without it first) -- adding it
+    now avoids that repeat.
+
+No config keys are removed in this commit (per the release's revert
+safety: fallback_sonnet_model/fallback_haiku_model/refusal_fallback_model
+remain fully consumed until the fallback-ladder commits that replace
+them land, later in this series).
+
+New tests (tests/test_config_surface.py): T-D01 (deferred keys present
+in the allowlist), T-D02 (the sweep produces zero false positives on
+the owner's 5 real settings.yaml instances -- shared OWNER_LIVE_CONFIGS
+fixture reused by the full migration acceptance test later in this
+series), T-D03 (did-you-mean), T-D04/T-D05 (targeted inert-key
+messages, single and double), T-D06 (effort alias: alone -> deprecated,
+with reasoning_effort -> both-set, never both), T-D07 (subclass
+extension point). 12 new tests.
+
+Part of the config-surface + fallback-ladder + docs-alignment overhaul.
+Spec: anthropic-surface-spec.md D-01..D-04 (commit 3/9).
+
+🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>

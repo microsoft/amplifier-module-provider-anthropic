@@ -14,7 +14,70 @@ import logging
 
 import pytest
 
+from amplifier_module_provider_anthropic import _CONSUMED_CONFIG_KEYS
 from amplifier_module_provider_anthropic import AnthropicProvider
+
+# ---------------------------------------------------------------------------
+# The owner's 5 live provider-anthropic settings.yaml instances, verbatim
+# (anthropic-surface-spec.md §7). Shared by the unknown-key-sweep tests here
+# and by the full migration acceptance test added once the fallback-ladder
+# key removals land (see test_fallback_ladder.py /
+# test_migration_owner_instances.py).
+# ---------------------------------------------------------------------------
+OWNER_LIVE_CONFIGS: dict[str, dict] = {
+    "opus-4.8": {
+        "default_model": "claude-opus-4-8",
+        "fallback_on_overload": "true",
+        "fallback_retry_count": "2",
+        "fallback_cooldown_seconds": "300",
+        "fallback_sonnet_model": "claude-sonnet-4-6",
+        "fallback_haiku_model": "claude-haiku-4-5",
+        "persist_fallback_state": "true",
+        "enable_1m_context": "true",
+        "reasoning_effort": "xhigh",
+        "enable_prompt_caching": "true",
+    },
+    "opus": {
+        "default_model": "claude-opus-5",
+        "fallback_on_overload": "true",
+        "fallback_retry_count": "2",
+        "fallback_cooldown_seconds": "300",
+        "fallback_sonnet_model": "claude-sonnet-4-6",
+        "fallback_haiku_model": "claude-haiku-4-5",
+        "persist_fallback_state": "true",
+        "enable_1m_context": "true",
+        "reasoning_effort": "xhigh",
+        "enable_prompt_caching": "true",
+    },
+    "sonnet": {
+        "default_model": "claude-sonnet-5",
+        "fallback_on_overload": "true",
+        "fallback_retry_count": "2",
+        "fallback_cooldown_seconds": "300",
+        "fallback_haiku_model": "claude-haiku-4-5",
+        "persist_fallback_state": "true",
+        "enable_1m_context": "true",
+        "reasoning_effort": "high",
+        "enable_prompt_caching": "true",
+    },
+    "haiku": {
+        "default_model": "claude-haiku-4-5-20251001",
+        "reasoning_effort": "high",
+        "enable_prompt_caching": "true",
+    },
+    "fable": {
+        "default_model": "claude-fable-5",
+        "fallback_on_overload": "true",
+        "fallback_retry_count": "3",
+        "fallback_cooldown_seconds": "300",
+        "fallback_sonnet_model": "claude-sonnet-4-6",
+        "fallback_haiku_model": "claude-haiku-4-5",
+        "persist_fallback_state": "false",
+        "enable_1m_context": "true",
+        "reasoning_effort": "xhigh",
+        "enable_prompt_caching": "true",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # D-05 / D-06 -- numeric coercion via _config_int / _config_float
@@ -119,3 +182,119 @@ def test_numeric_real_type_passthrough():
     assert provider.priority == 7
     assert provider.timeout == 45.0
     assert provider.temperature == 0.3
+
+
+# ---------------------------------------------------------------------------
+# D-01..D-04 -- unknown-key sweep, targeted inert messages, did-you-mean
+# ---------------------------------------------------------------------------
+
+# The eight keys read only in the deferred request path (_build_params /
+# _build_web_search_tool), never at construction. An allowlist derived only
+# from __init__ would false-positive on every one of these.
+_DEFERRED_KEYS = {
+    "thinking_budget_tokens",
+    "thinking_budget_buffer",
+    "thinking_type",
+    "thinking_display",
+    "task_budget_tokens",
+    "speed",
+    "web_search_max_uses",
+    "web_search_user_location",
+}
+
+
+def test_consumed_config_keys_contains_all_deferred_keys():
+    """T-D01: _CONSUMED_CONFIG_KEYS must include every key read outside the
+    constructor, or every extended-thinking / web-search user gets a false
+    unknown-key warning."""
+    missing = _DEFERRED_KEYS - _CONSUMED_CONFIG_KEYS
+    assert not missing, f"deferred keys missing from _CONSUMED_CONFIG_KEYS: {missing}"
+
+
+@pytest.mark.parametrize("name,config", list(OWNER_LIVE_CONFIGS.items()))
+def test_no_false_positive_unknown_key_warning_on_owner_live_configs(
+    name: str, config: dict, caplog
+):
+    """T-D02 (unknown-key-sweep half): every key set by the owner's 5 real
+    settings.yaml instances (anthropic-surface-spec.md §7) is a recognized
+    key -- mounting must never emit a generic 'Unknown config key' warning
+    for any of them. (Targeted inert-key warnings, e.g. for the
+    fallback_sonnet_model/fallback_haiku_model keys once they are retired by
+    the fallback-ladder change, are a SEPARATE, expected signal -- see the
+    full migration acceptance test added alongside that change.)
+    """
+    with caplog.at_level(logging.WARNING):
+        _make_provider(config)
+    unknown_key_warnings = [
+        r.message for r in caplog.records if "Unknown config key" in r.message
+    ]
+    assert not unknown_key_warnings, (
+        f"instance {name!r} produced unexpected unknown-key warning(s): "
+        f"{unknown_key_warnings}"
+    )
+
+
+def test_unknown_key_warns_with_did_you_mean(caplog):
+    """T-D03: a typo'd key gets a 'did you mean' suggestion drawn from the
+    known-key set."""
+    with caplog.at_level(logging.WARNING):
+        _make_provider({"temperture": 1})  # typo of "temperature"
+    matches = [r.message for r in caplog.records if "Unknown config key" in r.message]
+    assert len(matches) == 1
+    assert "did you mean" in matches[0].lower()
+    assert "temperature" in matches[0]
+
+
+def test_single_inert_key_emits_exactly_one_targeted_warning(caplog):
+    """T-D04 (adapted): a single recognized-inert key ('debug', a ghost key
+    documented in the README but never implemented) emits exactly one
+    warning, and it is the TARGETED inert-key message, not the generic
+    unknown-key sweep warning."""
+    with caplog.at_level(logging.WARNING):
+        _make_provider({"debug": True})
+    debug_warnings = [r.message for r in caplog.records if "'debug'" in r.message]
+    assert len(debug_warnings) == 1
+    assert "not consumed" in debug_warnings[0]
+    assert not any("Unknown config key" in r.message for r in caplog.records)
+
+
+def test_debug_and_raw_debug_each_emit_a_targeted_warning(caplog):
+    """T-D05: both README-ghost keys warn independently."""
+    with caplog.at_level(logging.WARNING):
+        _make_provider({"debug": True, "raw_debug": True})
+    assert any("'debug'" in r.message for r in caplog.records)
+    assert any("'raw_debug'" in r.message for r in caplog.records)
+
+
+def test_effort_alias_alone_warns_deprecated_not_both_set(caplog):
+    """T-D06 (part 1): 'effort' alone -> a deprecation warning, never the
+    both-set warning."""
+    with caplog.at_level(logging.WARNING):
+        _make_provider({"effort": "high"})
+    messages = [r.message for r in caplog.records if "effort" in r.message.lower()]
+    assert any("DEPRECATED" in m for m in messages)
+    assert not any("Both 'reasoning_effort'" in m for m in messages)
+
+
+def test_effort_and_reasoning_effort_both_set_warns_both_set_not_deprecated(caplog):
+    """T-D06 (part 2): both keys set -> the both-set warning, never the
+    bare-deprecation warning (never both)."""
+    with caplog.at_level(logging.WARNING):
+        _make_provider({"effort": "high", "reasoning_effort": "low"})
+    messages = [r.message for r in caplog.records if "effort" in r.message.lower()]
+    both_set = [m for m in messages if "Both 'reasoning_effort'" in m]
+    bare_deprecated = [m for m in messages if "DEPRECATED" in m and "Both" not in m]
+    assert len(both_set) == 1
+    assert not bare_deprecated
+
+
+def test_extra_known_config_keys_subclass_extension_point(caplog):
+    """T-D07: a subclass's EXTRA_KNOWN_CONFIG_KEYS suppresses the
+    unknown-key warning for its own key."""
+
+    class _SubclassProvider(AnthropicProvider):
+        EXTRA_KNOWN_CONFIG_KEYS = frozenset({"my_custom_key"})
+
+    with caplog.at_level(logging.WARNING):
+        _SubclassProvider(api_key="test-key", config={"my_custom_key": "value"})
+    assert not any("Unknown config key" in r.message for r in caplog.records)
