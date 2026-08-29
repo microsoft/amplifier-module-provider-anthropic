@@ -259,44 +259,14 @@ class TestOpus47ThinkingFallback:
 
 
 # ---------------------------------------------------------------------------
-# TestBetaHeader1MFix — 1M context beta header uses >= instead of ==
-# ---------------------------------------------------------------------------
-
-
-class TestBetaHeader1MFix:
-    """1M context beta header uses >= instead of ==."""
-
-    def _check(self, model_id: str) -> bool:
-        provider = _make_provider(default_model=model_id)
-        caps = AnthropicProvider._get_capabilities(model_id)
-        return provider._should_add_context_1m_beta(model_id, caps)
-
-    def test_opus_46_gets_1m_header(self):
-        assert self._check("claude-opus-4-6-20260101") is True
-
-    def test_opus_47_gets_1m_header(self):
-        assert self._check("claude-opus-4-7-20260416") is True
-
-    def test_opus_unknown_no_1m_header(self):
-        # Unknown opus versions assume latest (4.8+) where 1M is GA — no header needed.
-        assert self._check("claude-opus-latest") is False
-
-    def test_opus_45_no_1m_header(self):
-        assert self._check("claude-opus-4-5-20251101") is False
-
-    def test_haiku_never_gets_1m_header(self):
-        assert self._check("claude-haiku-4-5-20251001") is False
-
-    def test_sonnet_46_gets_1m_header(self):
-        assert self._check("claude-sonnet-4-6-20260101") is True
-
-    def test_sonnet_45_gets_1m_header(self):
-        assert self._check("claude-sonnet-4-5-20250929") is True
-
-    def test_sonnet_unknown_gets_1m_header(self):
-        assert self._check("claude-sonnet-latest") is True
-
-
+# NOTE: TestBetaHeader1MFix (the old ">= instead of ==" 1M-beta-header
+# threshold tests) is REMOVED here. 1M context is GA, default, and
+# standard-priced on every model that has it -- no beta header is ever
+# required, on any model or version. _should_add_context_1m_beta is
+# deleted entirely (see anthropic-surface-spec.md C-01); its replacement
+# invariant ("no 1M header, ever") is covered by
+# test_model_capabilities.py::TestContextBetaHeaderNeverSent and
+# test_fallback.py::test_enable_1m_context_never_adds_a_beta_header.
 # ---------------------------------------------------------------------------
 # TestOpus47OutputConfig — output_config.effort on Opus 4.7
 # ---------------------------------------------------------------------------
@@ -872,7 +842,9 @@ class TestSonnet5Temperature:
         provider.client.messages.with_raw_response.create = AsyncMock(
             return_value=_make_raw_mock()
         )
-        request = ChatRequest(messages=[Message(role="user", content="Name this session")])
+        request = ChatRequest(
+            messages=[Message(role="user", content="Name this session")]
+        )
         asyncio.run(provider.complete(request))
         params = _get_api_params(provider.client.messages.with_raw_response.create)
         assert "temperature" not in params

@@ -322,7 +322,6 @@ class TestFastModeBetaHeader:
         provider = AnthropicProvider(api_key="test-key", config={"max_retries": 0})
         caps = AnthropicProvider._get_capabilities("claude-opus-4-8")
         headers = provider._build_request_beta_headers(
-            model_id="claude-opus-4-8",
             request_caps=caps,
             tools_present=False,
             resolved_thinking_type=None,
@@ -337,7 +336,6 @@ class TestFastModeBetaHeader:
         provider = AnthropicProvider(api_key="test-key", config={"max_retries": 0})
         caps = AnthropicProvider._get_capabilities("claude-opus-4-8")
         headers = provider._build_request_beta_headers(
-            model_id="claude-opus-4-8",
             request_caps=caps,
             tools_present=False,
             resolved_thinking_type=None,
@@ -346,48 +344,42 @@ class TestFastModeBetaHeader:
         assert BETA_HEADER_FAST_MODE not in headers
 
 
-class TestContextBetaHeaderOpus48:
-    """Opus 4.8+ should NOT get the 1M context beta header (1M is GA)."""
+class TestContextBetaHeaderNeverSent:
+    """1M context is GA/default/standard-priced on every model that has it
+    (platform.claude.com/en/docs/build-with-claude/context-windows, verified
+    2026-08-29) -- no beta header is EVER required or sent for it, on any
+    model, regardless of version. _should_add_context_1m_beta and
+    BETA_HEADER_1M_CONTEXT are removed entirely (C-01)."""
 
     def test_opus_48_no_1m_beta_header(self):
-        from amplifier_module_provider_anthropic import BETA_HEADER_1M_CONTEXT
-
         provider = AnthropicProvider(api_key="test-key", config={"max_retries": 0})
         caps = AnthropicProvider._get_capabilities("claude-opus-4-8")
         headers = provider._build_request_beta_headers(
-            model_id="claude-opus-4-8",
             request_caps=caps,
             tools_present=False,
             resolved_thinking_type=None,
         )
-        assert BETA_HEADER_1M_CONTEXT not in headers
+        assert "context-1m-2025-08-07" not in headers
 
-    def test_opus_47_still_gets_1m_beta_header(self):
-        from amplifier_module_provider_anthropic import BETA_HEADER_1M_CONTEXT
-
+    def test_opus_47_no_1m_beta_header(self):
         provider = AnthropicProvider(api_key="test-key", config={"max_retries": 0})
         caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
         headers = provider._build_request_beta_headers(
-            model_id="claude-opus-4-7-20260416",
             request_caps=caps,
             tools_present=False,
             resolved_thinking_type=None,
         )
-        assert BETA_HEADER_1M_CONTEXT in headers
+        assert "context-1m-2025-08-07" not in headers
 
     def test_opus_unknown_version_no_1m_beta_header(self):
-        """Unknown opus version assumes latest (4.8+), so no 1M header needed."""
-        from amplifier_module_provider_anthropic import BETA_HEADER_1M_CONTEXT
-
         provider = AnthropicProvider(api_key="test-key", config={"max_retries": 0})
         caps = AnthropicProvider._get_capabilities("claude-opus-latest")
         headers = provider._build_request_beta_headers(
-            model_id="claude-opus-latest",
             request_caps=caps,
             tools_present=False,
             resolved_thinking_type=None,
         )
-        assert BETA_HEADER_1M_CONTEXT not in headers
+        assert "context-1m-2025-08-07" not in headers
 
 
 class TestSpeedConfigPlumbing:
@@ -403,7 +395,6 @@ class TestSpeedConfigPlumbing:
         caps = AnthropicProvider._get_capabilities("claude-opus-4-7-20260416")
         assert caps.supports_speed is False
         headers = provider._build_request_beta_headers(
-            model_id="claude-opus-4-7-20260416",
             request_caps=caps,
             tools_present=False,
             resolved_thinking_type=None,

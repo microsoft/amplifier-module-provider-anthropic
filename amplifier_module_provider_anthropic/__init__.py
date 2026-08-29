@@ -323,7 +323,6 @@ NATIVE_TOOL_BETA_HEADERS: dict[str, str] = {
     "computer_20251124": "computer-use-2025-11-24",
 }
 
-BETA_HEADER_1M_CONTEXT = "context-1m-2025-08-07"
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
 BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
 BETA_HEADER_FAST_MODE = "fast-mode-2026-02-01"
@@ -965,8 +964,29 @@ class AnthropicProvider:
                 self.config.get("fallback_cooldown_seconds", 300.0), 300.0
             ),
         )
+        # 1M context is GA, DEFAULT, and billed at STANDARD PRICING on every
+        # model that has it (Opus 5/4.8/4.7/4.6, Sonnet 5/4.6, Fable 5,
+        # Mythos 5/Preview) -- verified against
+        # platform.claude.com/en/docs/build-with-claude/context-windows on
+        # 2026-08-29: "For every model with a 1M-token context window, 1M is
+        # the default: you don't need a beta header, and long-context
+        # requests are billed at standard pricing."
+        #
+        # There is NO long-context premium tier. Do not add one to _cost.py.
+        # The context-1m-2025-08-07 beta header is gone from Anthropic's
+        # docs and has been removed from this provider (C-01); sending an
+        # unrecognised beta header is a hard 400.
+        #
+        # This flag's ONLY remaining effect is the ADVERTISED context window
+        # handed to the context manager (get_info().defaults["context_window"]
+        # and ModelInfo.context_window in list_models()) -- i.e. how much
+        # conversation history the caller keeps per request, which is a COST
+        # decision, not a capability one. Default flipped True -> False: an
+        # honest default now that the flag no longer changes what the API
+        # will accept, only how much history is kept (and therefore billed
+        # for) per request.
         self._enable_1m_context = self._config_bool(
-            self.config.get("enable_1m_context", True)
+            self.config.get("enable_1m_context", False)
         )
 
         # Fallback target resolution: fallback_models (settings-only,
@@ -1313,7 +1333,13 @@ class AnthropicProvider:
                     field_type="boolean",
                     prompt="Request 1M token context window when the selected model supports it",
                     required=False,
-                    default="true",
+                    # Default flipped true -> false alongside the constructor
+                    # default (both must change together or the wizard and
+                    # the constructor disagree) -- see the enable_1m_context
+                    # comment in __init__ for the full C-01/C-02 rationale.
+                    # Prompt text is reworded in the wizard-slimming commit
+                    # later in this series (A-03).
+                    default="false",
                     requires_model=True,  # Shown after model selection
                     show_when={
                         "default_model": "not_contains:haiku"
@@ -2115,28 +2141,6 @@ class AnthropicProvider:
             deduped.append(header)
         return deduped
 
-    def _should_add_context_1m_beta(
-        self, model_id: str, request_caps: ModelCapabilities
-    ) -> bool:
-        """Return True when the effective model still needs the 1M beta header."""
-        if not self._enable_1m_context:
-            return False
-
-        family = self._detect_family(model_id)
-        if family == "haiku":
-            return False
-
-        major, minor = self._detect_version(model_id, family)
-        version = (major, minor)
-
-        if family == "opus":
-            # 1M context is GA for Opus 4.8+; beta header only needed for 4.6 and 4.7.
-            # Unknown versions (0, 0) assume latest (4.8+), so no header.
-            if version == (0, 0):
-                return False
-            return (4, 6) <= version < (4, 8)
-        return family == "sonnet" and (version == (0, 0) or version >= (4, 0))
-
     def _should_add_interleaved_beta(
         self,
         *,
@@ -2187,7 +2191,6 @@ class AnthropicProvider:
     def _build_request_beta_headers(
         self,
         *,
-        model_id: str,
         request_caps: ModelCapabilities,
         tools_present: bool,
         resolved_thinking_type: str | None,
@@ -2201,11 +2204,13 @@ class AnthropicProvider:
         required by model-native tool types present in it are derived here (see
         `NATIVE_TOOL_BETA_HEADERS`), so a caller declaring a beta-gated native
         tool does not also have to know - and inject - the matching header.
+
+        No 1M-context beta header is ever added here: 1M context is GA,
+        default, and standard-priced on every model that has it -- see the
+        `enable_1m_context` comment in __init__ for the verified citation.
         """
         headers = list(self._beta_headers)
         headers.extend(self._derive_native_tool_betas(tools))
-        if self._should_add_context_1m_beta(model_id, request_caps):
-            headers.append(BETA_HEADER_1M_CONTEXT)
         if self._should_add_interleaved_beta(
             request_caps=request_caps,
             tools_present=tools_present,
@@ -3781,7 +3786,6 @@ class AnthropicProvider:
             params["stop_sequences"] = stop_sequences
 
         request_beta_headers = self._build_request_beta_headers(
-            model_id=params["model"],
             request_caps=request_caps,
             tools_present=bool(params.get("tools")),
             resolved_thinking_type=resolved_thinking_type,

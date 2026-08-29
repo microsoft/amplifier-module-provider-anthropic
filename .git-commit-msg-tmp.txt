@@ -1,75 +1,54 @@
-fix(fallback)!: a 429 is per-account -- back off, never downgrade; refusal fallback follows the same ladder
+fix(docs-align)!: 1M context is GA -- delete the beta-header path
 
-**B-06 -- 429 is not overload.** `_is_overload_fallback_error` classified
-a 429 as an overload trigger when its body happened to contain the
-substring "overload"/"overloaded". Per Anthropic's error docs
-(platform.claude.com/docs/en/api/errors, verified 2026-08-29): a 429 is
-`rate_limit_error` -- "Your organization has hit a rate limit, reached
-its usage tier's monthly spend cap, or reached a spend limit" -- i.e.
-PER-ACCOUNT. A lower-tier model draws on the SAME org quota, so
-downgrading cannot relieve it; it only hides the real fix (back off,
-ramp up gradually, or raise the quota). The substring branch is deleted
-entirely -- a 429 now always falls through to the full retry budget on
-the SAME model (exponential backoff honoring retry-after), which is the
-documented correct response. No new code path was required; deleting
-the 429 branch is sufficient.
+Verified against platform.claude.com/en/docs/build-with-claude/context-windows
+on 2026-08-29: "For every model with a 1M-token context window, 1M is the
+default: you don't need a beta header, and long-context requests are
+billed at standard pricing." The string "context-1m" appears zero times
+on that page.
 
-**B-07 -- refusal fallback: owner-adjudicated Q-1, option (a).**
-Decision: the fable->opus->sonnet->haiku downgrade ladder now applies to
-BOTH fallback types -- overload AND refusal. Rationale (owner's, recorded
-here verbatim): (1) Anthropic's own guidance for a refusal is to retry
-with a less-restrictive model, i.e. downward, not up to the most
-expensive tier; (2) there is a product expectation that fallback never
-lands on a model MORE expensive than the one the user selected -- which
-the old hardcoded refusal-escalation target (always claude-opus-4-8)
-actually violated for sonnet/haiku users. This is not a pure regression:
-inspection shows both `opus` instances' refusal fallback was ALREADY
-silently dead under the old chain (opus -> claude-opus-4-8 -> same
-family -> None).
+C-01: deletes `_should_add_context_1m_beta` entirely (it computed which
+models still needed the header, on a version threshold that was already
+wrong -- Sonnet 4.5 was included when Anthropic's own docs say it has a
+200K window, not 1M), deletes the `BETA_HEADER_1M_CONTEXT` constant, and
+deletes the call site in `_build_request_beta_headers`. The now-unused
+`model_id` parameter is removed from `_build_request_beta_headers`'s
+signature and its one call site (verified via grep that no other caller
+depends on it).
 
-`refusal_fallback_model` (the explicit hardcoded-escalation override) is
-RETIRED ENTIRELY -- not merely defaulted to None with an override path
-retained. `_refusal_fallback_target` now delegates straight to
-`_fallback_target_for_model`, using the EXACT SAME three-source
-resolution as overload fallback (fallback_models override -> live
-list_models cache -> static backstop, skipping unusable rungs).
-`refusal_fallback_enabled` remains the gate, default unchanged. Haiku
-refusal is now terminal -- the refusal surfaces normally, exactly as a
-haiku response always has. Thinking-block stripping on the refusal
-retry (`_strip_thinking_blocks`) is unchanged and still runs -- still
-required cross-model. The key moves to _INERT_CONFIG_KEY_MESSAGES with
-a targeted migration message naming the replacement mechanism.
+C-02/A-03: `enable_1m_context`'s constructor default flips `True` ->
+`False`, with the ConfigField's declared default flipped to match in the
+same commit (both must change together or the wizard and the
+constructor disagree; the ConfigField's prompt text reword is deferred
+to the wizard-slimming commit later in this series). A comment at the
+assignment site encodes the no-premium-tier invariant so cost modeling
+never re-adds a long-context price tier: `enable_1m_context`'s only
+remaining effect is the ADVERTISED context window handed to the context
+manager (how much history is kept per request), which is a cost
+decision, not a capability one -- it no longer changes what the API
+will accept or send.
 
-Deviation from the draft spec, called out explicitly per task
-instruction: the spec's own text for "option (a)" retained
-`refusal_fallback_model` as a still-functional override that "wins" over
-the ladder (so an owner could set it on sonnet/haiku to preserve the old
-escalation behavior). The owner's adjudication supersedes that: the key
-is removed entirely, with no override path -- refusal fallback follows
-the ladder unconditionally once refusal_fallback_enabled is true. This
-also means T-B16 as originally specified ("explicit refusal_fallback_model
-still wins over the ladder") does not apply; it is replaced with tests
-asserting the key is retired and inert, and that refusal fallback uses
-the same fallback_models-based resolution as overload.
-
-New/updated tests: tests/test_fallback_ladder.py gains T-B15 (refusal on
-opus resolves to the ladder's claude-sonnet-5 target, not the old
-claude-opus-4-8, and not None). tests/test_fallback.py's
-`test_429_overloaded_body_also_triggers_fallback` is INVERTED to
-`test_429_overloaded_body_does_not_trigger_fallback` -- every attempt now
-stays on the same model. tests/test_refusal_fallback.py rewritten:
-the fallback-target assertion updates from the hardcoded
-claude-opus-4-8 to the ladder's claude-sonnet-5 (fable's actual next
-rung); the same-family loop-guard test is rebuilt against a pathological
-`fallback_models` override (since the old `refusal_fallback_model`
-override no longer exists to construct the scenario with); a new
-terminal-rung test confirms haiku refusals have no fallback target; a
-new test confirms the refusal ladder shares fallback_models' override
-precedence with overload fallback.
+Test changes:
+  - tests/test_fallback.py: 3 of the 4 existing 1M-beta-header tests are
+    deleted (they asserted the header's conditional presence, which no
+    longer exists at all); the 4th
+    (test_enable_1m_context_does_not_become_global_beta_header) is
+    RE-POINTED to test_enable_1m_context_never_adds_a_beta_header --
+    asserting the real invariant (no 1M header, ever, for any value of
+    enable_1m_context) rather than the narrower "not a GLOBAL header"
+    claim. A new end-to-end variant confirms no header reaches a live
+    request either.
+  - tests/test_model_capabilities.py: TestContextBetaHeaderOpus48 (which
+    asserted the header's presence threshold) is replaced with
+    TestContextBetaHeaderNeverSent (the header is absent for every
+    version, opus included). TestFastModeBetaHeader and
+    TestSpeedConfigPlumbing updated to drop the now-removed `model_id=`
+    kwarg from `_build_request_beta_headers` call sites.
+  - tests/test_opus_47.py: TestBetaHeader1MFix (8 tests asserting the
+    now-deleted `_should_add_context_1m_beta`'s per-version threshold
+    behavior) is removed; a comment points to its replacement coverage.
 
 Part of the config-surface + fallback-ladder + docs-alignment overhaul.
-Spec: anthropic-surface-spec.md B-06, B-07 (owner-adjudicated Q-1,
-option (a) as amended) (commit 6/9).
+Spec: anthropic-surface-spec.md C-01, C-02, A-03 (default only) (commit 7/9).
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 

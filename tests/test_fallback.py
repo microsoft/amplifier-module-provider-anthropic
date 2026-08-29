@@ -227,12 +227,21 @@ class TestTemporaryFallbackOnOverload:
         assert fallback_call.kwargs["thinking"]["type"] == "enabled"
         assert fallback_call.kwargs["thinking"]["budget_tokens"] == 63_999
 
-    def test_enable_1m_context_does_not_become_global_beta_header(self):
-        provider = _make_provider("claude-sonnet-4-6", enable_1m_context=True)
-        assert anthropic_module.BETA_HEADER_1M_CONTEXT not in provider._beta_headers
+    def test_enable_1m_context_never_adds_a_beta_header(self):
+        """1M context is GA, default, and standard-priced on every model
+        that has it (platform.claude.com/en/docs/build-with-claude/context-windows,
+        verified 2026-08-29) -- no beta header is ever required or sent,
+        regardless of enable_1m_context's value. The context-1m-2025-08-07
+        beta header and _should_add_context_1m_beta are removed entirely
+        (C-01); this test is re-pointed from asserting a narrow "not a
+        GLOBAL header" claim to the real invariant: no 1M header, ever."""
+        for enabled in (True, False):
+            provider = _make_provider("claude-sonnet-4-6", enable_1m_context=enabled)
+            assert not hasattr(anthropic_module, "BETA_HEADER_1M_CONTEXT")
+            assert "context-1m-2025-08-07" not in provider._beta_headers
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_sonnet_46_adds_context_beta_header_when_enabled(self, mock_sleep):
+    def test_enable_1m_context_true_sends_no_beta_header_end_to_end(self, mock_sleep):
         provider = _make_provider("claude-sonnet-4-6", enable_1m_context=True)
         provider._get_runtime_model_info = AsyncMock(
             return_value=_runtime_model_info(
@@ -251,70 +260,7 @@ class TestTemporaryFallbackOnOverload:
             provider.client.messages.with_raw_response.create.await_args.kwargs
         )
         beta_header = call_kwargs.get("extra_headers", {}).get("anthropic-beta", "")
-        assert anthropic_module.BETA_HEADER_1M_CONTEXT in beta_header
-
-    @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_haiku_fallback_does_not_inherit_context_beta_header(self, mock_sleep):
-        provider = _make_provider(
-            "claude-sonnet-4-6",
-            enable_1m_context=True,
-            fallback_on_overload=True,
-            fallback_retry_count=1,
-            fallback_cooldown_seconds=300,
-        )
-        provider._get_runtime_model_info = AsyncMock(
-            side_effect=[
-                _runtime_model_info(max_input_tokens=1_000_000, max_tokens=64_000),
-                _runtime_model_info(max_input_tokens=200_000, max_tokens=64_000),
-            ]
-        )
-        provider.client.messages.with_raw_response.create = AsyncMock(
-            side_effect=[
-                _make_sdk_overloaded_error(),
-                _make_sdk_overloaded_error(),
-                _make_raw_success("claude-haiku-4-5"),
-            ]
-        )
-
-        result = asyncio.run(provider.complete(_simple_request()))
-
-        assert result is not None
-        first_call = provider.client.messages.with_raw_response.create.await_args_list[
-            0
-        ]
-        fallback_call = (
-            provider.client.messages.with_raw_response.create.await_args_list[-1]
-        )
-        first_header = first_call.kwargs.get("extra_headers", {}).get(
-            "anthropic-beta", ""
-        )
-        fallback_header = fallback_call.kwargs.get("extra_headers", {}).get(
-            "anthropic-beta", ""
-        )
-        assert anthropic_module.BETA_HEADER_1M_CONTEXT in first_header
-        assert anthropic_module.BETA_HEADER_1M_CONTEXT not in fallback_header
-
-    @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_sonnet_45_still_adds_context_beta_header_when_enabled(self, mock_sleep):
-        provider = _make_provider("claude-sonnet-4-5", enable_1m_context=True)
-        provider._get_runtime_model_info = AsyncMock(
-            return_value=_runtime_model_info(
-                max_input_tokens=200_000,
-                max_tokens=64_000,
-            )
-        )
-        provider.client.messages.with_raw_response.create = AsyncMock(
-            return_value=_make_raw_success("claude-sonnet-4-5")
-        )
-
-        result = asyncio.run(provider.complete(_simple_request()))
-
-        assert result is not None
-        call_kwargs = (
-            provider.client.messages.with_raw_response.create.await_args.kwargs
-        )
-        beta_header = call_kwargs.get("extra_headers", {}).get("anthropic-beta", "")
-        assert anthropic_module.BETA_HEADER_1M_CONTEXT in beta_header
+        assert "context-1m-2025-08-07" not in beta_header
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
     def test_persisted_breaker_state_is_opt_in(self, mock_sleep, tmp_path):
