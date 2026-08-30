@@ -1638,16 +1638,29 @@ class AnthropicProvider:
         """
         model_lower = model_id.lower()
 
-        # Prefer family-MAJOR-MINOR where MINOR is a short semantic version part,
+        # Current ids put the family first: claude-opus-4-6,
+        # claude-sonnet-4-5-20250929. MINOR is a short semantic version part,
         # not a snapshot suffix like 20250514.
         pattern = rf"{family}-(\d+)-(\d{{1,2}})(?:-|$)"
         match = re.search(pattern, model_lower)
         if match:
             return int(match.group(1)), int(match.group(2))
 
+        # Claude 3-generation ids put the version BEFORE the family:
+        # claude-3-5-haiku-20241022, claude-3-7-sonnet-20250219,
+        # claude-3-opus-20240229. Without this branch the major-only fallback
+        # below matched the trailing snapshot date instead ("haiku-20241022"
+        # -> major 20241022), and these models were then treated as newer than
+        # anything Anthropic has shipped.
+        legacy_pattern = rf"-(\d{{1,2}})(?:-(\d{{1,2}}))?-{family}(?:-|$)"
+        match = re.search(legacy_pattern, model_lower)
+        if match:
+            return int(match.group(1)), int(match.group(2) or 0)
+
         # Fallback for ids like claude-sonnet-4-20250514 where only the major
-        # semantic version is present before the snapshot date.
-        major_only_pattern = rf"{family}-(\d+)(?:-|$)"
+        # semantic version is present before the snapshot date. The major is
+        # capped at 2 digits so a snapshot date can never be read as one.
+        major_only_pattern = rf"{family}-(\d{{1,2}})(?:-|$)"
         match = re.search(major_only_pattern, model_lower)
         if match:
             return int(match.group(1)), 0
