@@ -157,8 +157,14 @@ _RATES: dict[str, dict[str, Decimal]] = {
     },
     # ------------------------------------------------------------------
     # Claude Haiku 3.5  ($0.80 / $4.00 / $0.08 / $1.00)
+    #
+    # The served id is claude-3-5-haiku-20241022: Claude 3-generation ids put
+    # the version before the family, and later ids put the family first.
+    # "claude-haiku-3-5-20250929" was neither shape -- family-first ordering
+    # with Sonnet 4.5's snapshot date. `compute_cost` does an exact
+    # `_RATES.get()`, so the real id missed and Haiku 3.5 cost returned None.
     # ------------------------------------------------------------------
-    "claude-haiku-3-5-20250929": {
+    "claude-3-5-haiku-20241022": {
         "input_per_m": Decimal("0.80"),
         "output_per_m": Decimal("4.00"),
         "cache_read_per_m": Decimal("0.08"),
