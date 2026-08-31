@@ -3267,8 +3267,8 @@ class AnthropicProvider:
         # Determine ephemeral status BEFORE conversion -- Message.metadata is
         # only available on the original Message objects; _convert_messages
         # discards unrecognized keys when it rebuilds Anthropic-format dicts.
-        trailing_ephemeral_count, has_ephemeral_signal = (
-            self._count_trailing_ephemeral_messages(conversation)
+        unstable_suffix_len, has_ephemeral_signal = self._unstable_suffix_length(
+            conversation
         )
 
         # Track how many of the 4 Anthropic cache breakpoints are used, so we
@@ -3327,7 +3327,7 @@ class AnthropicProvider:
         all_messages, conversation_breakpoints_used = (
             self._apply_conversation_cache_control(
                 all_messages,
-                trailing_ephemeral_count,
+                unstable_suffix_len,
                 has_ephemeral_signal,
                 conversation_budget,
             )
@@ -5184,46 +5184,63 @@ class AnthropicProvider:
             idx -= 1
         return None
 
-    def _count_trailing_ephemeral_messages(
-        self, conversation: list[Message]
-    ) -> tuple[int, bool]:
-        """Count how many trailing conversation messages are ephemeral.
+    def _unstable_suffix_length(self, conversation: list[Message]) -> tuple[int, bool]:
+        """How many trailing entries must be excluded from breakpoint eligibility.
 
-        Ephemeral status is read from ``Message.metadata["ephemeral"]`` --
-        the same contract ``HookResult.ephemeral`` is meant to carry through
-        to the provider (see ``amplifier_core.models.HookResult``). Walking
-        from the end, the count stops at the first message that is either
-        not marked ephemeral, or has ``role == "tool"``: tool-role messages
-        can be batched together by ``_convert_messages`` (many input
-        messages -> one output message), which would break the 1:1 index
-        correspondence this count relies on. Ephemeral injections are never
-        tool-role in the current architecture (HookResult.context_injection_role
-        is one of "system"/"user"/"assistant"), so this is a hard stop, not a
-        heuristic guess.
+        A message is UNSTABLE when it is marked ephemeral but not persisted --
+        i.e. regenerated per request, so any cached prefix containing it can
+        never be reproduced. Everything from the last unstable message to the
+        end is excluded, whether or not the unstable message is itself last
+        (the pre-user reminder block introduced by the system-reminder
+        redesign is not: it sits BEFORE the real user message, not after it).
+
+        Ephemeral AND persisted is STABLE: it was written into canonical
+        history via context.add_message and is byte-frozen from then on
+        (the persist-mode reminder block, and the orchestrator's own
+        budget-warning message, both qualify).
+
+        This is a strict generalization of the prior
+        ``_count_trailing_ephemeral_messages`` (any ephemeral message,
+        regardless of position, disqualified the tail): that method's
+        behavior is reproduced exactly whenever ephemeral content only ever
+        appears at the true tail (today's shape, and the redesign's own
+        tail-injection-mode shape), and additionally handles a leading
+        ephemeral-but-unstable block correctly, which the old walk could not
+        express at all.
+
+        The role == "tool" hard stop is retained verbatim from
+        _count_trailing_ephemeral_messages: _convert_messages batches
+        consecutive tool messages many-to-one, which breaks the 1:1 index
+        correspondence a count-from-the-end relies on. Stopping early is safe
+        here because view-only (unstable) injections only ever exist for the
+        CURRENT request -- they are never in canonical history, so none can be
+        buried behind an earlier tool batch.
 
         Returns:
-            (trailing_ephemeral_count, has_any_metadata_signal). The second
-            value tells the caller whether *any* message in the conversation
-            carries a metadata dict at all -- i.e. whether "not marked
-            ephemeral" is a trustworthy negative, or simply means nothing in
-            this deployment ever populates the field.
+            (excluded, has_any_metadata_signal). ``excluded`` is a count from
+            the end (never an absolute index -- ``all_messages`` combines
+            context-prefix messages with converted conversation messages, so
+            pre-conversion indices do not map 1:1 onto it).
+            ``has_any_metadata_signal`` tells the caller whether *any*
+            message in the conversation carries a metadata dict at all --
+            i.e. whether "not unstable" is a trustworthy negative, or simply
+            means nothing in this deployment ever populates the field.
         """
         has_any_metadata_signal = any(bool(m.metadata) for m in conversation)
 
-        count = 0
-        for msg in reversed(conversation):
+        excluded = 0
+        for walked, msg in enumerate(reversed(conversation), start=1):
             if msg.role == "tool":
                 break
-            if bool((msg.metadata or {}).get("ephemeral")):
-                count += 1
-                continue
-            break
-        return count, has_any_metadata_signal
+            md = msg.metadata or {}
+            if md.get("ephemeral") and not md.get("persisted"):
+                excluded = walked
+        return excluded, has_any_metadata_signal
 
     def _apply_conversation_cache_control(
         self,
         all_messages: list[dict[str, Any]],
-        trailing_ephemeral_count: int,
+        unstable_suffix_len: int,
         has_ephemeral_signal: bool,
         remaining_budget: int,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -5243,8 +5260,12 @@ class AnthropicProvider:
 
         The fix has two parts:
 
-        1. Never place a breakpoint on a message known to be ephemeral --
-           walk backward past ``trailing_ephemeral_count`` messages first.
+        1. Never place a breakpoint on a message known to be unstable
+           (ephemeral and not persisted -- regenerated per request) --
+           walk backward past ``unstable_suffix_len`` messages first. Unlike
+           the prior trailing-only walk, this correctly excludes an unstable
+           message wherever it sits in the eligible window, not only when
+           it is literally last (see ``_unstable_suffix_length``).
         2. Use the *two* breakpoints Anthropic's docs describe for
            multi-turn conversations: one at the current stable boundary
            ("primary") and one right before the previous real user turn
@@ -5257,13 +5278,13 @@ class AnthropicProvider:
             all_messages: Anthropic-formatted message array (context-prefix
                 messages followed by conversation messages), mutated in
                 place.
-            trailing_ephemeral_count: number of trailing entries of the
-                conversation region known to be ephemeral (see
-                ``_count_trailing_ephemeral_messages``).
+            unstable_suffix_len: number of trailing entries of the
+                conversation region excluded from breakpoint eligibility
+                (see ``_unstable_suffix_length``).
             has_ephemeral_signal: whether ephemeral status could be
                 determined at all for this request (see above). If False,
-                "not marked ephemeral" cannot be trusted as a real signal,
-                and placing breakpoints on unverified content would risk
+                "not unstable" cannot be trusted as a real signal, and
+                placing breakpoints on unverified content would risk
                 repeating the exact bug this method exists to fix.
             remaining_budget: cache breakpoints left before hitting
                 Anthropic's 4-breakpoint hard limit (system + tools may
@@ -5318,7 +5339,7 @@ class AnthropicProvider:
             )
             return all_messages, 0
 
-        eligible_upper = len(all_messages) - trailing_ephemeral_count
+        eligible_upper = len(all_messages) - unstable_suffix_len
         if eligible_upper <= 0:
             logger.warning(
                 "[PROVIDER] Prompt caching: every message in this request is "
@@ -5372,6 +5393,44 @@ class AnthropicProvider:
         breakpoints keeps landing on a previously-cached boundary as the
         conversation grows, per Anthropic's documented multi-turn caching
         pattern.
+
+        Deliberately left alone under the system-reminder redesign's
+        pre-user reminder block (a stable, persisted, `role="user"` message
+        written immediately before the turn's real user message -- see
+        ``_unstable_suffix_length``). Verified empirically (see
+        tests/test_prompt_cache_breakpoints.py's T-W5-04 test), not just
+        derived on paper -- the actual mechanism is subtler than "the block
+        becomes the previous turn's primary":
+
+        At iteration 1 of a fresh turn N+1 (request ends `[..., block N+1,
+        user N+1]`, no assistant reply yet), `primary_idx` IS `user N+1`'s
+        own index. This method's search starts AT `primary_idx` itself, and
+        since that message is `role="user"` and not a tool_result batch, it
+        matches on the very first loop iteration -- `last_user_turn_idx`
+        resolves to `user N+1`'s own index (not the block's), and the
+        secondary is `safe(last_user_turn_idx - 1)`, which lands ON `block
+        N+1` (it sits directly before `user N+1`).
+
+        Once the model replies (iteration 2+: `[..., block N+1, user N+1,
+        assistant N+1(tool_use), tool_result, ...]`), `primary_idx` advances
+        into the tool_result batch. The search now walks PAST the
+        tool_result (excluded: it IS a tool_result batch) and past the
+        assistant message, and matches `user N+1` the same way -- so the
+        secondary lands on `block N+1` AGAIN, at the same position, across
+        every iteration of the SAME turn. That is the real rolling-overlap
+        property this reminder-block shape gets from this method, unchanged:
+        a consistent secondary target across a turn's own tool-loop
+        iterations. (A cross-TURN overlap -- turn N+1's secondary matching
+        turn N's OWN primary from the request that generated it -- does NOT
+        hold for this shape: that hypothetical prior request also ends in
+        `[..., block N, user N]` with no assistant reply yet, so its own
+        primary is `user N`'s index, not `block N`'s -- there is no shared
+        position between the two calls in that comparison. This is a
+        pre-existing property of "primary lands on a user-role message
+        when nothing follows it yet", not something the system-reminder
+        redesign changes.) Do not "fix" this to skip reminder blocks --
+        skipping them here would break the WITHIN-turn overlap that
+        genuinely exists.
         """
         last_user_turn_idx: int | None = None
         for idx in range(min(primary_idx, eligible_upper - 1), -1, -1):

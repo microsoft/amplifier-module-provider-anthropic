@@ -34,7 +34,6 @@ from amplifier_core.message_models import (
     ToolCallBlock,
     ToolSpec,
 )
-
 from amplifier_module_provider_anthropic import AnthropicProvider
 from tests._helpers import DummyResponse
 
@@ -122,8 +121,30 @@ def _ephemeral_tail(text: str) -> Message:
     role from `context_injection_role` (default/observed: "user"), content
     is the injected text, and -- once the necessary upstream plumbing fix
     is applied -- `metadata={"ephemeral": True}`.
+
+    This is UNSTABLE under `_unstable_suffix_length` (ephemeral, no
+    `persisted` key) -- regenerated per request, e.g. loop-streaming's
+    `ephemeral_injection_mode="tail"` path, or the view-only splice for
+    `reminder_placement="pre_user"` in tail mode.
     """
     return Message(role="user", content=text, metadata={"ephemeral": True})
+
+
+def _persisted_reminder(text: str) -> Message:
+    """Build a message shaped like the system-reminder redesign's
+    persist-mode reminder block (loop-streaming's `ephemeral_injection_mode
+    ="persist"` path): written into canonical history via
+    `context.add_message(...)`, so it is byte-frozen from then on.
+
+    This is STABLE under `_unstable_suffix_length`
+    (`ephemeral=True, persisted=True`) -- safe to cache past, unlike
+    `_ephemeral_tail`'s unstable shape.
+    """
+    return Message(
+        role="user",
+        content=text,
+        metadata={"ephemeral": True, "persisted": True},
+    )
 
 
 def _run(provider: AnthropicProvider, request: ChatRequest) -> dict:
@@ -198,6 +219,11 @@ def test_never_exceeds_four_breakpoints_even_with_many_turns():
 
 
 def test_breakpoint_never_lands_on_ephemeral_tail_message():
+    """Still valid under `_unstable_suffix_length` (system-reminder redesign,
+    W5): `_ephemeral_tail` carries no `persisted` key, so this remains an
+    UNSTABLE trailing message -- the mid-loop `ephemeral_injection_mode=
+    "tail"` shape (or the `reminder_placement="pre_user"` tail-mode splice,
+    which is view-only and therefore never persisted either)."""
     provider = _make_provider()
 
     messages: list[Message] = [Message(role="system", content="System prompt.")]
@@ -595,6 +621,56 @@ def test_multi_message_with_ephemeral_metadata_places_breakpoints_as_before(capl
                 found_breakpoint = True
     assert found_breakpoint, (
         "expected at least one conversation-region cache breakpoint"
+    )
+
+
+def test_multi_message_with_persisted_ephemeral_metadata_places_breakpoints_as_before(
+    caplog,
+):
+    """Same regression guard as above, with a `persisted: True` variant
+    (system-reminder redesign, W5/T-W5-02): a persist-mode reminder block
+    sitting immediately before the trailing user message must not reduce
+    breakpoint eligibility at all -- it is genuinely frozen canonical
+    history, not regenerated content. Numerically this shape produces the
+    SAME `eligible_upper` as the pre-existing `_ephemeral_tail` (unstable)
+    variant above under BOTH the old and new algorithms here (the old
+    trailing-only walk never even reaches this position, since the very
+    last message is the real, non-ephemeral user text) -- pinning that this
+    stays true is the point: a future, less careful generalization could
+    easily start treating any `ephemeral=True` message as exclusion-worthy
+    regardless of `persisted`, which would silently regress this exact
+    case."""
+    provider = _make_provider()
+
+    messages: list[Message] = [Message(role="system", content="System prompt.")]
+    for i in range(3):
+        messages.extend(_turn(f"question {i}", f"answer {i}"))
+    messages.append(_persisted_reminder("<system-reminders>...</system-reminders>"))
+    messages.append(Message(role="user", content="the real ask"))
+
+    request = ChatRequest(messages=messages)
+
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="amplifier_module_provider_anthropic"):
+        params = _run(provider, request)
+
+    own_records = [
+        r for r in caplog.records if r.name == "amplifier_module_provider_anthropic"
+    ]
+    assert not any(r.levelno >= logging.WARNING for r in own_records)
+
+    found_breakpoint = False
+    for msg in params["messages"]:
+        content = msg.get("content")
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and "cache_control" in b for b in content
+        ):
+            found_breakpoint = True
+    assert found_breakpoint, (
+        "expected at least one conversation-region cache breakpoint even "
+        "with a persisted reminder block immediately before the trailing "
+        "user message"
     )
 
 
@@ -1221,3 +1297,281 @@ def test_breakpoint_never_lands_on_a_redacted_thinking_block():
     assert not offenders, (
         f"cache_control landed on a redacted_thinking block: {offenders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# System-reminder redesign, W5: `_unstable_suffix_length` generalization.
+#
+# Prior to this patch, `_count_trailing_ephemeral_messages` walked backward
+# from the end and stopped at the first message that was either role="tool"
+# or NOT marked ephemeral -- i.e. it could only ever exclude a TRAILING run
+# of ephemeral messages. The system-reminder redesign introduces a leading
+# (pre-user) reminder block: `[..., block(ephemeral, ...), user(real), ...]`.
+# `_unstable_suffix_length` distinguishes STABLE (ephemeral AND persisted --
+# frozen canonical history) from UNSTABLE (ephemeral, NOT persisted --
+# regenerated per request) and excludes everything from the last unstable
+# message through the end, whether or not that message is itself last.
+# ---------------------------------------------------------------------------
+
+
+def test_unstable_block_before_trailing_user_excludes_both_from_eligibility():
+    """T-W5-01 (the core W5 bug). An unstable (ephemeral, not persisted)
+    block sitting BEFORE the trailing real user message -- the shape
+    produced by loop-streaming's `ephemeral_injection_mode="tail"` +
+    `reminder_placement="pre_user"` -- must exclude BOTH the block and the
+    user message that follows it from breakpoint eligibility. A breakpoint
+    landing AT OR AFTER the block would still cache the block's
+    regenerated-per-request bytes as part of the same prefix, guaranteeing
+    a miss on the very next request.
+
+    FAILS on the prior trailing-only walk: the trailing message here is the
+    REAL user text (not ephemeral), so the old walk's count stayed 0 --
+    verified via `git stash` against unmodified `833403b`: the old code
+    placed its PRIMARY breakpoint directly on the trailing user message
+    (the last "safe" position at the old, unreduced `eligible_upper`), and
+    its SECONDARY breakpoint landed directly on the unstable block itself
+    (`_find_rolling_secondary_index` treats the primary's own user-role
+    message as "the most recent real user turn" and steps back exactly one
+    message -- straight onto the block). Both assertions below fail on
+    `833403b`; both pass after this patch."""
+    provider = _make_provider()
+
+    messages: list[Message] = [Message(role="system", content="System prompt.")]
+    messages.extend(_turn("question 0", "answer 0"))
+    messages.append(_ephemeral_tail("<system-reminders>...</system-reminders>"))
+    messages.append(Message(role="user", content="the real ask"))
+
+    request = ChatRequest(messages=messages)
+    params = _run(provider, request)
+
+    sent_messages = params["messages"]
+    block_msg = sent_messages[-2]
+    user_msg = sent_messages[-1]
+
+    def _is_stamped(msg: dict) -> bool:
+        content = msg.get("content")
+        return isinstance(content, list) and any(
+            isinstance(b, dict) and "cache_control" in b for b in content
+        )
+
+    assert not _is_stamped(block_msg), (
+        "breakpoint must not land on the unstable (regenerated-per-request) "
+        "reminder block"
+    )
+    assert not _is_stamped(user_msg), (
+        "breakpoint must not land on the real user message either -- it "
+        "directly follows the unstable block, so a breakpoint here would "
+        "still cache the block's regenerated bytes as part of the same "
+        "prefix"
+    )
+    assert any(_is_stamped(m) for m in sent_messages[:-2]), (
+        "expected a breakpoint on earlier, genuinely stable content instead"
+    )
+
+
+def test_persisted_block_before_user_does_not_reduce_eligibility():
+    """T-W5-02. An ephemeral AND persisted block immediately before the
+    trailing user message (loop-streaming's `ephemeral_injection_mode=
+    "persist"` + `reminder_placement="pre_user"` turn-start shape) must NOT
+    reduce breakpoint eligibility -- it is frozen canonical history, safe
+    to cache past. Numerically this shape is invisible to the OLD
+    trailing-only walk too (the last message is the real user text, not
+    ephemeral, so the old walk's count was already 0 here) -- confirmed via
+    `git stash` against `833403b`: this test passes on both. Recorded here
+    as a deliberate documentation pin (not a fail-before proof; see the PR
+    description for this spec-ambiguity resolution), so a future, less
+    careful generalization that starts excluding ANY `ephemeral=True`
+    message regardless of `persisted` cannot silently regress this exact,
+    extremely common shape (every persist-mode turn looks like this)."""
+    provider = _make_provider()
+
+    messages: list[Message] = [Message(role="system", content="System prompt.")]
+    messages.extend(_turn("question 0", "answer 0"))
+    messages.append(_persisted_reminder("<system-reminders>...</system-reminders>"))
+    messages.append(Message(role="user", content="the real ask"))
+
+    request = ChatRequest(messages=messages)
+    params = _run(provider, request)
+
+    sent_messages = params["messages"]
+
+    def _is_stamped(msg: dict) -> bool:
+        content = msg.get("content")
+        return isinstance(content, list) and any(
+            isinstance(b, dict) and "cache_control" in b for b in content
+        )
+
+    assert any(_is_stamped(m) for m in sent_messages), (
+        "expected at least one conversation-region cache breakpoint"
+    )
+
+
+def test_persisted_trailing_message_may_take_a_breakpoint():
+    """T-W5-03. A persisted-ephemeral message that IS the trailing
+    (mid-loop) message -- e.g. loop-streaming's persist-mode reminder block
+    at turn start, before the next iteration appends anything further --
+    may now take a breakpoint. This removes the prior over-conservatism:
+    the OLD walk excluded ANY trailing ephemeral message regardless of
+    `persisted`, so a genuinely stable persisted-ephemeral tail could never
+    be cached. FAILS on `833403b` (confirmed via `git stash`): the old code
+    always excluded this trailing message from eligibility, so it was never
+    stamped; after this patch it is eligible and gets stamped like any
+    other stable trailing content."""
+    provider = _make_provider()
+
+    messages: list[Message] = [Message(role="system", content="System prompt.")]
+    for i in range(3):
+        messages.extend(_turn(f"question {i}", f"answer {i}"))
+    messages.append(_persisted_reminder("<system-reminders>...</system-reminders>"))
+
+    request = ChatRequest(messages=messages)
+    params = _run(provider, request)
+
+    sent_messages = params["messages"]
+    last_msg = sent_messages[-1]
+    content = last_msg.get("content")
+    assert isinstance(content, list) and any(
+        isinstance(b, dict) and "cache_control" in b for b in content
+    ), (
+        "expected the persisted-ephemeral trailing message to be eligible "
+        "for a cache breakpoint (the over-conservatism removed by W5)"
+    )
+
+
+def test_rolling_secondary_stays_on_pre_user_block_across_a_turns_own_iterations():
+    """T-W5-04 (pins §W5.3 -- `_find_rolling_secondary_index` is
+    deliberately left UNCHANGED). Verified empirically (see the docstring
+    on `_find_rolling_secondary_index` itself for the full derivation, and
+    the PR description for the spec-ambiguity resolution): the rolling
+    secondary breakpoint's real, verified benefit for a pre-user persisted
+    reminder block is a WITHIN-TURN property, not a cross-turn one.
+
+    Iteration 1 of a fresh turn (request ends `[..., block, user]`, no
+    assistant reply yet): `primary_idx` is `user`'s own index, and
+    `_find_rolling_secondary_index`'s search matches on that very message
+    at the first loop step, so the secondary is `safe(primary_idx - 1)` --
+    landing ON the persisted block that sits directly before it.
+
+    Iteration 2+ of the SAME turn (after a tool call: `[..., block, user,
+    assistant(tool_use), tool_result]`): `primary_idx` advances into the
+    tool_result batch; the search walks past it (excluded: it IS a
+    tool_result batch) and past the assistant message, matches `user` the
+    same way, and again returns `safe(user_idx - 1)` -- the SAME block,
+    same position. The secondary breakpoint is therefore stable across a
+    turn's own tool-loop iterations, giving a genuine rolling cache hit on
+    the reminder block.
+
+    Not a fail-before proof (see PR description for why): `_find_rolling_
+    secondary_index` is untouched by this patch, and this exact behavior is
+    unaffected by `_unstable_suffix_length` either way (the block here is
+    persisted, so neither the old nor the new eligibility walk treats it as
+    unstable) -- confirmed via `git stash` against `833403b`. Recorded as a
+    deliberate pin per §W5.3's explicit instruction not to "fix" this
+    method."""
+    shared_prefix = [
+        Message(role="system", content="System prompt."),
+        _persisted_reminder("<system-reminders>t1</system-reminders>"),
+        Message(role="user", content="question 0"),
+        Message(role="assistant", content="answer 0"),
+        _persisted_reminder("<system-reminders>t2</system-reminders>"),
+        Message(role="user", content="question 1"),
+    ]
+
+    def _cached_texts(params: dict) -> set[str]:
+        out = set()
+        for msg in params["messages"]:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and "cache_control" in block:
+                        out.add(block.get("text", ""))
+        return out
+
+    # Iteration 1: request ends in [block_t2, question_1] -- no reply yet.
+    params_iter1 = _run(_make_provider(), ChatRequest(messages=shared_prefix))
+    breakpoints_iter1 = _cached_texts(params_iter1)
+
+    # Iteration 2: the model has now called a tool for THIS SAME turn.
+    messages_iter2 = shared_prefix + [
+        Message(
+            role="assistant",
+            content=[ToolCallBlock(id="call_1", name="lookup", input={})],
+        ),
+        Message(role="tool", content="tool result", tool_call_id="call_1"),
+    ]
+    params_iter2 = _run(_make_provider(), ChatRequest(messages=messages_iter2))
+    breakpoints_iter2 = _cached_texts(params_iter2)
+
+    assert breakpoints_iter1, "iteration 1 should have placed at least one breakpoint"
+    assert breakpoints_iter2, "iteration 2 should have placed at least one breakpoint"
+    overlap = breakpoints_iter1 & breakpoints_iter2
+    assert overlap, (
+        "the two iterations of the SAME turn should share at least one "
+        "cache breakpoint (the pre-user reminder block) -- otherwise the "
+        "cache can never be hit within a single tool-loop turn"
+    )
+    assert "<system-reminders>t2</system-reminders>" in overlap, (
+        f"expected the shared breakpoint to be the turn's own pre-user "
+        f"reminder block specifically; got overlap={overlap}"
+    )
+
+
+def test_unstable_message_behind_a_tool_batch_degrades_safely():
+    """T-W5-05. An unstable message positioned BEHIND (further from the
+    tail than) a trailing tool-role batch must not crash the walk, and
+    placement must degrade safely -- not raise, not infinite-loop. The
+    role=="tool" hard stop fires on the very first (trailing-most) message
+    here, before any unstable content is even examined, exactly like the
+    prior implementation's identical hard stop. This shape is not expected
+    to occur in practice (unstable injections only ever exist for the
+    CURRENT request, never behind canonical tool-call history), but the
+    method must not misbehave if it does."""
+    provider = _make_provider()
+
+    messages: list[Message] = [Message(role="system", content="System prompt.")]
+    messages.extend(_turn("question 0", "answer 0"))
+    messages.append(_ephemeral_tail("<system-reminders>buried</system-reminders>"))
+    messages.append(
+        Message(
+            role="assistant",
+            content=[ToolCallBlock(id="call_1", name="lookup", input={})],
+        )
+    )
+    messages.append(Message(role="tool", content="tool result", tool_call_id="call_1"))
+
+    request = ChatRequest(messages=messages)
+    params = _run(provider, request)  # must not raise
+
+    sent_messages = params["messages"]
+    found_breakpoint = any(
+        isinstance(msg.get("content"), list)
+        and any(isinstance(b, dict) and "cache_control" in b for b in msg["content"])
+        for msg in sent_messages
+    )
+    assert found_breakpoint, (
+        "expected placement to still succeed (degrade safely) rather than "
+        "silently place zero breakpoints"
+    )
+
+
+def test_never_exceeds_four_breakpoints_with_pre_user_block():
+    """T-W5-06 (must not regress). The new pre-user-block shape must still
+    respect Anthropic's hard 4-breakpoint limit, exactly like the existing
+    ceiling tests for the no-block shape."""
+    provider = _make_provider()
+
+    messages: list[Message] = [
+        Message(role="system", content="You are a helpful assistant.")
+    ]
+    for i in range(6):
+        messages.extend(_turn(f"question {i}", f"answer {i}"))
+    messages.append(_persisted_reminder("<system-reminders>...</system-reminders>"))
+    messages.append(Message(role="user", content="the real ask"))
+
+    request = ChatRequest(
+        messages=messages,
+        tools=[_long_tool_spec("tool_a"), _long_tool_spec("tool_b")],
+    )
+    params = _run(provider, request)
+
+    assert _count_cache_control_blocks(params) <= 4
