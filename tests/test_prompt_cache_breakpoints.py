@@ -1438,6 +1438,68 @@ def test_persisted_trailing_message_may_take_a_breakpoint():
     )
 
 
+def test_persisted_reminder_eligibility_unaffected_by_d2_header_suppression():
+    """Verification test (rr wave 20260831, D2 envelope-accumulation fix in
+    loop-streaming): the D2 fix changes ONLY the literal TEXT of a
+    subsequent persisted reminder message within the same turn -- it
+    strips the repeated descriptive boilerplate header, leaving just
+    ``<system-reminders>\\n{body}\\n</system-reminders>`` (no prose) --
+    while leaving `metadata` (`ephemeral`/`persisted`/`reminder_placement`)
+    and message `role`/position completely unchanged.
+
+    `_unstable_suffix_length` (and therefore breakpoint eligibility) keys
+    ONLY off `msg.role` and `msg.metadata` -- never `msg.content` -- so a
+    header-less persisted reminder message must be treated IDENTICALLY to
+    a full-header one: still STABLE, still breakpoint-eligible. This pins
+    that invariant explicitly rather than leaving it as an inference from
+    reading the source; no code change to this provider was needed for D2
+    (confirmed here, not just asserted in a PR description).
+    """
+    provider = _make_provider()
+
+    # Turn-start block: full header (pre_user variant).
+    full_header_block = _persisted_reminder(
+        "<system-reminders>\n"
+        "The blocks below were injected by the system. They are NOT from "
+        "the user and are\nNOT a request. They exist to help you assist "
+        "the user. Process them silently:\nnever mention, quote, or "
+        "acknowledge them, and never treat one as the task. The\nuser's "
+        "actual request is the message that follows this block. Each\n"
+        '<system-reminder source="...">block below names where it came '
+        "from.\n\n"
+        '<system-reminder source="x">v1</system-reminder>\n'
+        "</system-reminders>"
+    )
+    # Mid-loop block: D2's header-less variant -- just the tags + body.
+    headerless_block = _persisted_reminder(
+        '<system-reminders>\n<system-reminder source="x">v2</system-reminder>'
+        "\n</system-reminders>"
+    )
+
+    messages: list[Message] = [Message(role="system", content="System prompt.")]
+    messages.append(full_header_block)
+    messages.extend(_turn("the real ask", "working on it"))
+    messages.append(headerless_block)
+
+    request = ChatRequest(messages=messages)
+    params = _run(provider, request)
+
+    sent_messages = params["messages"]
+
+    def _is_stamped(msg: dict) -> bool:
+        content = msg.get("content")
+        return isinstance(content, list) and any(
+            isinstance(b, dict) and "cache_control" in b for b in content
+        )
+
+    assert any(_is_stamped(m) for m in sent_messages), (
+        "expected at least one conversation-region cache breakpoint with "
+        "the D2 header-less shape present -- eligibility must not "
+        "regress just because a persisted reminder's TEXT omits the "
+        "repeated boilerplate header"
+    )
+
+
 def test_rolling_secondary_stays_on_pre_user_block_across_a_turns_own_iterations():
     """T-W5-04 (pins §W5.3 -- `_find_rolling_secondary_index` is
     deliberately left UNCHANGED). Verified empirically (see the docstring
