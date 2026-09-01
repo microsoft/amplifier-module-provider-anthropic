@@ -156,6 +156,21 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_write_per_m": Decimal("12.50"),
     },
     # ------------------------------------------------------------------
+    # Claude Fable 5.1  ($10 / $50 / $0.25 / $12.50)
+    # Same input and output rates as Fable 5, but cache reads are 75% cheaper
+    # ($0.25/MTok vs $1.00/MTok on Fable 5). Cache writes (5-min) remain at
+    # $12.50/MTok; 1-hour cache writes remain at 2x input ($20.00/MTok).
+    # Source: https://www.anthropic.com/claude-fable-and-mythos-5-1
+    #         (verified 2026-09-01: "Cache reads now cost 75% less, or $0.25
+    #          per million tokens.")
+    # ------------------------------------------------------------------
+    "claude-fable-5-1": {
+        "input_per_m": Decimal("10.00"),
+        "output_per_m": Decimal("50.00"),
+        "cache_read_per_m": Decimal("0.25"),
+        "cache_write_per_m": Decimal("12.50"),
+    },
+    # ------------------------------------------------------------------
     # Claude Haiku 3.5  ($0.80 / $4.00 / $0.08 / $1.00)
     # ------------------------------------------------------------------
     "claude-haiku-3-5-20250929": {
