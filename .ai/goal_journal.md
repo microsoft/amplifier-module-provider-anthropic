@@ -1,0 +1,1 @@
+# Goal convergence journal (append-only -- one block per failed attempt)
