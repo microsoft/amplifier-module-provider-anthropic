@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Internal constants
 # ---------------------------------------------------------------------------
 
-_PER_M = Decimal("1_000_000")
+_PER_M = Decimal(1_000_000)
 
 # _RATES maps model-id → {
 #   "input_per_m":      Decimal,   # fresh input tokens, per 1M
@@ -153,6 +153,19 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "input_per_m": Decimal("10.00"),
         "output_per_m": Decimal("50.00"),
         "cache_read_per_m": Decimal("1.00"),
+        "cache_write_per_m": Decimal("12.50"),
+    },
+    # ------------------------------------------------------------------
+    # Claude Fable 5.1  ($10 / $50 / $0.25 / $12.50)
+    # Same input/output/cache-write rates as Fable 5; cache reads reduced
+    # 75% to $0.25/MTok (from $1.00/MTok on Fable 5).
+    # Source: https://www.anthropic.com/pricing (verified 2026-09-02)
+    #         https://www.anthropic.com/claude-fable-and-mythos-5-1
+    # ------------------------------------------------------------------
+    "claude-fable-5-1": {
+        "input_per_m": Decimal("10.00"),
+        "output_per_m": Decimal("50.00"),
+        "cache_read_per_m": Decimal("0.25"),
         "cache_write_per_m": Decimal("12.50"),
     },
     # ------------------------------------------------------------------
