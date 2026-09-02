@@ -273,7 +273,7 @@ providers:
 
 1M context is **generally available, on by default, and billed at standard
 pricing** on every model that has it (Opus 5/4.8/4.7/4.6, Sonnet 5/4.6, Fable
-5, Mythos 5/Preview). No beta header is required, and there is no
+5/5.1, Mythos 5/Preview). No beta header is required, and there is no
 long-context price premium
 ([Anthropic: Context windows](https://platform.claude.com/en/docs/build-with-claude/context-windows),
 verified 2026-08-29). Those models cap output at **128K tokens** per request

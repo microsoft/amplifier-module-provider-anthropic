@@ -37,7 +37,7 @@ _PER_M = Decimal("1_000_000")
 # }
 #
 # Rates are in USD.
-# cache_read  ≈ 10 % of input_per_m
+# cache_read  ≈ 10 % of input_per_m (claude-fable-5-1: 2.5 % — Anthropic cut it 75 %)
 # cache_write ≈ 125 % of input_per_m
 _RATES: dict[str, dict[str, Decimal]] = {
     # ------------------------------------------------------------------
@@ -140,7 +140,8 @@ _RATES: dict[str, dict[str, Decimal]] = {
     },
     # ------------------------------------------------------------------
     # Claude Fable 5  ($10 / $50 / $1.00 / $12.50)
-    # Exactly 2x Opus 4.8 on every rate.
+    # Exactly 2x Opus 4.8 on every rate -- true of Fable 5 ITSELF, not of
+    # the fable family: Fable 5.1 below breaks it on cache reads.
     # A 1-hour cache write tier exists at $20.00/MTok (= 2x input_per_m, the
     # same relationship as every other model in this table). Anthropic's
     # usage object now reports a per-TTL split via `usage.cache_creation`
@@ -153,6 +154,19 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "input_per_m": Decimal("10.00"),
         "output_per_m": Decimal("50.00"),
         "cache_read_per_m": Decimal("1.00"),
+        "cache_write_per_m": Decimal("12.50"),
+    },
+    # ------------------------------------------------------------------
+    # Claude Fable 5.1  ($10 / $50 / $0.25 / $12.50)
+    # Same input/output/cache-write rates as Fable 5; cache reads reduced
+    # 75% to $0.25/MTok (from $1.00/MTok on Fable 5).
+    # Source: https://www.anthropic.com/pricing (verified 2026-09-02)
+    #         https://www.anthropic.com/claude-fable-and-mythos-5-1
+    # ------------------------------------------------------------------
+    "claude-fable-5-1": {
+        "input_per_m": Decimal("10.00"),
+        "output_per_m": Decimal("50.00"),
+        "cache_read_per_m": Decimal("0.25"),
         "cache_write_per_m": Decimal("12.50"),
     },
     # ------------------------------------------------------------------

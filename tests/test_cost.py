@@ -372,6 +372,69 @@ def test_fable5_exact_2x_opus48():
 
 
 # ---------------------------------------------------------------------------
+# Fable 5.1 pricing: $10 / $50 / $0.25 / $12.50 per MTok
+# Source: https://www.anthropic.com/pricing (verified 2026-09-02)
+#         https://www.anthropic.com/claude-fable-and-mythos-5-1
+# Key difference from Fable 5: cache_read_per_m reduced 75% ($1.00 -> $0.25).
+# ---------------------------------------------------------------------------
+def test_fable51_input_tokens_cost():
+    """claude-fable-5-1: 1M input -> $10.00"""
+    result = compute_cost("claude-fable-5-1", input_tokens=1_000_000)
+    assert result == Decimal("10.00"), f"Expected Decimal('10.00'), got {result!r}"
+
+
+def test_fable51_output_tokens_cost():
+    """claude-fable-5-1: 1M output -> $50.00"""
+    result = compute_cost("claude-fable-5-1", output_tokens=1_000_000)
+    assert result == Decimal("50.00"), f"Expected Decimal('50.00'), got {result!r}"
+
+
+def test_fable51_cache_read_cost():
+    """claude-fable-5-1: 1M cache read -> $0.25 (75% reduction vs Fable 5's $1.00)."""
+    result = compute_cost("claude-fable-5-1", cache_read_input_tokens=1_000_000)
+    assert result == Decimal("0.25"), f"Expected Decimal('0.25'), got {result!r}"
+
+
+def test_fable51_cache_write_cost():
+    """claude-fable-5-1: 1M cache write (5-min) -> $12.50 (same as Fable 5)."""
+    result = compute_cost("claude-fable-5-1", cache_creation_input_tokens=1_000_000)
+    assert result == Decimal("12.50"), f"Expected Decimal('12.50'), got {result!r}"
+
+
+def test_fable51_cache_read_cheaper_than_fable5():
+    """Fable 5.1 cache read must be 75% cheaper than Fable 5."""
+    fable5_read = compute_cost("claude-fable-5", cache_read_input_tokens=1_000_000)
+    fable51_read = compute_cost("claude-fable-5-1", cache_read_input_tokens=1_000_000)
+    assert fable5_read is not None, "claude-fable-5 must be in _RATES"
+    assert fable51_read is not None, "claude-fable-5-1 must be in _RATES"
+    # Fable 5.1 cache reads cost 25% of Fable 5 (75% reduction). This is a
+    # dimensionless RATIO -- it only coincidentally equals Fable 5.1's
+    # $0.25/MTok cache-read rate, which is asserted separately above.
+    ratio_of_fable5 = Decimal("0.25")
+    assert fable51_read == fable5_read * ratio_of_fable5, (
+        f"Fable 5.1 cache read ({fable51_read}) must be 25% of Fable 5 ({fable5_read})"
+    )
+
+
+def test_fable51_not_in_fast_eligible_models():
+    """claude-fable-5-1 must NOT be in _FAST_ELIGIBLE_MODELS (no speed mode)."""
+    from amplifier_module_provider_anthropic._cost import _FAST_ELIGIBLE_MODELS
+
+    assert "claude-fable-5-1" not in _FAST_ELIGIBLE_MODELS
+
+
+def test_fable51_input_output_same_as_fable5():
+    """Fable 5.1 input/output rates must be identical to Fable 5."""
+    fable5_input = compute_cost("claude-fable-5", input_tokens=1_000_000)
+    fable51_input = compute_cost("claude-fable-5-1", input_tokens=1_000_000)
+    assert fable5_input == fable51_input
+
+    fable5_output = compute_cost("claude-fable-5", output_tokens=1_000_000)
+    fable51_output = compute_cost("claude-fable-5-1", output_tokens=1_000_000)
+    assert fable5_output == fable51_output
+
+
+# ---------------------------------------------------------------------------
 # (r) Sonnet 5 pricing: standard rates $3 / $15 / $0.30 / $3.75 per MTok
 #     (intro discount $2/$10 through 2026-08-31 is intentionally NOT encoded;
 #     _RATES carries durable standard rates, matching the rest of the table.)
