@@ -103,6 +103,51 @@ chain is what enables thinking.
 - This key is exposed through `amplifier provider use` (shown for thinking-capable
   models), so it can be set interactively without hand-editing YAML.
 
+### Thinking Budget
+
+`thinking.budget_tokens` is the *entire* reasoning dial on models without
+`output_config.effort` support -- Haiku 4.5 among them, where `effort` never
+reaches the wire at all. Two config keys control it:
+
+```yaml
+providers:
+  - module: provider-anthropic
+    config:
+      default_model: claude-haiku-4-5
+      extended_thinking: true       # turn thinking on WITHOUT choosing an effort
+      thinking_budget_tokens: 8000  # explicit budget, honored as written
+```
+
+**Precedence** (highest wins): per-call `thinking_budget_tokens` kwarg ->
+`thinking_budget_tokens` config -> the budget implied by `reasoning_effort`
+(`low` -> 4096, everything else -> the model default) -> the model default.
+
+An **explicit** budget outranks the effort-implied one, because the effort ladder
+is a derived default and a configured number is caller intent. Setting only
+`reasoning_effort` is unchanged: you still get 4096 for `low` and the model
+default otherwise.
+
+**Turning thinking on:** `reasoning_effort` enables thinking as a side effect, but
+it also selects a thinking depth and, on Opus 4.7+, sets `output_config.effort`.
+`extended_thinking: true` enables thinking *and nothing else*, which is what you
+want when the budget is the only dial you care about. `extended_thinking: false`
+is an explicit opt-out that overrides a configured `reasoning_effort`; a per-call
+`extended_thinking` kwarg overrides both.
+
+**It is never silently discarded.** If an explicitly requested budget does not
+reach `thinking.budget_tokens`, a warning names the key, the value you asked for,
+the value actually sent, and why. That happens when:
+
+| Situation | What is sent | Remedy |
+| --- | --- | --- |
+| Thinking is not enabled | no `thinking` block at all | set `reasoning_effort` or `extended_thinking: true` |
+| Model has no thinking support (e.g. Haiku 3.5) | no `thinking` block at all | use a thinking-capable model |
+| Resolved `thinking_type` is `adaptive` | `{"type": "adaptive"}` -- the API forbids `budget_tokens` here; your value sizes `max_tokens` instead | set `thinking_type: enabled` |
+| Value is outside the model's limits | the clamped value (min 1024, max the model's output ceiling) | pick a value inside the range |
+
+A non-integer value is ignored with a warning and the resolved default is used --
+a typo does not raise out of every request.
+
 ### Debug / Raw Payload Capture
 
 `debug` and `raw_debug` never existed as real keys -- this section documented
@@ -302,6 +347,10 @@ House-style key reference. ✅ = wizard-visible ConfigField, ⚙️ = settings-o
 | `base_url` | `https://api.anthropic.com` | ✅ | Custom endpoint |
 | `default_model` | `claude-sonnet-5` | *(model picker)* | Model used when a request does not name one |
 | `reasoning_effort` | *(unset)* | ✅ | `low`\|`medium`\|`high`\|`xhigh`\|`max`. Enables extended thinking. Legacy alias: `effort` (deprecated) |
+| `extended_thinking` | *(unset)* | ⚙️ | Turn extended thinking on/off without choosing an effort. Overrides the `reasoning_effort` implication; a per-call kwarg overrides this |
+| `thinking_budget_tokens` | *(model default)* | ⚙️ | Explicit `thinking.budget_tokens`. Outranks the effort-implied budget; warns if it can't reach the wire |
+| `thinking_budget_buffer` | `8192` | ⚙️ | Headroom added to the budget when sizing `max_tokens` |
+| `thinking_type` | `adaptive` | ⚙️ | `adaptive`\|`enabled`. `adaptive` lets the model manage its own budget (and forbids `budget_tokens`); falls back to `enabled` on models without adaptive support |
 | `enable_1m_context` | `false` | ✅ | Advertise the 1M context window (more history kept = higher cost) |
 | `cache_stable_region_ttl_1h` | *(unset)* | ✅ | 1h cache TTL for system prompt + tools. 2x write cost, fewer writes |
 | `enable_prompt_caching` | `true` | ⚙️ | Place cache breakpoints |

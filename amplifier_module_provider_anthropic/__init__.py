@@ -703,6 +703,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "beta_headers",
         "extra_request_params",
         # --- deferred: read in _build_params (:3056-3230 pre-overhaul) ---
+        "extended_thinking",
         "thinking_budget_tokens",
         "thinking_budget_buffer",
         "thinking_type",
@@ -3406,16 +3407,65 @@ class AnthropicProvider:
             logger.info("[PROVIDER] Native web search tool enabled")
         resolved_thinking_type: str | None = None
 
+        # An EXPLICITLY requested thinking budget — kwargs first, then config.
+        # Captured here, before any resolution, for two reasons:
+        #   1. it is what the budget chain below now resolves from, so an
+        #      explicit config value outranks the effort→budget ladder
+        #      (the ladder is a derived default; config is caller intent); and
+        #   2. the silent-discard guard after the thinking block compares it
+        #      against what actually reached the wire.
+        # Before this, config `thinking_budget_tokens` sat BELOW the effort
+        # ladder in the chain, and the ladder always produced a value whenever
+        # any reasoning_effort was set — so the config key was accepted without
+        # complaint and then discarded, and the only budgets reachable from
+        # config were {4096 (effort: low), <model default>}.
+        requested_budget_source: str | None = None
+        requested_budget_raw: Any = None
+        if kwargs.get("thinking_budget_tokens") is not None:
+            requested_budget_source = "kwargs"
+            requested_budget_raw = kwargs["thinking_budget_tokens"]
+        elif self.config.get("thinking_budget_tokens") is not None:
+            requested_budget_source = "config"
+            requested_budget_raw = self.config["thinking_budget_tokens"]
+
+        requested_budget: int | None = None
+        if requested_budget_source is not None:
+            try:
+                requested_budget = int(requested_budget_raw)
+            except (TypeError, ValueError):
+                # Fail soft, log loudly — the same policy the numeric config
+                # helpers use at construction. A typo must not kill every
+                # request with a ValueError from int().
+                logger.warning(
+                    "[PROVIDER] Ignoring invalid %s 'thinking_budget_tokens'=%r "
+                    "(expected an integer) — falling back to the resolved default.",
+                    requested_budget_source,
+                    requested_budget_raw,
+                )
+                requested_budget_source = None
+                requested_budget = None
+
         # Enable extended thinking if requested (equivalent to OpenAI's reasoning)
         #
         # Precedence chain (highest to lowest):
-        #   1. kwargs["extended_thinking"]  — explicit per-request override
-        #   2. request.reasoning_effort     — portable kernel interface (Phase 2)
-        #   3. config defaults              — session-level settings
+        #   1. kwargs["extended_thinking"]   — explicit per-request override
+        #   2. config["extended_thinking"]   — explicit session-level override
+        #   3. request.reasoning_effort      — portable kernel interface (Phase 2)
+        #   4. config["reasoning_effort"]    — session-level effort default
         #
         # kwargs["extended_thinking"]=False can disable thinking even when
-        # reasoning_effort is set (explicit opt-out).
+        # reasoning_effort is set (explicit opt-out); config["extended_thinking"]
+        # is the same opt-in/opt-out one level down. config["extended_thinking"]
+        # exists so a config-only caller can turn thinking on WITHOUT also
+        # choosing an effort: before it, `thinking_budget_tokens` could never be
+        # read at all on that path (thinking was never enabled), which is the
+        # fifth silently-inert configuration this key had.
         thinking_enabled = bool(kwargs.get("extended_thinking"))
+        config_extended_thinking: bool | None = None
+        if "extended_thinking" in self.config:
+            config_extended_thinking = self._config_bool(
+                self.config["extended_thinking"]
+            )
 
         # Phase 2: Check request.reasoning_effort when kwargs don't specify
         reasoning_effort = getattr(request, "reasoning_effort", None)
@@ -3469,14 +3519,21 @@ class AnthropicProvider:
                         ", ".join(valid_efforts),
                     )
 
-        if "extended_thinking" not in kwargs and reasoning_effort is not None:
-            # reasoning_effort implies extended_thinking=True. This is a
-            # deliberate Amplifier mapping (commit bc026a43): the portable
-            # reasoning_effort hint enables Anthropic extended thinking, the
-            # same way OpenAI's reasoning effort engages its reasoning. effort
-            # and thinking are independent at the API level; coupling them is
-            # Amplifier's "reason harder" product semantics.
-            thinking_enabled = True
+        if "extended_thinking" not in kwargs:
+            if config_extended_thinking is not None:
+                # An explicit config opt-in/opt-out outranks the effort
+                # implication below, mirroring how kwargs["extended_thinking"]
+                # outranks it. Unset (the default) leaves the implication
+                # untouched — see the elif.
+                thinking_enabled = config_extended_thinking
+            elif reasoning_effort is not None:
+                # reasoning_effort implies extended_thinking=True. This is a
+                # deliberate Amplifier mapping (commit bc026a43): the portable
+                # reasoning_effort hint enables Anthropic extended thinking, the
+                # same way OpenAI's reasoning effort engages its reasoning. effort
+                # and thinking are independent at the API level; coupling them is
+                # Amplifier's "reason harder" product semantics.
+                thinking_enabled = True
 
         thinking_budget = None
         interleaved_thinking_enabled = False
@@ -3565,11 +3622,25 @@ class AnthropicProvider:
                     effort_thinking_type = "adaptive"
                     effort_budget = request_caps.default_thinking_budget
 
-                # Resolve budget: kwargs > reasoning_effort > config > model default
+                # Resolve budget: explicit (kwargs > config) > reasoning_effort
+                #                 > model default
+                #
+                # `requested_budget` is the caller's EXPLICIT ask, resolved
+                # above. It now outranks the effort→budget ladder, which was
+                # previously between kwargs and config and therefore shadowed
+                # config on every request that set any reasoning_effort. The
+                # ladder is a derived default (for every effort except "low" it
+                # simply restates request_caps.default_thinking_budget); an
+                # explicitly configured number is caller intent, and explicit
+                # beats derived.
+                #
+                # Byte-identical on the default path: with no explicit budget
+                # anywhere, `requested_budget` is None and this collapses to
+                # `effort_budget or request_caps.default_thinking_budget`,
+                # exactly as before.
                 budget_tokens = (
-                    kwargs.get("thinking_budget_tokens")
+                    requested_budget
                     or effort_budget
-                    or self.config.get("thinking_budget_tokens")
                     or request_caps.default_thinking_budget
                 )
                 budget_tokens = max(1024, int(budget_tokens))
@@ -3668,6 +3739,68 @@ class AnthropicProvider:
                     interleaved_thinking_enabled,
                 )
 
+        # ------------------------------------------------------------------
+        # Silent-discard guard for `thinking_budget_tokens`
+        # ------------------------------------------------------------------
+        # An explicitly requested budget that does not reach
+        # thinking.budget_tokens must SAY SO. The defect this closes is not the
+        # precedence order — it is the silence: the key was accepted without
+        # complaint and then dropped, exactly the way a discarded `effort` was
+        # before it got a loader guard. Runs once, after thinking is fully
+        # resolved, so it covers every way the value can fail to land:
+        # thinking off, model can't think, adaptive mode (where the API forbids
+        # budget_tokens outright), and clamping to the model's limits.
+        #
+        # Fires ONLY when the caller explicitly asked for a budget, so the
+        # default path stays byte-identical and silent.
+        if requested_budget_source is not None and requested_budget is not None:
+            wire_thinking = params.get("thinking")
+            sent_budget = (
+                wire_thinking.get("budget_tokens")
+                if isinstance(wire_thinking, dict)
+                else None
+            )
+            if sent_budget != requested_budget:
+                if not thinking_enabled and not request_caps.supports_thinking:
+                    reason = (
+                        f"model {params['model']} does not support extended "
+                        f"thinking, so no thinking budget is sent at all"
+                    )
+                elif not thinking_enabled:
+                    reason = (
+                        "extended thinking is not enabled, so the budget is "
+                        "never read — set `reasoning_effort` (low|medium|high|"
+                        "xhigh|max) or `extended_thinking: true` to turn it on"
+                    )
+                elif request_caps.thinking_always_on:
+                    reason = (
+                        f"{params['model']} always thinks and manages its own "
+                        "budget — the API rejects a thinking param on this "
+                        "model, so no budget can be sent and this value is "
+                        "not used for anything"
+                    )
+                elif resolved_thinking_type == "adaptive":
+                    reason = (
+                        "thinking.type='adaptive' — the API forbids "
+                        "budget_tokens in adaptive mode (the model manages its "
+                        "own budget); the value only feeds max_tokens sizing "
+                        f"(resolved max_tokens={params.get('max_tokens')}). "
+                        "Set `thinking_type: enabled` to send an explicit budget"
+                    )
+                else:
+                    reason = (
+                        "clamped to this model's limits (minimum 1024, maximum "
+                        f"{model_ceiling if params.get('tools') else max(1024, model_ceiling - 1)})"
+                    )
+                logger.warning(
+                    "[PROVIDER] %s 'thinking_budget_tokens'=%s did not reach the "
+                    "wire: sent %s. Reason: %s.",
+                    requested_budget_source,
+                    requested_budget,
+                    sent_budget if sent_budget is not None else "no thinking budget",
+                    reason,
+                )
+
         if params.get("max_tokens") and params["max_tokens"] > model_ceiling:
             logger.info(
                 "[PROVIDER] Clamping max_tokens from %s to %s for %s",
@@ -3691,7 +3824,14 @@ class AnthropicProvider:
         # thinking: it's a deliberate, per-call output_config-only override
         # (not an ambient default), matching the existing precedence note
         # below.
-        explicit_thinking_opt_out = kwargs.get("extended_thinking") is False
+        # config["extended_thinking"]=false is the same explicit opt-out one
+        # level down (kwargs still wins). Unset config leaves this False, so
+        # the default path is unchanged.
+        explicit_thinking_opt_out = (
+            kwargs["extended_thinking"] is False
+            if "extended_thinking" in kwargs
+            else config_extended_thinking is False
+        )
         explicit_effort_override = "effort" in kwargs
         if (
             request_caps.supports_output_config
