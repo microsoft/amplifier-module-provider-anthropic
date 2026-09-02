@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Internal constants
 # ---------------------------------------------------------------------------
 
-_PER_M = Decimal(1_000_000)
+_PER_M = Decimal("1_000_000")
 
 # _RATES maps model-id → {
 #   "input_per_m":      Decimal,   # fresh input tokens, per 1M
@@ -37,7 +37,7 @@ _PER_M = Decimal(1_000_000)
 # }
 #
 # Rates are in USD.
-# cache_read  ≈ 10 % of input_per_m
+# cache_read  ≈ 10 % of input_per_m (claude-fable-5-1: 2.5 % — Anthropic cut it 75 %)
 # cache_write ≈ 125 % of input_per_m
 _RATES: dict[str, dict[str, Decimal]] = {
     # ------------------------------------------------------------------
@@ -140,7 +140,8 @@ _RATES: dict[str, dict[str, Decimal]] = {
     },
     # ------------------------------------------------------------------
     # Claude Fable 5  ($10 / $50 / $1.00 / $12.50)
-    # Exactly 2x Opus 4.8 on every rate.
+    # Exactly 2x Opus 4.8 on every rate -- true of Fable 5 ITSELF, not of
+    # the fable family: Fable 5.1 below breaks it on cache reads.
     # A 1-hour cache write tier exists at $20.00/MTok (= 2x input_per_m, the
     # same relationship as every other model in this table). Anthropic's
     # usage object now reports a per-TTL split via `usage.cache_creation`

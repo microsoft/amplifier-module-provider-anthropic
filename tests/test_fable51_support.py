@@ -8,7 +8,7 @@ Covers:
       max output, thinking mode, effort tiers)
   (e) Fable 5.1 is in _RATES (cost lookup succeeds)
   (f) Fable 5.1 cache read rate is $0.25/MTok (75% reduction vs Fable 5's $1.00)
-  (g) Fable 5.1 fallback target is opus (same as Fable 5)
+  (g) Fable 5.1 fallback target is claude-opus-5 (same as Fable 5)
   (h) _convert_to_chat_response stamps a non-None cost_usd for Fable 5.1
 
 Source for facts (a)-(d): https://docs.anthropic.com/en/docs/about-claude/models/overview
@@ -86,27 +86,22 @@ def test_fable51_capabilities_correct():
 # (d) Fable 5.1 capabilities are identical to Fable 5
 # ---------------------------------------------------------------------------
 def test_fable51_capabilities_match_fable5():
-    """Fable 5.1 must have the same capability matrix as Fable 5."""
+    """Fable 5.1 must have the same capability matrix as Fable 5.
+
+    Whole-object equality rather than a field-by-field list: ModelCapabilities
+    has 21 fields, and a hand-rolled comparison silently stops covering any
+    field added after it was written.
+
+    This guards a real regression. The sibling `mythos` branch in
+    _get_capabilities IS version-gated (Mythos PREVIEW differs from Mythos 5 on
+    effort tiers and cache minimum), so a future version gate on the `fable`
+    branch that splits 5.1 off from 5 is exactly the kind of change this test
+    exists to catch.
+    """
     caps5 = AnthropicProvider._get_capabilities("claude-fable-5")
     caps51 = AnthropicProvider._get_capabilities("claude-fable-5-1")
 
-    # Compare all fields that should be identical
-    assert caps51.family == caps5.family
-    assert caps51.max_output_tokens == caps5.max_output_tokens
-    assert caps51.supports_1m == caps5.supports_1m
-    assert caps51.supports_thinking == caps5.supports_thinking
-    assert caps51.supports_adaptive_thinking == caps5.supports_adaptive_thinking
-    assert caps51.supports_manual_thinking == caps5.supports_manual_thinking
-    assert caps51.thinking_always_on == caps5.thinking_always_on
-    assert caps51.supports_output_config == caps5.supports_output_config
-    assert caps51.supports_task_budget == caps5.supports_task_budget
-    assert caps51.supports_sampling == caps5.supports_sampling
-    assert caps51.thinking_display_required == caps5.thinking_display_required
-    assert caps51.supported_efforts == caps5.supported_efforts
-    assert caps51.supports_speed == caps5.supports_speed
-    assert caps51.supports_inline_system == caps5.supports_inline_system
-    assert caps51.capability_tags == caps5.capability_tags
-    assert caps51.min_cacheable_tokens == caps5.min_cacheable_tokens
+    assert caps51 == caps5
 
 
 # ---------------------------------------------------------------------------
@@ -131,11 +126,18 @@ def test_fable51_cache_read_rate():
 # (g) Fallback target
 # ---------------------------------------------------------------------------
 def test_fable51_fallback_target_is_opus():
-    """Fable 5.1 must fall back to the opus family (same as Fable 5)."""
+    """Fable 5.1 must fall back to claude-opus-5 (same as Fable 5).
+
+    Asserts the CONCRETE target id, not just its family. _fallback_target_for_model
+    branches only on _detect_family, so a family-level assertion here also holds
+    for "claude-fable-banana" -- it cannot fail for a Fable-5.1-specific reason.
+    Pinning the exact id at least catches a regression in the
+    _STATIC_FALLBACK_MODELS backstop. Ladder mechanics themselves are covered by
+    tests/test_fallback_ladder.py.
+    """
     provider = _make_provider("claude-fable-5-1")
     target = provider._fallback_target_for_model("claude-fable-5-1")
-    assert target is not None
-    assert AnthropicProvider._detect_family(target) == "opus"
+    assert target == "claude-opus-5"
 
 
 # ---------------------------------------------------------------------------

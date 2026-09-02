@@ -977,7 +977,7 @@ class AnthropicProvider:
             ),
         )
         # 1M context is GA, DEFAULT, and billed at STANDARD PRICING on every
-        # model that has it (Opus 5/4.8/4.7/4.6, Sonnet 5/4.6, Fable 5,
+        # model that has it (Opus 5/4.8/4.7/4.6, Sonnet 5/4.6, Fable 5/5.1,
         # Mythos 5/Preview) -- verified against
         # platform.claude.com/en/docs/build-with-claude/context-windows on
         # 2026-08-29: "For every model with a 1M-token context window, 1M is

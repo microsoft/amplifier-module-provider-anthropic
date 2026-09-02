@@ -37,7 +37,6 @@ from typing import cast
 from unittest.mock import MagicMock
 
 from amplifier_core import ModuleCoordinator
-
 from amplifier_module_provider_anthropic import AnthropicProvider
 from amplifier_module_provider_anthropic._cost import compute_cost
 from tests._helpers import FakeCoordinator
@@ -408,9 +407,11 @@ def test_fable51_cache_read_cheaper_than_fable5():
     fable51_read = compute_cost("claude-fable-5-1", cache_read_input_tokens=1_000_000)
     assert fable5_read is not None, "claude-fable-5 must be in _RATES"
     assert fable51_read is not None, "claude-fable-5-1 must be in _RATES"
-    # Fable 5.1 cache reads cost 25% of Fable 5 (75% reduction)
-    expected = Decimal("0.25")
-    assert fable51_read == fable5_read * expected, (
+    # Fable 5.1 cache reads cost 25% of Fable 5 (75% reduction). This is a
+    # dimensionless RATIO -- it only coincidentally equals Fable 5.1's
+    # $0.25/MTok cache-read rate, which is asserted separately above.
+    ratio_of_fable5 = Decimal("0.25")
+    assert fable51_read == fable5_read * ratio_of_fable5, (
         f"Fable 5.1 cache read ({fable51_read}) must be 25% of Fable 5 ({fable5_read})"
     )
 
