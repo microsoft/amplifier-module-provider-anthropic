@@ -1320,6 +1320,11 @@ class AnthropicProvider:
                 if self._enable_1m_context and self._default_caps.supports_1m
                 else self._default_caps.base_context_window,
                 "max_output_tokens": self._default_caps.max_output_tokens,
+                # Anthropic charges 2x input / 1.5x output above 200k tokens
+                "context_budget_cap": 200_000
+                if self.config.get("enable_1m_context")
+                and self._default_caps.supports_1m
+                else None,
             },
             config_fields=[
                 ConfigField(
