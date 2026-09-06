@@ -357,6 +357,7 @@ House-style key reference. ✅ = wizard-visible ConfigField, ⚙️ = settings-o
 | `max_tokens` | *(model ceiling)* | ⚙️ | Output token cap |
 | `temperature` | `0.7` | ⚙️ | Ignored by non-sampling models (Sonnet 5, Opus 4.7+) |
 | `timeout` | `600.0` | ⚙️ | API timeout, seconds |
+| `close_timeout` | `5.0` | ⚙️ | Hard bound on closing the HTTP client at session teardown, seconds. `httpx`'s `aclose()` has no deadline of its own and blocks forever on a half-closed (CLOSE-WAIT) connection; on timeout the client is abandoned with a WARNING and the socket is reclaimed at process exit |
 | `priority` | `100` | ⚙️ | Provider selection priority (lower wins) |
 | `raw` | `false` | ⚙️ | Include full request/response payloads in `llm:request`/`llm:response` events |
 | `fallback_on_overload` | `false` | ⚙️ | Downgrade one ladder rung (fable/mythos → opus → sonnet → haiku) after persistent 529s |
