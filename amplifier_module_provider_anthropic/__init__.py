@@ -264,6 +264,29 @@ class _RateLimitState:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Teardown hard bound (see AnthropicProvider.close)
+# ---------------------------------------------------------------------------
+# `httpx.AsyncClient.aclose()` -- what `AsyncAnthropic.close()` awaits
+# (anthropic/_base_client.py) -- has NO deadline of its own. On a half-closed
+# (CLOSE-WAIT) connection it can block indefinitely, and session cleanup runs
+# BEFORE a CLI command returns its result, so an unbounded close turns a
+# finished run into a silent hang (measured 28 minutes; recipes-8sr evidence).
+# Overridable per instance via the `close_timeout` config key.
+_DEFAULT_CLOSE_TIMEOUT: float = 5.0
+
+
+def _retrieve_task_exception(task: "asyncio.Future[Any]") -> None:
+    """Consume an abandoned close task's exception.
+
+    Without this, a close task we stopped awaiting that later fails makes
+    asyncio log "Task exception was never retrieved" at GC time -- noise
+    that reads like a new defect. Cancelled tasks have nothing to retrieve.
+    """
+    if not task.cancelled():
+        task.exception()
+
+
+# ---------------------------------------------------------------------------
 # Process-wide concurrency gate
 # ---------------------------------------------------------------------------
 # Shared across ALL AnthropicProvider instances in this process (including
@@ -644,7 +667,9 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     logger.info("Mounted AnthropicProvider")
 
     # Return cleanup function that delegates to provider.close().
-    # close() handles lazy-client guard, asyncio.shield, and CancelledError.
+    # close() handles the lazy-client guard, the shield, CancelledError, and
+    # the hard `close_timeout` bound -- this cleanup runs inside the finally
+    # that precedes a CLI command's return, so it must never block forever.
     async def cleanup():
         await provider.close()
 
@@ -677,6 +702,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "priority",
         "raw",
         "timeout",
+        "close_timeout",
         "reasoning_effort",
         "max_retries",
         "min_retry_delay",
@@ -934,6 +960,13 @@ class AnthropicProvider:
         self.timeout = self._config_float(
             self.config.get("timeout"), 600.0
         )  # API timeout in seconds (default 10 minutes)
+        # Hard bound on teardown's httpx aclose() -- see close(). This is NOT
+        # `timeout` above: that one bounds an API request, this one bounds
+        # closing the connection pool at session cleanup, where a half-closed
+        # (CLOSE-WAIT) connection can otherwise block forever.
+        self._close_timeout = self._config_float(
+            self.config.get("close_timeout"), _DEFAULT_CLOSE_TIMEOUT
+        )
 
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
         # We handle retries ourselves (SDK max_retries=0) to properly honor retry-after headers
@@ -5805,11 +5838,59 @@ class AnthropicProvider:
         and fail permanently with "Cannot send a request, as the client
         has been closed." Clearing it lets the next use lazily rebuild a
         fresh client, and makes close() idempotent.
+
+        The close is HARD BOUNDED at ``close_timeout`` seconds (config key;
+        default 5.0). ``AsyncAnthropic.close()`` awaits
+        ``httpx.AsyncClient.aclose()``, which has no deadline of its own: on
+        a half-closed (CLOSE-WAIT) connection it can block forever. Session
+        cleanup runs inside the ``finally`` that PRECEDES a CLI command's
+        return, so an unbounded close here does not merely leak a socket --
+        it swallows the result of a completed run (recipes-8sr: 28 minutes,
+        two anthropic:443 sockets in CLOSE-WAIT, process asleep in the
+        await). On timeout the httpx client is abandoned, with a WARNING;
+        the process exit reclaims the socket.
+
+        There is no faster escape than abandoning it: anthropic 1.4.0
+        exposes only the async ``close()``, and neither
+        ``httpx.AsyncClient`` (0.28.1) nor ``httpcore.AsyncConnectionPool``
+        exposes a synchronous close of an async transport.
         """
-        if self._client is not None:
-            try:
-                await asyncio.shield(self._client.close())
-            except asyncio.CancelledError:
-                pass
-            finally:
-                self._client = None
+        client = self._client
+        if client is None:
+            return
+        # Hand off and clear the slot FIRST: the lazy-init contract and
+        # idempotency must hold even on the timeout path, where we never
+        # learn whether the close finished.
+        self._client = None
+        close_task = asyncio.ensure_future(client.close())
+        close_task.add_done_callback(_retrieve_task_exception)
+        try:
+            # shield: preserves the pre-existing contract that cancelling
+            # our CALLER does not cancel a close already in flight.
+            # wait_for: bounds it. Shield's outer future is a plain Future,
+            # so cancelling it completes immediately -- this returns within
+            # the timeout even though the inner aclose() ignores deadlines
+            # and cancellation alike.
+            await asyncio.wait_for(
+                asyncio.shield(close_task), timeout=self._close_timeout
+            )
+        except asyncio.CancelledError:
+            # Caller cancelled: leave the shielded close running, exactly as
+            # before this bound existed.
+            pass
+        except TimeoutError:
+            # Request cancellation and walk away. Deliberately NOT awaited:
+            # awaiting a call that ignores cancellation would reintroduce
+            # the unbounded wait this bound exists to prevent.
+            close_task.cancel()
+            logger.warning(
+                "[PROVIDER] %s HTTP client close exceeded %.1fs "
+                "(half-closed/CLOSE-WAIT connection?) -- abandoning the httpx "
+                "client for provider instance %s id=0x%x. The socket is "
+                "reclaimed at process exit. Raise the `close_timeout` config "
+                "key if this is a false alarm.",
+                self.api_label,
+                self._close_timeout,
+                self.name,
+                id(self),
+            )
