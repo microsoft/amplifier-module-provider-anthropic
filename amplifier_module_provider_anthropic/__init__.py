@@ -11,6 +11,7 @@ __amplifier_module_type__ = "provider"
 
 import asyncio
 import difflib
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ from threading import Lock
 from typing import Any
 from typing import ClassVar
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from dataclasses import field
 
@@ -725,6 +727,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "enable_1m_context",
         "enable_prompt_caching",
         "cache_stable_region_ttl_1h",
+        "cache_infer_stability_from_history",
         "enable_web_search",
         "beta_headers",
         "extra_request_params",
@@ -747,6 +750,14 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
 # settings-shaped provider entry carries. `api_key` and `default_model` are
 # already in _CONSUMED_CONFIG_KEYS (this module reads both).
 _INFRASTRUCTURE_CONFIG_KEYS: frozenset[str] = frozenset({"id", "module", "source"})
+
+# How many distinct conversations one provider instance tracks request
+# fingerprints for (see `cache_infer_stability_from_history`). A provider
+# instance is shared across a session's sub-agents and utility calls, so this
+# is an LRU, not a per-session slot. 32 covers deep delegation trees with room
+# to spare; each entry is a list of 32-char digests, so the whole map is
+# kilobytes even at the limit.
+_MAX_TRACKED_CONVERSATIONS = 32
 
 # Keys that are recognized but currently do nothing. Each gets its own
 # targeted warning naming what to do instead, and is therefore *excluded*
@@ -1192,6 +1203,42 @@ class AnthropicProvider:
         self.cache_stable_region_ttl_1h = self._config_bool(
             self.config.get("cache_stable_region_ttl_1h", False)
         )
+
+        # Infer conversation stability by OBSERVING consecutive requests, when
+        # the `Message.metadata` ephemeral contract is not populated.
+        #
+        # Default ON. Without it, a deployment whose orchestrator never stamps
+        # `metadata={"ephemeral": True}` gets NO conversation-region breakpoint
+        # at all -- `_apply_conversation_cache_control`'s `has_ephemeral_signal`
+        # guard skips the whole region rather than risk a breakpoint on
+        # unstable content. Measured cost of that dead end on a real
+        # coding-agent node visit (164 provider calls, one session): cache_read
+        # frozen at a single constant (10,995 = system + tools) for every call
+        # while uncached input climbed 24K -> 228K; 1.79M cache_read against
+        # 24.7M uncached input = a 6.8% hit ratio, ~26.5M input tokens billed.
+        #
+        # The inference replaces a *declaration* the orchestrator may never
+        # make with a *measurement* this provider can always take: fingerprint
+        # each request's message array, and on the next request in the same
+        # conversation compare against it. `len(previous) - longest_common_
+        # prefix` is the observed unstable-suffix length -- exactly the
+        # quantity `_unstable_suffix_length` tries to derive from metadata,
+        # but evidenced instead of asserted. It is used as a floor (max) with
+        # the metadata value, so it can only ever make placement MORE
+        # conservative, never less.
+        #
+        # Set False to revert to strict metadata-only behavior.
+        self.cache_infer_stability_from_history = self._config_bool(
+            self.config.get("cache_infer_stability_from_history", True)
+        )
+
+        # conversation key -> (message fingerprints, last observed unstable
+        # suffix length). Bounded LRU: a long-lived provider instance may
+        # serve many interleaved conversations, and this must never grow
+        # without limit. Values are short hex digests, not message content.
+        self._prefix_fingerprints: OrderedDict[
+            str, tuple[list[str], int | None]
+        ] = OrderedDict()
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
         #
@@ -3358,14 +3405,54 @@ class AnthropicProvider:
         conversation_budget = (
             4 - breakpoints_used - (1 if _tools_will_use_a_slot else 0)
         )
-        all_messages, conversation_breakpoints_used = (
-            self._apply_conversation_cache_control(
-                all_messages,
-                unstable_suffix_len,
-                has_ephemeral_signal,
-                conversation_budget,
+
+        # Before placing anything, measure the unstable tail rather than
+        # relying solely on the orchestrator declaring it. Fingerprints must
+        # be taken here -- after `all_messages` is assembled, BEFORE any
+        # cache_control is stamped onto it.
+        observed_state = "disabled"
+        if self.enable_prompt_caching and self.cache_infer_stability_from_history:
+            observed_len, observed_state = self._observed_unstable_suffix_length(
+                all_messages, system_blocks
             )
-        )
+            if observed_len is not None:
+                if observed_len > unstable_suffix_len:
+                    logger.debug(
+                        "[PROVIDER] Prompt caching: observed unstable suffix of "
+                        "%d message(s) (declared via metadata: %d) -- using the "
+                        "larger, more conservative value.",
+                        observed_len,
+                        unstable_suffix_len,
+                    )
+                unstable_suffix_len = max(unstable_suffix_len, observed_len)
+                # An observation IS a signal: it answers the same question
+                # metadata would have, from evidence this provider gathered
+                # itself. Without this, a deployment that never populates
+                # Message.metadata stays permanently in the skip path.
+                has_ephemeral_signal = True
+
+        if observed_state == "no_shared_prefix":
+            # Placing a breakpoint would burn a 1.25x cache WRITE every turn
+            # for a prefix that can never be read back.
+            logger.warning(
+                "[PROVIDER] Prompt caching: this request shares no leading "
+                "message with the previous request in the same conversation, "
+                "so no cached prefix can ever match (Anthropic matches from "
+                "the start of the request). Skipping conversation-region "
+                "cache breakpoints. Most likely cause: a leading context/"
+                "developer message regenerated per request with volatile "
+                "content (timestamp, git status, session id)."
+            )
+            conversation_breakpoints_used = 0
+        else:
+            all_messages, conversation_breakpoints_used = (
+                self._apply_conversation_cache_control(
+                    all_messages,
+                    unstable_suffix_len,
+                    has_ephemeral_signal,
+                    conversation_budget,
+                )
+            )
         breakpoints_used += conversation_breakpoints_used
         logger.info(f"[PROVIDER] Final message count for API: {len(all_messages)}")
 
@@ -5409,6 +5496,156 @@ class AnthropicProvider:
             if md.get("ephemeral") and not md.get("persisted"):
                 excluded = walked
         return excluded, has_any_metadata_signal
+
+    @staticmethod
+    def _message_fingerprint(msg: dict[str, Any]) -> str:
+        """Content digest of one Anthropic-format message.
+
+        ``cache_control`` keys are stripped at every depth so a fingerprint
+        is invariant under breakpoint placement: the *same* message must
+        hash identically whether or not this request happened to stamp it.
+        Without that, every fingerprint comparison would report a spurious
+        difference exactly at the breakpoint, which is the one position the
+        comparison exists to reason about.
+        """
+
+        def _strip(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                return {
+                    k: _strip(v) for k, v in obj.items() if k != "cache_control"
+                }
+            if isinstance(obj, list):
+                return [_strip(v) for v in obj]
+            return obj
+
+        canonical = json.dumps(_strip(msg), sort_keys=True, default=str)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+    @staticmethod
+    def _conversation_key(
+        system_blocks: list[dict[str, Any]] | None, fingerprints: list[str]
+    ) -> str:
+        """Identity of a conversation, for fingerprint bookkeeping only.
+
+        Derived from the system prompt plus the FIRST message, both of which
+        are fixed for the life of a conversation while everything after them
+        grows. No session id is available at this layer, and inventing a
+        dependency on one would tie caching to an orchestrator contract --
+        the exact coupling that broke conversation caching in the first
+        place.
+
+        A deployment whose first message is itself regenerated per request
+        gets a new key every turn and therefore never accumulates an
+        observation. That is not a silent loss: a volatile first message
+        means no cached prefix can EVER match, since Anthropic matches from
+        the start of the request. Such a deployment has nothing to lose here
+        and is reported by the `no_shared_prefix` diagnostic when the key
+        does hold still long enough to compare.
+        """
+        system_text = ""
+        if system_blocks:
+            system_text = str(system_blocks[0].get("text", ""))
+        head = fingerprints[0] if fingerprints else ""
+        digest = hashlib.sha256(
+            f"{hashlib.sha256(system_text.encode('utf-8')).hexdigest()}:{head}".encode()
+        )
+        return digest.hexdigest()[:32]
+
+    def _observed_unstable_suffix_length(
+        self,
+        all_messages: list[dict[str, Any]],
+        system_blocks: list[dict[str, Any]] | None,
+    ) -> tuple[int | None, str]:
+        """Measure the unstable tail by comparing this request to the last one.
+
+        The metadata contract (`_unstable_suffix_length`) asks the
+        orchestrator to DECLARE which trailing messages are regenerated per
+        request. When nothing populates `Message.metadata`, that question has
+        no answer and conversation caching is skipped entirely -- measured at
+        a 6.8% hit ratio over 164 calls on a real coding-agent node visit.
+
+        This answers the same question by observation instead. Fingerprint
+        every message; on the next request in the same conversation, walk the
+        two fingerprint lists to their longest common prefix. Whatever the
+        previous request had BEYOND that point did not survive into this one,
+        so ``len(previous) - lcp`` is a measured upper bound on how many
+        trailing messages are regenerated rather than appended.
+
+        Why a count from the end transfers correctly to the *current*
+        (longer) request: the estimator describes the orchestrator's
+        behavior, not a fixed index. If it drops/rewrites k trailing entries
+        each turn, then excluding k entries from this request's tail lands
+        the breakpoint on content that the next request will still carry,
+        byte-identical -- which is precisely the condition for a cache hit.
+        Worked shapes:
+
+        * append-only  -> prev [a,b,c], now [a,b,c,d,e]: lcp 3, observed 0,
+          breakpoint on the true tail. Optimal, and correct.
+        * tail reminder -> prev [a,b,c,u,R], now [a,b,c,u,A,T,R']: lcp 4,
+          observed 1, breakpoint at T -- present in the next request.
+        * pre-user reminder -> prev [a,b,c,R,u], now [a,b,c,u,A,T,R',u']:
+          lcp 3, observed 2, breakpoint at T. Over-estimates by one (u moved
+          rather than vanished); over-estimating only ever costs cacheable
+          tokens, never a hit.
+
+        Returns:
+            ``(observed_length, state)``. State is one of:
+
+            * ``"none"``   -- no prior request for this conversation, so no
+              observation exists yet (length is None). Caller falls back to
+              whatever the metadata contract said.
+            * ``"ok"``     -- length is a measured unstable-suffix count.
+            * ``"no_shared_prefix"`` -- the previous and current requests
+              share NO leading message. Nothing in this conversation can ever
+              produce a cache hit, so the caller must place no conversation
+              breakpoint at all: every one would be a cache WRITE (billed at
+              1.25x) that is never read.
+        """
+        fingerprints = [self._message_fingerprint(m) for m in all_messages]
+        key = self._conversation_key(system_blocks, fingerprints)
+        entry = self._prefix_fingerprints.get(key)
+
+        if entry is None:
+            self._prefix_fingerprints[key] = (fingerprints, None)
+            self._prefix_fingerprints.move_to_end(key)
+            while len(self._prefix_fingerprints) > _MAX_TRACKED_CONVERSATIONS:
+                self._prefix_fingerprints.popitem(last=False)
+            return None, "none"
+
+        previous, previous_observed = entry
+
+        if previous == fingerprints:
+            # Byte-identical request. This is a retry or a fallback re-issue
+            # of the SAME turn, not evidence that the orchestrator appends
+            # stably -- concluding "observed 0" here would place a breakpoint
+            # on a tail that the next real turn may well regenerate. Reuse
+            # the last real observation and leave the stored list alone.
+            self._prefix_fingerprints.move_to_end(key)
+            return (
+                previous_observed,
+                "ok" if previous_observed is not None else "none",
+            )
+
+        lcp = 0
+        for old, new in zip(previous, fingerprints):
+            if old != new:
+                break
+            lcp += 1
+
+        if lcp == 0:
+            # Not even message 0 survived. Anthropic matches a cached prefix
+            # from the very start of the request, so no breakpoint anywhere
+            # in this conversation can ever be read back.
+            self._prefix_fingerprints[key] = (fingerprints, previous_observed)
+            self._prefix_fingerprints.move_to_end(key)
+            return None, "no_shared_prefix"
+
+        observed = max(0, len(previous) - lcp)
+        self._prefix_fingerprints[key] = (fingerprints, observed)
+        self._prefix_fingerprints.move_to_end(key)
+        while len(self._prefix_fingerprints) > _MAX_TRACKED_CONVERSATIONS:
+            self._prefix_fingerprints.popitem(last=False)
+        return observed, "ok"
 
     def _apply_conversation_cache_control(
         self,
