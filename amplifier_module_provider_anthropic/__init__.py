@@ -3411,9 +3411,15 @@ class AnthropicProvider:
         # be taken here -- after `all_messages` is assembled, BEFORE any
         # cache_control is stamped onto it.
         observed_state = "disabled"
+        if self.enable_prompt_caching:
+            # Must run BEFORE fingerprinting and stamping: it is what makes a
+            # message's wire shape independent of whether this turn's rolling
+            # breakpoint happened to land on it.
+            self._normalize_content_for_cache_stability(all_messages)
+
         if self.enable_prompt_caching and self.cache_infer_stability_from_history:
             observed_len, observed_state = self._observed_unstable_suffix_length(
-                all_messages, system_blocks
+                all_messages, system_blocks, len(context_user_msgs)
             )
             if observed_len is not None:
                 if observed_len > unstable_suffix_len:
@@ -5522,30 +5528,69 @@ class AnthropicProvider:
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
 
     @staticmethod
+    def _normalize_content_for_cache_stability(
+        all_messages: list[dict[str, Any]],
+    ) -> None:
+        """Give every message the same wire shape regardless of stamping.
+
+        `_stamp_last_block` turns string content INTO a single text block in
+        order to attach `cache_control`. That means the same message is sent
+        as ``"answer"`` on a turn where it is not the breakpoint and as
+        ``[{"type": "text", "text": "answer"}]`` on a turn where it is -- so
+        the request prefix changes shape purely as a function of where the
+        rolling breakpoint happened to land, and a cached prefix written on
+        one turn cannot be matched on the next.
+
+        Caught by
+        `test_breakpoint_lands_on_content_the_next_request_still_carries`:
+        request 2 stamped message 5 and sent it as a block list; request 3
+        stamped a later message and sent message 5 as a bare string.
+
+        Normalising up front (idempotently, for every message) removes the
+        coupling entirely: the shape no longer depends on the breakpoint.
+        Anthropic treats a string as sugar for one text block, so this is a
+        representation change only.
+
+        Empty / whitespace-only strings are left alone: Anthropic rejects an
+        empty text *block* outright, so materialising one would turn a
+        tolerated input into a 400.
+        """
+        for msg in all_messages:
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                msg["content"] = [{"type": "text", "text": content}]
+
+    @staticmethod
     def _conversation_key(
-        system_blocks: list[dict[str, Any]] | None, fingerprints: list[str]
+        system_blocks: list[dict[str, Any]] | None,
+        fingerprints: list[str],
+        conversation_start: int,
     ) -> str:
         """Identity of a conversation, for fingerprint bookkeeping only.
 
-        Derived from the system prompt plus the FIRST message, both of which
-        are fixed for the life of a conversation while everything after them
-        grows. No session id is available at this layer, and inventing a
-        dependency on one would tie caching to an orchestrator contract --
-        the exact coupling that broke conversation caching in the first
-        place.
+        Derived from the system prompt plus the first message of the
+        CONVERSATION region -- the opening user turn. Both are fixed for the
+        life of a conversation while everything after them grows. No session
+        id is available at this layer, and inventing a dependency on one
+        would tie caching to an orchestrator contract -- the exact coupling
+        that broke conversation caching in the first place.
 
-        A deployment whose first message is itself regenerated per request
-        gets a new key every turn and therefore never accumulates an
-        observation. That is not a silent loss: a volatile first message
-        means no cached prefix can EVER match, since Anthropic matches from
-        the start of the request. Such a deployment has nothing to lose here
-        and is reported by the `no_shared_prefix` diagnostic when the key
-        does hold still long enough to compare.
+        Deliberately skips the context/developer prefix messages: those are
+        rebuilt from `developer` role messages on every request, and are
+        precisely the place a volatile blob (timestamp, git status, session
+        id) shows up. Keying on one would mint a new key every turn, so the
+        conversation could never accumulate an observation AND could never be
+        diagnosed -- the `no_shared_prefix` warning would never fire for the
+        one deployment shape that most needs it.
         """
         system_text = ""
         if system_blocks:
             system_text = str(system_blocks[0].get("text", ""))
-        head = fingerprints[0] if fingerprints else ""
+        head = ""
+        if conversation_start < len(fingerprints):
+            head = fingerprints[conversation_start]
+        elif fingerprints:
+            head = fingerprints[0]
         digest = hashlib.sha256(
             f"{hashlib.sha256(system_text.encode('utf-8')).hexdigest()}:{head}".encode()
         )
@@ -5555,6 +5600,7 @@ class AnthropicProvider:
         self,
         all_messages: list[dict[str, Any]],
         system_blocks: list[dict[str, Any]] | None,
+        conversation_start: int = 0,
     ) -> tuple[int | None, str]:
         """Measure the unstable tail by comparing this request to the last one.
 
@@ -5602,7 +5648,7 @@ class AnthropicProvider:
               1.25x) that is never read.
         """
         fingerprints = [self._message_fingerprint(m) for m in all_messages]
-        key = self._conversation_key(system_blocks, fingerprints)
+        key = self._conversation_key(system_blocks, fingerprints, conversation_start)
         entry = self._prefix_fingerprints.get(key)
 
         if entry is None:
