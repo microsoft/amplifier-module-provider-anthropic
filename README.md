@@ -238,6 +238,82 @@ A `provider:retry` event is emitted before each retry sleep with the following f
 | `error_type` | Kernel error class name |
 | `error_message` | Error description |
 
+## Conversation-Region Prompt Caching
+
+The provider places up to four Anthropic cache breakpoints per request: one on
+the system prompt, one on the last tool definition, and up to two rolling ones
+inside the conversation. The conversation breakpoints are the ones that matter
+for a long agent loop, because they are the only ones that grow with the
+transcript.
+
+Placing them safely requires knowing which trailing messages are *regenerated
+per request* (a `<system-reminder>` with a live clock, a git-status blob) rather
+than appended to history. A cached prefix ending in regenerated content can
+never be reproduced, so it is written every turn and never read -- strictly
+worse than not caching, because writes are billed at 1.25x.
+
+The provider answers that question two ways, in this order:
+
+1. **Declared** -- `Message.metadata = {"ephemeral": True}` (and `"persisted"`
+   for content that *is* written into canonical history). Orchestrators that
+   populate this get the most precise placement.
+2. **Observed** -- `cache_infer_stability_from_history` (default `true`). The
+   provider fingerprints each request's message array and, on the next request
+   in the same conversation, takes `len(previous) - longest_common_prefix` as
+   the measured unstable-suffix length.
+
+The observation is used as a **floor** with the declared value, never a
+replacement: it can only ever make placement more conservative.
+
+```yaml
+providers:
+  - module: provider-anthropic
+    config:
+      enable_prompt_caching: true                 # default: true
+      cache_infer_stability_from_history: true    # default: true
+```
+
+**Why the default matters.** Before observation existed, a deployment whose
+orchestrator never populated `Message.metadata` got *no* conversation-region
+breakpoint at all -- ever. Measured on one coding-agent node visit (164 provider
+calls, 60 minutes): `cache_read_input_tokens` frozen at exactly 10,995 (the
+system + tools blocks) on every single call while the prefix grew from 24K to
+228K tokens. 1.79M cache_read against 24.7M billed input -- a **6.8%** hit
+ratio.
+
+Reproduced and fixed under a 12-call tool-using loop against
+`claude-haiku-4-5` (`scripts/prompt_cache_live_probe.py`, no metadata anywhere,
+regenerated tail):
+
+| | calls 2-12 hit ratio | uncached tokens, calls 2-12 |
+| --- | ---: | ---: |
+| before | 71.5% (cache_read frozen at 11,180) | 44,208 |
+| after | **95.0%** | **411** |
+
+Two things follow from measuring rather than declaring:
+
+- **The first request in a conversation places nothing.** There is no prior
+  request to compare against, so there is no evidence yet. Caching engages from
+  the second request and the first hit lands on the second or third. That
+  warm-up is the price of not guessing.
+- **A conversation whose *leading* message is regenerated per request is
+  detected and reported.** Anthropic matches a cached prefix from the start of
+  the request, so nothing downstream of a volatile first message can ever hit.
+  The provider logs a warning naming the likely cause and places no
+  conversation breakpoint, rather than billing a write every turn for a prefix
+  that can never be read.
+
+Set `cache_infer_stability_from_history: false` to revert to strict
+metadata-only behaviour.
+
+> **Minimum cacheable prefix.** Anthropic silently ignores a breakpoint whose
+> prefix is below the model's minimum. Measured for `claude-haiku-4-5`
+> (2026-09-06): a 4,369-token system+tools prefix produced *no* cache write on
+> two consecutive identical requests, while 8,659 tokens cached immediately --
+> i.e. the effective floor is nearer 4096 than the 2048 the docs list for
+> Haiku. A small system prompt therefore gets no system-block caching at all,
+> in any version of this provider.
+
 ## Prompt Cache TTL
 
 By default, prompt-cache breakpoints use Anthropic's standard 5-minute TTL. The
@@ -354,6 +430,7 @@ House-style key reference. ✅ = wizard-visible ConfigField, ⚙️ = settings-o
 | `enable_1m_context` | `false` | ✅ | Advertise the 1M context window (more history kept = higher cost) |
 | `cache_stable_region_ttl_1h` | *(unset)* | ✅ | 1h cache TTL for system prompt + tools. 2x write cost, fewer writes |
 | `enable_prompt_caching` | `true` | ⚙️ | Place cache breakpoints |
+| `cache_infer_stability_from_history` | `true` | ⚙️ | Measure the regenerated-per-request tail by comparing consecutive requests, when `Message.metadata` is not populated. Used as a floor with the declared value, never a replacement. `false` = strict metadata-only |
 | `max_tokens` | *(model ceiling)* | ⚙️ | Output token cap |
 | `temperature` | `0.7` | ⚙️ | Ignored by non-sampling models (Sonnet 5, Opus 4.7+) |
 | `timeout` | `600.0` | ⚙️ | API timeout, seconds |
