@@ -3517,9 +3517,6 @@ class AnthropicProvider:
             params["tools"] = tools
             if tool_breakpoint_used:
                 breakpoints_used += 1
-            # Add tool_choice if specified
-            if tool_choice := kwargs.get("tool_choice"):
-                params["tool_choice"] = tool_choice
 
         # Add native web search tool if enabled (via config or kwargs)
         # This is a model-native tool that doesn't need function conversion
@@ -3531,6 +3528,24 @@ class AnthropicProvider:
             # Add web search tool at the beginning (native tools typically come first)
             params["tools"].insert(0, web_search_tool)
             logger.info("[PROVIDER] Native web search tool enabled")
+
+        if "tools" in params:
+            # Explicit provider kwargs retain their existing truthy-only
+            # semantics and vendor-wire shape. Translate only portable
+            # request-level string choices at the provider boundary.
+            if "tool_choice" in kwargs:
+                tool_choice = kwargs["tool_choice"]
+                if tool_choice:
+                    params["tool_choice"] = tool_choice
+            elif tool_choice := request.tool_choice:
+                if tool_choice == "none":
+                    params["tool_choice"] = {"type": "none"}
+                elif tool_choice == "auto":
+                    params["tool_choice"] = {"type": "auto"}
+                elif tool_choice == "required":
+                    params["tool_choice"] = {"type": "any"}
+                else:
+                    params["tool_choice"] = tool_choice
         resolved_thinking_type: str | None = None
 
         # An EXPLICITLY requested thinking budget — kwargs first, then config.
