@@ -46,6 +46,7 @@ def _descriptor(
     key: str,
     placement: str,
     binding: str = "live",
+    authority: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "version": 1,
@@ -54,6 +55,8 @@ def _descriptor(
         "placement": placement,
         "binding": binding,
     }
+    if authority is not None:
+        result["authority"] = authority
     if binding == "fixed":
         target: dict[str, Any]
         if placement == "head":
@@ -78,14 +81,19 @@ def _descriptor(
 
 
 def _instruction(
-    content: str, *, key: str, placement: str, binding: str = "live"
+    content: str,
+    *,
+    key: str,
+    placement: str,
+    binding: str = "live",
+    authority: str | None = "advisory",
 ) -> Message:
     return Message(
         role="system",
         content=content,
         metadata={
             "amplifier:instruction": _descriptor(
-                key=key, placement=placement, binding=binding
+                key=key, placement=placement, binding=binding, authority=authority
             )
         },
     )
@@ -117,6 +125,7 @@ def _cache_controlled_message_indices(params: dict[str, Any]) -> list[int]:
 def test_layout_version_is_advertised_only_for_supported_default_model() -> None:
     assert _provider("claude-opus-4-8").instruction_layout_version == 1
     assert _provider("claude-sonnet-4-7").instruction_layout_version is None
+    assert _provider().instruction_layout_authority_v1 is True
 
 
 def test_v1_rejects_an_unsupported_per_request_model() -> None:
@@ -438,3 +447,302 @@ def test_unmarked_system_messages_keep_legacy_hoisting_and_wire_shape() -> None:
     assert params["messages"] == [
         {"role": "user", "content": [{"type": "text", "text": "human"}]}
     ]
+
+
+def test_authoritative_tail_uses_consolidated_native_system_without_mutating_request() -> None:
+    request = ChatRequest(
+        messages=[
+            Message(role="user", content="work"),
+            _instruction(
+                "historical authority default",
+                key="tail-one",
+                placement="tail",
+                authority=None,
+            ),
+            _instruction(
+                "explicit authority",
+                key="tail-two",
+                placement="tail",
+                authority="authoritative",
+            ),
+            Message(role="assistant", content="previous reply"),
+        ]
+    )
+    original = request.model_dump()
+
+    params = _capture(_provider(), request)
+
+    assert [message["role"] for message in params["messages"]] == [
+        "user",
+        "system",
+        "assistant",
+    ]
+    assert _text_blocks(params["messages"][1]) == [
+        "historical authority default\n\nexplicit authority"
+    ]
+    assert "system" not in params
+    assert request.model_dump() == original
+
+
+def test_authoritative_tail_after_completed_tool_batch_keeps_native_pairing() -> None:
+    params = _capture(
+        _provider(),
+        ChatRequest(
+            messages=[
+                Message(role="user", content="run tool"),
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[{"id": "call", "tool": "tool", "arguments": {}}],
+                ),
+                Message(role="tool", tool_call_id="call", content="tool result"),
+                _instruction(
+                    "authoritative tool feedback",
+                    key="tool-tail",
+                    placement="tail",
+                    authority="authoritative",
+                ),
+                Message(role="assistant", content="continued reply"),
+            ]
+        ),
+    )
+
+    assert [message["role"] for message in params["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+        "system",
+        "assistant",
+    ]
+    tool_results = [
+        {key: block[key] for key in ("type", "tool_use_id", "content")}
+        for block in params["messages"][2]["content"]
+    ]
+    assert tool_results == [
+        {"type": "tool_result", "tool_use_id": "call", "content": "tool result"}
+    ]
+    assert _text_blocks(params["messages"][3]) == ["authoritative tool feedback"]
+
+
+def test_authoritative_before_human_uses_global_system_and_warns_once_per_source(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    request = ChatRequest(
+        messages=[
+            Message(role="user", content="older input"),
+            Message(role="assistant", content="older reply"),
+            _instruction(
+                "must not become user content",
+                key="before-human",
+                placement="before_human",
+                authority="authoritative",
+            ),
+            _instruction(
+                "same source only warns once",
+                key="before-human-second",
+                placement="before_human",
+                authority="authoritative",
+            ),
+            Message(role="user", content="current input"),
+        ]
+    )
+    original = request.model_dump()
+
+    params = _capture(_provider(), request)
+
+    assert [block["text"] for block in params["system"]] == [
+        "must not become user content",
+        "same source only warns once",
+    ]
+    assert all(
+        "must not become user content" not in " ".join(_text_blocks(message))
+        for message in params["messages"]
+        if message["role"] == "user"
+    )
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "global system fallback" in record.message
+    ]
+    assert len(warnings) == 1
+    assert "source=test-source" in warnings[0]
+    assert "key=before-human" in warnings[0]
+    assert "placement=before_human" in warnings[0]
+    assert "cache" in warnings[0]
+    assert request.model_dump() == original
+
+
+def test_authoritative_tail_in_illegal_position_uses_global_system() -> None:
+    params = _capture(
+        _provider(),
+        ChatRequest(
+            messages=[
+                Message(role="assistant", content="previous reply"),
+                _instruction(
+                    "tail after assistant is illegal",
+                    key="illegal-tail",
+                    placement="tail",
+                    authority="authoritative",
+                ),
+                Message(role="user", content="next input"),
+            ]
+        ),
+    )
+
+    assert [block["text"] for block in params["system"]] == [
+        "tail after assistant is illegal"
+    ]
+    assert all(message["role"] != "system" for message in params["messages"])
+    assert all(
+        "tail after assistant is illegal" not in " ".join(_text_blocks(message))
+        for message in params["messages"]
+        if message["role"] == "user"
+    )
+
+
+@pytest.mark.parametrize("authority", [True, "invalid"])
+def test_authority_must_be_a_closed_string_field(authority: object) -> None:
+    descriptor = _descriptor(key="bad-authority", placement="tail", authority=None)
+    descriptor["authority"] = authority
+    request = ChatRequest(
+        messages=[
+            Message(
+                role="system",
+                content="must fail before dispatch",
+                metadata={"amplifier:instruction": descriptor},
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="authority"):
+        asyncio.run(_provider().complete(request))
+
+
+def test_authority_unknown_field_remains_rejected() -> None:
+    descriptor = _descriptor(key="unknown-authority-field", placement="tail", authority=None)
+    descriptor["unexpected"] = "value"
+    request = ChatRequest(
+        messages=[
+            Message(
+                role="system",
+                content="must fail before dispatch",
+                metadata={"amplifier:instruction": descriptor},
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="invalid fields"):
+        asyncio.run(_provider().complete(request))
+
+
+def test_v1_overload_fallback_skips_models_without_v1_support() -> None:
+    provider = _provider()
+
+    assert provider._fallback_target_for_model("claude-opus-4-8") == "claude-sonnet-5"
+    assert (
+        provider._fallback_target_for_request(
+            "claude-opus-4-8", requires_instruction_layout=True
+        )
+        is None
+    )
+
+
+def test_v1_content_only_tool_call_serializes_as_native_tool_use() -> None:
+    request = ChatRequest(
+        messages=[
+            _instruction("head", key="head", placement="head"),
+            Message(role="user", content="run tool"),
+            Message(
+                role="assistant",
+                content=[ToolCallBlock(id="content-call", name="content_tool", input={"x": 1})],
+            ),
+            Message(role="tool", tool_call_id="content-call", content="result"),
+        ]
+    )
+    original = request.model_dump()
+
+    params = _capture(_provider(), request)
+
+    assert params["messages"][1]["content"] == [
+        {
+            "type": "tool_use",
+            "id": "content-call",
+            "name": "content_tool",
+            "input": {"x": 1},
+        }
+    ]
+    assert params["messages"][2]["content"] == [
+        {"type": "tool_result", "tool_use_id": "content-call", "content": "result"}
+    ]
+    assert request.model_dump() == original
+
+
+def test_v1_top_level_name_alias_serializes_as_native_tool_use() -> None:
+    request = ChatRequest(
+        messages=[
+            _instruction("head", key="head", placement="head"),
+            Message(role="user", content="run tool"),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {"id": "name-call", "name": "portable_tool", "arguments": {"x": 2}}
+                ],
+            ),
+            Message(role="tool", tool_call_id="name-call", content="result"),
+        ]
+    )
+    original = request.model_dump()
+
+    params = _capture(_provider(), request)
+
+    assert params["messages"][1]["content"] == [
+        {
+            "type": "tool_use",
+            "id": "name-call",
+            "name": "portable_tool",
+            "input": {"x": 2},
+        }
+    ]
+    assert request.model_dump() == original
+
+
+def test_v1_equivalent_duplicate_tool_calls_emit_once() -> None:
+    request = ChatRequest(
+        messages=[
+            _instruction("head", key="head", placement="head"),
+            Message(role="user", content="run tool"),
+            Message(
+                role="assistant",
+                content=[
+                    ToolCallBlock(id="duplicate-call", name="duplicate_tool", input={"x": 3})
+                ],
+                tool_calls=[
+                    {
+                        "id": "duplicate-call",
+                        "tool": "duplicate_tool",
+                        "arguments": {"x": 3},
+                    }
+                ],
+            ),
+            Message(role="tool", tool_call_id="duplicate-call", content="result"),
+        ]
+    )
+    original = request.model_dump()
+
+    params = _capture(_provider(), request)
+
+    tool_uses = [
+        block
+        for block in params["messages"][1]["content"]
+        if block["type"] == "tool_use"
+    ]
+    assert tool_uses == [
+        {
+            "type": "tool_use",
+            "id": "duplicate-call",
+            "name": "duplicate_tool",
+            "input": {"x": 3},
+        }
+    ]
+    assert request.model_dump() == original

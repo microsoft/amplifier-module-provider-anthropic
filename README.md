@@ -27,6 +27,17 @@ Provides access to Anthropic's Claude models (Claude 4 series: Sonnet, Opus, Hai
 **Mount Point:** `providers`
 **Entry Point:** `amplifier_module_provider_anthropic:mount`
 
+## Instruction Layout Authority
+
+For instruction-layout v1, `authority` is optional and defaults to
+`authoritative`. Advisory positioned records retain Anthropic's attributed
+`user` carrier. Authoritative records never use that carrier: heads use the
+global `system` prompt, while models supporting mid-conversation system
+messages retain legal authoritative tails as native `system` messages. An
+authoritative record that cannot occupy a legal native position uses the global
+system prompt instead; the provider warns because temporal placement and cache
+cost can change.
+
 ## Supported Models
 
 - `claude-sonnet-5` - Claude Sonnet 5 (recommended, default)

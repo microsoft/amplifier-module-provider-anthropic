@@ -1493,6 +1493,11 @@ class AnthropicProvider:
         """
         return self._instruction_layout_version_for_model(self.default_model)
 
+    @property
+    def instruction_layout_authority_v1(self) -> bool:
+        """Advertise that v1 authoritative records never use a user carrier."""
+        return True
+
     @classmethod
     def _instruction_layout_version_for_model(cls, model_id: str) -> int | None:
         """Return the v1 layout version supported by *model_id*, if any."""
@@ -2445,6 +2450,22 @@ class AnthropicProvider:
 
         return None
 
+    def _fallback_target_for_request(
+        self, model_id: str, *, requires_instruction_layout: bool
+    ) -> str | None:
+        """Find the next fallback that can carry this request's contract."""
+        target = self._fallback_target_for_model(model_id)
+        if not requires_instruction_layout:
+            return target
+
+        seen: set[str] = set()
+        while target is not None and target not in seen:
+            seen.add(target)
+            if self._instruction_layout_version_for_model(target) == 1:
+                return target
+            target = self._fallback_target_for_model(target)
+        return None
+
     def _refusal_fallback_target(self, current_model: str) -> str | None:
         """Resolve the model to retry against after a refusal.
 
@@ -2583,10 +2604,14 @@ class AnthropicProvider:
         await self._emit_provider_event(PROVIDER_FALLBACK_ACTIVE, payload)
 
     async def _open_fallback_window(
-        self, attempted_model: str, error: KernelLLMError
+        self,
+        attempted_model: str,
+        error: KernelLLMError,
+        *,
+        fallback_model: str | None = None,
     ) -> bool:
         """Open a temporary downgrade window for the attempted model family."""
-        fallback_model = self._fallback_target_for_model(attempted_model)
+        fallback_model = fallback_model or self._fallback_target_for_model(attempted_model)
         if not fallback_model:
             return False
 
@@ -3060,6 +3085,15 @@ class AnthropicProvider:
             effective_model, active_windows = self._resolve_effective_model(
                 requested_model
             )
+            if (
+                has_instruction_layout
+                and self._instruction_layout_version_for_model(effective_model) != 1
+            ):
+                # A legacy request may have opened this shared downgrade window.
+                # Do not let it silently turn a marked v1 request into a model
+                # that cannot preserve the instruction-layout contract.
+                effective_model = requested_model
+                active_windows = []
 
             # Guard against misconfigured fallback cycles.
             if (
@@ -3079,7 +3113,10 @@ class AnthropicProvider:
             current_kwargs["model"] = effective_model
 
             fallback_target = (
-                self._fallback_target_for_model(effective_model)
+                self._fallback_target_for_request(
+                    effective_model,
+                    requires_instruction_layout=has_instruction_layout,
+                )
                 if self._fallback_on_overload
                 else None
             )
@@ -3116,7 +3153,11 @@ class AnthropicProvider:
                 ):
                     raise
 
-                if not await self._open_fallback_window(effective_model, e):
+                if fallback_target is None:
+                    raise
+                if not await self._open_fallback_window(
+                    effective_model, e, fallback_model=fallback_target
+                ):
                     raise
             else:
                 return await self._apply_refusal_fallback(
@@ -3410,25 +3451,36 @@ class AnthropicProvider:
                 "Anthropic model does not support amplifier instruction layout version 1"
             )
 
-        # Lower only marked non-head records to an attributed user carrier.
-        # Legacy system messages retain their existing global-system behavior.
-        # This walks the canonical order once and never mutates it or resolves
-        # an anchor again in the provider.
+        # Advisory records use attributed native-user carriers. Authoritative
+        # records never do: head records are global, and legal tail records use
+        # a native inline system; every other positioned record falls back to
+        # the global system surface with an explicit trade-off warning.
         system_msgs: list[Message] = []
         developer_msgs: list[Message] = []
         conversation: list[Message] = []
+        native_tail_ids = self._native_tail_instruction_ids(
+            request.messages, instruction_descriptors, str(effective_model)
+        )
+        warned_authoritative_sources: set[str] = set()
         for message in request.messages:
             descriptor = instruction_descriptors[id(message)]
             if descriptor is not None:
                 if descriptor["placement"] == "head":
                     system_msgs.append(message)
-                else:
+                elif self._instruction_authority(descriptor) == "advisory":
                     conversation.append(
                         Message(
                             role="user",
                             content=self._instruction_carrier(message.content, descriptor),
                             metadata=message.metadata,
                         )
+                    )
+                elif id(message) in native_tail_ids:
+                    conversation.append(message)
+                else:
+                    system_msgs.append(message)
+                    self._warn_authoritative_global_fallback(
+                        descriptor, warned_authoritative_sources
                     )
             elif message.role == "system":
                 system_msgs.append(message)
@@ -3485,7 +3537,8 @@ class AnthropicProvider:
 
         # Convert conversation messages
         conversation_msgs = self._convert_messages(
-            [m.model_dump() for m in conversation]
+            [m.model_dump() for m in conversation],
+            preserve_native_system=has_instruction_layout,
         )
         logger.info(
             f"[PROVIDER] Converted {len(conversation_msgs)} conversation messages"
@@ -4999,8 +5052,17 @@ class AnthropicProvider:
             raise ValueError(
                 "amplifier:instruction placement must be head, before_human, or tail"
             )
+        if (
+            "authority" in descriptor
+            and descriptor["authority"] not in {"authoritative", "advisory"}
+        ):
+            raise ValueError(
+                "amplifier:instruction authority must be 'authoritative' or 'advisory'"
+            )
 
         base_keys = {"version", "source", "key", "binding", "placement"}
+        if "authority" in descriptor:
+            base_keys.add("authority")
         if descriptor["binding"] == "live":
             expected = base_keys | ({"target"} if "target" in descriptor else set())
             if set(descriptor) != expected:
@@ -5096,6 +5158,11 @@ class AnthropicProvider:
         return descriptor
 
     @staticmethod
+    def _instruction_authority(descriptor: dict[str, Any]) -> str:
+        """Return a descriptor's authority, defaulting historical records safely."""
+        return descriptor.get("authority", "authoritative")
+
+    @staticmethod
     def _is_head_instruction_target(target: Any, session_id: str) -> bool:
         return (
             isinstance(target, dict)
@@ -5161,6 +5228,58 @@ class AnthropicProvider:
                 call_ids.add(call["id"])
         return call_ids
 
+    @staticmethod
+    def _normalized_v1_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
+        """Normalize portable v1 tool calls without changing the source message.
+
+        Portable history can carry calls as ``content`` ToolCallBlocks
+        (``name``/``input``) and/or as the historical top-level
+        ``tool_calls`` array (``name`` or Anthropic's old ``tool`` alias,
+        plus ``arguments``). Equivalent duplicate representations describe
+        one call; conflicting duplicates are ambiguous and fail before wire
+        dispatch.
+        """
+        normalized: list[dict[str, Any]] = []
+        by_id: dict[str, dict[str, Any]] = {}
+
+        def add(raw: Any, *, content_block: bool) -> None:
+            if not isinstance(raw, dict):
+                raise ValueError("v1 instruction layout tool call must be a mapping")
+            call_id = raw.get("id") or raw.get("tool_call_id")
+            name = raw.get("name") or raw.get("tool")
+            arguments = raw.get("input") if content_block else raw.get("arguments")
+            if arguments is None:
+                arguments = raw.get("arguments") if content_block else raw.get("input")
+            if arguments is None:
+                arguments = {}
+            if not isinstance(call_id, str) or not call_id:
+                raise ValueError("v1 instruction layout tool call requires a non-empty id")
+            if not isinstance(name, str) or not name:
+                raise ValueError("v1 instruction layout tool call requires a non-empty name")
+            if not isinstance(arguments, dict):
+                raise ValueError("v1 instruction layout tool call arguments must be a mapping")
+
+            call = {"id": call_id, "name": name, "input": arguments}
+            prior = by_id.get(call_id)
+            if prior is None:
+                by_id[call_id] = call
+                normalized.append(call)
+            elif prior != call:
+                raise ValueError(
+                    f"v1 instruction layout has conflicting duplicate tool call {call_id!r}"
+                )
+
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_call":
+                    add(block, content_block=True)
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                add(call, content_block=False)
+        return normalized
+
     @classmethod
     def _validate_v1_tool_sequence(cls, messages: list[Message]) -> None:
         """Require complete canonical tool batches instead of repairing them."""
@@ -5192,7 +5311,7 @@ class AnthropicProvider:
 
     @staticmethod
     def _instruction_carrier(content: str, descriptor: dict[str, Any]) -> str:
-        """Render a positioned instruction as an attributed native user carrier."""
+        """Render an advisory positioned instruction as a native user carrier."""
         attribution = json.dumps(
             {
                 "source": descriptor["source"],
@@ -5204,13 +5323,77 @@ class AnthropicProvider:
         )
         return f"[Amplifier system instruction {attribution}]\n{content}"
 
+    @classmethod
+    def _native_tail_instruction_ids(
+        cls,
+        messages: list[Message],
+        descriptors: dict[int, dict[str, Any] | None],
+        model_id: str,
+    ) -> set[int]:
+        """Return authoritative tail records legal on Anthropic's inline surface.
+
+        An inline system record must follow a user/tool turn and precede an
+        assistant turn or the end of the transcript. Consecutive qualifying
+        records share that one legal position and are consolidated on the wire.
+        """
+        if not cls._get_capabilities(model_id).supports_inline_system:
+            return set()
+
+        native: set[int] = set()
+        index = 0
+        while index < len(messages):
+            descriptor = descriptors[id(messages[index])]
+            if (
+                descriptor is None
+                or descriptor["placement"] != "tail"
+                or cls._instruction_authority(descriptor) != "authoritative"
+            ):
+                index += 1
+                continue
+
+            end = index + 1
+            while end < len(messages):
+                adjacent = descriptors[id(messages[end])]
+                if (
+                    adjacent is None
+                    or adjacent["placement"] != "tail"
+                    or cls._instruction_authority(adjacent) != "authoritative"
+                ):
+                    break
+                end += 1
+
+            previous_role = messages[index - 1].role if index else None
+            following_role = messages[end].role if end < len(messages) else None
+            if previous_role in {"user", "tool"} and following_role in {None, "assistant"}:
+                native.update(id(message) for message in messages[index:end])
+            index = end
+        return native
+
+    @staticmethod
+    def _warn_authoritative_global_fallback(
+        descriptor: dict[str, Any], warned_sources: set[str]
+    ) -> None:
+        """Warn once per source when authority costs native placement/caching."""
+        source = descriptor["source"]
+        if source in warned_sources:
+            return
+        warned_sources.add(source)
+        logger.warning(
+            "[PROVIDER] Authoritative amplifier instruction source=%s key=%s "
+            "placement=%s uses Anthropic global system fallback; native temporal "
+            "placement is not preserved and cache cost may change.",
+            source,
+            descriptor["key"],
+            descriptor["placement"],
+        )
+
     @staticmethod
     def _merge_adjacent_user_messages(
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Merge neighboring Anthropic user messages while preserving blocks.
 
-        A positioned system carrier may sit directly before a canonical user
+        An advisory positioned carrier may sit directly before a canonical user
         message or directly after a complete tool-result batch. Converting the
         pair to one content-block list preserves order and Anthropic's native
         tool-use/tool-result grouping; it does not alter assistant replay or
@@ -5234,7 +5417,23 @@ class AnthropicProvider:
             )
         return merged
 
-    def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    @staticmethod
+    def _merge_adjacent_system_messages(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Consolidate native inline systems required to share one legal slot."""
+        merged: list[dict[str, Any]] = []
+        for message in messages:
+            if message.get("role") != "system" or not merged or merged[-1].get("role") != "system":
+                merged.append(message)
+                continue
+            previous = merged[-1]
+            previous["content"] = f"{previous['content']}\n\n{message['content']}"
+        return merged
+
+    def _convert_messages(
+        self, messages: list[dict[str, Any]], *, preserve_native_system: bool = False
+    ) -> list[dict[str, Any]]:
         """Convert messages to Anthropic format.
 
         CRITICAL: Anthropic requires ALL tool_result blocks from one assistant's tool_use
@@ -5279,8 +5478,17 @@ class AnthropicProvider:
             role = msg.get("role")
             content = msg.get("content", "")
 
-            # Skip system messages (handled separately)
+            # Marked authoritative tail records may be legal native inline
+            # systems. All other system messages belong to the global surface.
             if role == "system":
+                descriptor = (msg.get("metadata") or {}).get("amplifier:instruction")
+                if (
+                    preserve_native_system
+                    and isinstance(descriptor, dict)
+                    and descriptor.get("placement") == "tail"
+                    and self._instruction_authority(descriptor) == "authoritative"
+                ):
+                    anthropic_messages.append({"role": "system", "content": content})
                 i += 1
                 continue
 
@@ -5328,7 +5536,12 @@ class AnthropicProvider:
                 continue  # i already advanced in while loop
             if role == "assistant":
                 # Assistant messages - check for tool calls or thinking blocks
-                if "tool_calls" in msg and msg["tool_calls"]:
+                v1_tool_calls = (
+                    self._normalized_v1_tool_calls(msg)
+                    if preserve_native_system
+                    else []
+                )
+                if v1_tool_calls or ("tool_calls" in msg and msg["tool_calls"]):
                     # Assistant message with tool calls
                     content_blocks = []
 
@@ -5372,13 +5585,14 @@ class AnthropicProvider:
                             content_blocks.append({"type": "text", "text": content})
 
                     # Add tool_use blocks
-                    for tc in msg["tool_calls"]:
+                    tool_calls = v1_tool_calls or msg["tool_calls"]
+                    for tc in tool_calls:
                         content_blocks.append(
                             {
                                 "type": "tool_use",
                                 "id": tc.get("id", ""),
-                                "name": tc.get("tool", ""),
-                                "input": tc.get("arguments", {}),
+                                "name": tc.get("name") or tc.get("tool", ""),
+                                "input": tc.get("input", tc.get("arguments", {})),
                             }
                         )
 
@@ -5480,7 +5694,7 @@ class AnthropicProvider:
                     anthropic_messages.append({"role": "user", "content": content})
                 i += 1
 
-        return anthropic_messages
+        return self._merge_adjacent_system_messages(anthropic_messages)
 
     def _convert_tools_from_request(self, tools: list) -> list[dict[str, Any]]:
         """Convert ToolSpec objects from ChatRequest to Anthropic format.
