@@ -1483,6 +1483,21 @@ class AnthropicProvider:
             ],
         )
 
+    @property
+    def instruction_layout_version(self) -> int | None:
+        """Advertise the optional v1 lowering contract for the selected model.
+
+        Context assembly checks this before producing marked system records.
+        Keep the declaration model-specific: a provider instance configured
+        for an older path must remain on the legacy route.
+        """
+        return self._instruction_layout_version_for_model(self.default_model)
+
+    @classmethod
+    def _instruction_layout_version_for_model(cls, model_id: str) -> int | None:
+        """Return the v1 layout version supported by *model_id*, if any."""
+        return 1 if cls._get_capabilities(model_id).supports_inline_system else None
+
     async def list_models(
         self, retry_config: RetryConfig | None = None
     ) -> list[ModelInfo]:
@@ -2936,6 +2951,12 @@ class AnthropicProvider:
         if getattr(response, "finish_reason", None) != "refusal":
             return response
 
+        # A v1 request is an immutable prepared canonical view. The legacy
+        # fallback strips replay thinking from a transport copy, which is valid
+        # for unmarked history but would be provider-side pruning here.
+        if self._has_instruction_layout(request.messages):
+            return response
+
         fallback_model = self._refusal_fallback_target(effective_model)
         if fallback_model is None:
             return response
@@ -2962,8 +2983,21 @@ class AnthropicProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
-        # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
-        missing = self._find_missing_tool_results(request.messages)
+        # Validate marked records before the legacy repair path. V1 canonical
+        # views are immutable at this boundary: no synthetic result insertion,
+        # re-resolution, or provider-side pruning is permitted.
+        has_instruction_layout = self._has_instruction_layout(request.messages)
+        if has_instruction_layout:
+            self._validate_v1_tool_sequence(request.messages)
+
+        # Legacy-only backup safety net. V1's complete-batch validation above
+        # deliberately fails instead of inspecting or rewriting its canonical
+        # view for repair.
+        missing = (
+            []
+            if has_instruction_layout
+            else self._find_missing_tool_results(request.messages)
+        )
 
         if missing:
             logger.warning(
@@ -3242,12 +3276,14 @@ class AnthropicProvider:
         return info
 
     def _format_system_with_cache(
-        self, system_msgs: list[Message]
+        self, system_msgs: list[Message], *, instruction_layout: bool = False
     ) -> list[dict[str, Any]] | None:
         """Format system messages as content block array with cache_control.
 
         Anthropic requires system as array of content blocks for caching.
-        Cache breakpoint goes on the LAST block.
+        Legacy requests retain their one combined system block. A v1 request
+        keeps head records separate, so its stable prefix can be cached without
+        caching a following live head contribution.
 
         Returns:
             List of content blocks, or None if no system messages
@@ -3255,27 +3291,48 @@ class AnthropicProvider:
         if not system_msgs:
             return None
 
-        # Combine into single text (preserves current behavior)
-        combined = "\n\n".join(
-            m.content if isinstance(m.content, str) else "" for m in system_msgs
-        )
+        if not instruction_layout:
+            # Combine into one text block to preserve the legacy wire shape.
+            combined = "\n\n".join(
+                m.content if isinstance(m.content, str) else "" for m in system_msgs
+            )
+            if not combined:
+                return None
+            blocks = [{"type": "text", "text": combined}]
+            cacheable_prefix_len = 1
+        else:
+            # Every v1 system record is text-only and was validated before this
+            # method runs. Empty unmarked legacy system records retain their
+            # historical omission here.
+            pairs = [
+                (message, {"type": "text", "text": message.content})
+                for message in system_msgs
+                if isinstance(message.content, str) and message.content
+            ]
+            if not pairs:
+                return None
+            blocks = [block for _, block in pairs]
 
-        if not combined:
-            return None
+            # A live head contribution is regenerated each request. Anthropic
+            # cache checkpoints cover the prefix, so stop at the first such
+            # record rather than making an old current instruction cacheable.
+            cacheable_prefix_len = len(blocks)
+            for index, (message, _) in enumerate(pairs):
+                descriptor = (message.metadata or {}).get("amplifier:instruction")
+                if isinstance(descriptor, dict) and descriptor.get("binding") == "live":
+                    cacheable_prefix_len = index
+                    break
 
-        block: dict[str, Any] = {"type": "text", "text": combined}
-
-        # Add cache_control if enabled. The system prompt is the most stable
-        # part of the request (rebuilt from on-disk bundle content, not from
-        # per-turn conversation), so it optionally gets the extended 1h TTL --
-        # see `cache_stable_region_ttl_1h` (opt-in, default off).
-        if self.enable_prompt_caching:
+        # Add cache_control only to the last stable prefix block. The system
+        # prompt is the most stable part of a legacy request, while v1 may add
+        # a volatile live head suffix.
+        if self.enable_prompt_caching and cacheable_prefix_len:
             cache_control: dict[str, Any] = {"type": "ephemeral"}
             if self.cache_stable_region_ttl_1h:
                 cache_control["ttl"] = "1h"
-            block["cache_control"] = cache_control
+            blocks[cacheable_prefix_len - 1]["cache_control"] = cache_control
 
-        return [block]
+        return blocks
 
     def _merge_extra_request_params(self, params: dict[str, Any]) -> None:
         """Merge config ``extra_request_params`` into *params*, user-wins-loudly.
@@ -3334,12 +3391,51 @@ class AnthropicProvider:
             f"Received ChatRequest with {len(request.messages)} messages (raw={self.raw})"
         )
 
-        # Separate messages by role
-        system_msgs = [m for m in request.messages if m.role == "system"]
-        developer_msgs = [m for m in request.messages if m.role == "developer"]
-        conversation = [
-            m for m in request.messages if m.role in ("user", "assistant", "tool")
-        ]
+        # Validate every marked record before creating a wire representation.
+        # A malformed descriptor must fail intact rather than being silently
+        # dropped by the historical all-system-message hoist below.
+        instruction_descriptors = {
+            id(message): self._validated_instruction_descriptor(message)
+            for message in request.messages
+        }
+        has_instruction_layout = any(
+            descriptor is not None for descriptor in instruction_descriptors.values()
+        )
+        effective_model = kwargs.get("model", self.default_model)
+        if (
+            has_instruction_layout
+            and self._instruction_layout_version_for_model(effective_model) != 1
+        ):
+            raise ValueError(
+                "Anthropic model does not support amplifier instruction layout version 1"
+            )
+
+        # Lower only marked non-head records to an attributed user carrier.
+        # Legacy system messages retain their existing global-system behavior.
+        # This walks the canonical order once and never mutates it or resolves
+        # an anchor again in the provider.
+        system_msgs: list[Message] = []
+        developer_msgs: list[Message] = []
+        conversation: list[Message] = []
+        for message in request.messages:
+            descriptor = instruction_descriptors[id(message)]
+            if descriptor is not None:
+                if descriptor["placement"] == "head":
+                    system_msgs.append(message)
+                else:
+                    conversation.append(
+                        Message(
+                            role="user",
+                            content=self._instruction_carrier(message.content, descriptor),
+                            metadata=message.metadata,
+                        )
+                    )
+            elif message.role == "system":
+                system_msgs.append(message)
+            elif message.role == "developer":
+                developer_msgs.append(message)
+            elif message.role in ("user", "assistant", "tool"):
+                conversation.append(message)
 
         logger.debug(
             f"Separated: {len(system_msgs)} system, {len(developer_msgs)} developer, {len(conversation)} conversation"
@@ -3358,7 +3454,9 @@ class AnthropicProvider:
         breakpoints_used = 0
 
         # Format system messages as content block array (required for caching)
-        system_blocks = self._format_system_with_cache(system_msgs)
+        system_blocks = self._format_system_with_cache(
+            system_msgs, instruction_layout=has_instruction_layout
+        )
         if system_blocks and self.enable_prompt_caching:
             breakpoints_used += 1
 
@@ -3393,8 +3491,13 @@ class AnthropicProvider:
             f"[PROVIDER] Converted {len(conversation_msgs)} conversation messages"
         )
 
-        # Combine: context THEN conversation
+        # Combine: context THEN conversation. V1 system carriers can be
+        # adjacent to actual user input or a completed tool-result batch.
+        # Anthropic requires one user message in those positions, so merge
+        # their blocks without inventing an actual-human turn boundary.
         all_messages = context_user_msgs + conversation_msgs
+        if has_instruction_layout:
+            all_messages = self._merge_adjacent_user_messages(all_messages)
 
         # Apply up to 2 rolling cache breakpoints over STABLE conversation
         # content (never on the trailing ephemeral messages identified
@@ -3464,7 +3567,6 @@ class AnthropicProvider:
 
         # Resolve model and capabilities BEFORE building params dict,
         # so per-model param gating (temperature, output_config) can apply.
-        effective_model = kwargs.get("model", self.default_model)
         request_caps = await self._get_request_capabilities(effective_model)
         model_ceiling = request_caps.max_output_tokens
 
@@ -4863,6 +4965,275 @@ class AnthropicProvider:
         cleaned.pop("visibility", None)
         return cleaned
 
+    @classmethod
+    def _validated_instruction_descriptor(
+        cls, message: Message
+    ) -> dict[str, Any] | None:
+        """Return a usable v1 descriptor or fail before lowering any content.
+
+        Context-simple owns target resolution and retention. This boundary
+        validates only the closed facts required to preserve that resolved
+        placement, and deliberately does not infer, rewrite, prune, or compact
+        any canonical message.
+        """
+        metadata = message.metadata
+        if metadata is None or "amplifier:instruction" not in metadata:
+            return None
+        descriptor = metadata["amplifier:instruction"]
+        if not isinstance(descriptor, dict):
+            raise ValueError("amplifier:instruction metadata must be a mapping")
+        if message.role != "system":
+            raise ValueError("amplifier:instruction metadata requires a system message")
+        if not isinstance(message.content, str):
+            raise ValueError("amplifier:instruction content must be text")
+        if type(descriptor.get("version")) is not int or descriptor["version"] != 1:
+            raise ValueError("unsupported amplifier:instruction metadata version")
+        for key in ("source", "key"):
+            if not isinstance(descriptor.get(key), str) or not descriptor[key]:
+                raise ValueError(
+                    f"amplifier:instruction metadata requires non-empty {key!r}"
+                )
+        if descriptor.get("binding") not in {"live", "fixed"}:
+            raise ValueError("amplifier:instruction binding must be 'live' or 'fixed'")
+        if descriptor.get("placement") not in {"head", "before_human", "tail"}:
+            raise ValueError(
+                "amplifier:instruction placement must be head, before_human, or tail"
+            )
+
+        base_keys = {"version", "source", "key", "binding", "placement"}
+        if descriptor["binding"] == "live":
+            expected = base_keys | ({"target"} if "target" in descriptor else set())
+            if set(descriptor) != expected:
+                raise ValueError("live amplifier:instruction metadata has invalid fields")
+            if "target" in descriptor:
+                if (
+                    descriptor["placement"] != "tail"
+                    or not cls._is_tail_instruction_target(descriptor["target"])
+                ):
+                    raise ValueError(
+                        "live amplifier:instruction target must be a tail boundary"
+                    )
+            return descriptor
+
+        expected = base_keys | {
+            "entry_id",
+            "event_key",
+            "session_id",
+            "target",
+            "order",
+            "disposition",
+        }
+        if descriptor.get("deferred_origin") is True:
+            expected.add("deferred_origin")
+        if descriptor.get("disposition") == "retired":
+            expected.add("retire_reason")
+        if set(descriptor) != expected:
+            raise ValueError("fixed amplifier:instruction metadata has invalid fields")
+        for key in ("entry_id", "event_key", "session_id"):
+            if not isinstance(descriptor.get(key), str) or not descriptor[key]:
+                raise ValueError(
+                    f"fixed amplifier:instruction metadata requires non-empty {key!r}"
+                )
+        if descriptor["event_key"] != descriptor["key"] or descriptor["entry_id"] != (
+            f"{descriptor['session_id']}:{descriptor['source']}:{descriptor['key']}"
+        ):
+            raise ValueError("fixed amplifier:instruction metadata identity is invalid")
+        if (
+            type(descriptor.get("order")) is not int
+            or descriptor["order"] <= 0
+        ):
+            raise ValueError(
+                "fixed amplifier:instruction metadata requires positive order"
+            )
+        if descriptor.get("disposition") not in {
+            "pending",
+            "delivered",
+            "retired",
+            "anchor_pruned",
+        }:
+            raise ValueError(
+                "fixed amplifier:instruction metadata has invalid disposition"
+            )
+        if descriptor["disposition"] in {"retired", "anchor_pruned"}:
+            raise ValueError(
+                "terminal fixed amplifier:instruction cannot be lowered"
+            )
+        if (
+            "deferred_origin" in descriptor
+            and descriptor["deferred_origin"] is not True
+        ):
+            raise ValueError("fixed amplifier:instruction deferred origin is invalid")
+        if descriptor["disposition"] == "retired" and (
+            not isinstance(descriptor.get("retire_reason"), str)
+            or not descriptor["retire_reason"]
+        ):
+            raise ValueError(
+                "retired fixed amplifier:instruction requires a non-empty reason"
+            )
+
+        target = descriptor["target"]
+        if descriptor.get("deferred_origin") is True and descriptor["placement"] == "tail":
+            raise ValueError(
+                "deferred fixed amplifier:instruction cannot target tail"
+            )
+        if cls._is_deferred_instruction_target(target):
+            raise ValueError(
+                "unresolved fixed amplifier:instruction target cannot be lowered"
+            )
+        target_kind = (
+            "head"
+            if cls._is_head_instruction_target(target, descriptor["session_id"])
+            else "before_human"
+            if cls._is_before_human_instruction_target(target)
+            else "tail"
+            if cls._is_tail_instruction_target(target)
+            else None
+        )
+        if target_kind != descriptor["placement"]:
+            raise ValueError(
+                "fixed amplifier:instruction target does not match its placement"
+            )
+        return descriptor
+
+    @staticmethod
+    def _is_head_instruction_target(target: Any, session_id: str) -> bool:
+        return (
+            isinstance(target, dict)
+            and set(target) == {"kind", "session_id"}
+            and target.get("kind") == "conversation_head"
+            and target.get("session_id") == session_id
+        )
+
+    @staticmethod
+    def _is_before_human_instruction_target(target: Any) -> bool:
+        if not isinstance(target, dict):
+            return False
+        expected = {"input_id", "message_id", "origin"}
+        if set(target) == expected | {"version"}:
+            if type(target.get("version")) is not int or target["version"] != 1:
+                return False
+            target = {key: target[key] for key in expected}
+        if set(target) != expected:
+            return False
+        return (
+            all(isinstance(target[key], str) and target[key] for key in expected)
+            and target["origin"] in {"human", "delegation"}
+        )
+
+    @staticmethod
+    def _is_tail_instruction_target(target: Any) -> bool:
+        return (
+            isinstance(target, dict)
+            and set(target) == {"after_message_id"}
+            and isinstance(target["after_message_id"], str)
+            and bool(target["after_message_id"])
+        )
+
+    @staticmethod
+    def _is_deferred_instruction_target(target: Any) -> bool:
+        return (
+            isinstance(target, dict)
+            and set(target) == {"kind", "placement"}
+            and target.get("kind") == "first_eligible_turn"
+            and target.get("placement") in {"head", "before_human"}
+        )
+
+    @classmethod
+    def _has_instruction_layout(cls, messages: list[Message]) -> bool:
+        """Validate marked records and return whether this is a v1 request."""
+        descriptors = [
+            cls._validated_instruction_descriptor(message) for message in messages
+        ]
+        return any(descriptor is not None for descriptor in descriptors)
+
+    @staticmethod
+    def _v1_assistant_tool_call_ids(message: Message) -> set[str]:
+        """Extract canonical tool-call IDs without rewriting a v1 message."""
+        call_ids: set[str] = set()
+        if isinstance(message.content, list):
+            for block in message.content:
+                if getattr(block, "type", None) == "tool_call" and isinstance(
+                    getattr(block, "id", None), str
+                ):
+                    call_ids.add(block.id)
+        for call in getattr(message, "tool_calls", []) or []:
+            if isinstance(call, dict) and isinstance(call.get("id"), str):
+                call_ids.add(call["id"])
+        return call_ids
+
+    @classmethod
+    def _validate_v1_tool_sequence(cls, messages: list[Message]) -> None:
+        """Require complete canonical tool batches instead of repairing them."""
+        pending: set[str] = set()
+        for message in messages:
+            if message.role == "assistant":
+                if pending:
+                    raise ValueError(
+                        "v1 instruction layout has an incomplete tool-result batch"
+                    )
+                pending = cls._v1_assistant_tool_call_ids(message)
+                continue
+            if message.role == "tool":
+                if (
+                    not isinstance(message.tool_call_id, str)
+                    or message.tool_call_id not in pending
+                ):
+                    raise ValueError(
+                        "v1 instruction layout has an orphaned tool result"
+                    )
+                pending.remove(message.tool_call_id)
+                continue
+            if pending:
+                raise ValueError(
+                    "v1 instruction layout splits a tool-use/tool-result batch"
+                )
+        if pending:
+            raise ValueError("v1 instruction layout has missing tool results")
+
+    @staticmethod
+    def _instruction_carrier(content: str, descriptor: dict[str, Any]) -> str:
+        """Render a positioned instruction as an attributed native user carrier."""
+        attribution = json.dumps(
+            {
+                "source": descriptor["source"],
+                "placement": descriptor["placement"],
+                "binding": descriptor["binding"],
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        return f"[Amplifier system instruction {attribution}]\n{content}"
+
+    @staticmethod
+    def _merge_adjacent_user_messages(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Merge neighboring Anthropic user messages while preserving blocks.
+
+        A positioned system carrier may sit directly before a canonical user
+        message or directly after a complete tool-result batch. Converting the
+        pair to one content-block list preserves order and Anthropic's native
+        tool-use/tool-result grouping; it does not alter assistant replay or
+        thinking blocks.
+        """
+        merged: list[dict[str, Any]] = []
+        for message in messages:
+            if message.get("role") != "user" or not merged or merged[-1].get("role") != "user":
+                merged.append(message)
+                continue
+
+            previous = merged[-1]
+
+            def as_blocks(content: Any) -> list[Any]:
+                if isinstance(content, list):
+                    return list(content)
+                return [{"type": "text", "text": content}]
+
+            previous["content"] = as_blocks(previous.get("content", "")) + as_blocks(
+                message.get("content", "")
+            )
+        return merged
+
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert messages to Anthropic format.
 
@@ -5514,7 +5885,14 @@ class AnthropicProvider:
             if msg.role == "tool":
                 break
             md = msg.metadata or {}
-            if md.get("ephemeral") and not md.get("persisted"):
+            instruction = md.get("amplifier:instruction")
+            if (
+                (md.get("ephemeral") and not md.get("persisted"))
+                or (
+                    isinstance(instruction, dict)
+                    and instruction.get("binding") == "live"
+                )
+            ):
                 excluded = walked
         return excluded, has_any_metadata_signal
 
