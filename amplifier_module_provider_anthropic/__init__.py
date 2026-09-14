@@ -1496,6 +1496,14 @@ class AnthropicProvider:
     @classmethod
     def _instruction_layout_version_for_model(cls, model_id: str) -> int | None:
         """Return the v1 layout version supported by *model_id*, if any."""
+        # V1 uses top-level system text and attributed user carriers, not
+        # messages[].role="system". Sonnet 5 supports that native wire shape
+        # without advertising the unrelated inline-system capability.
+        if (
+            cls._detect_family(model_id) == "sonnet"
+            and cls._detect_version(model_id, "sonnet") == (5, 0)
+        ):
+            return 1
         return 1 if cls._get_capabilities(model_id).supports_inline_system else None
 
     async def list_models(

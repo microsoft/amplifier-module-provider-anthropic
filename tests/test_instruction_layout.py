@@ -117,6 +117,8 @@ def _cache_controlled_message_indices(params: dict[str, Any]) -> list[int]:
 def test_layout_version_is_advertised_only_for_supported_default_model() -> None:
     assert _provider("claude-opus-4-8").instruction_layout_version == 1
     assert _provider("claude-sonnet-4-7").instruction_layout_version is None
+    assert _provider("claude-sonnet-5").instruction_layout_version == 1
+    assert not AnthropicProvider._get_capabilities("claude-sonnet-5").supports_inline_system
 
 
 def test_v1_rejects_an_unsupported_per_request_model() -> None:
@@ -127,9 +129,10 @@ def test_v1_rejects_an_unsupported_per_request_model() -> None:
         asyncio.run(provider.complete(request, model="claude-sonnet-4-7"))
 
 
-def test_v1_hoists_only_head_and_caches_stable_head_prefix() -> None:
+@pytest.mark.parametrize("model", ["claude-opus-4-8", "claude-sonnet-5"])
+def test_v1_hoists_only_head_and_caches_stable_head_prefix(model: str) -> None:
     params = _capture(
-        _provider(),
+        _provider(model),
         ChatRequest(
             messages=[
                 Message(role="system", content="legacy base"),
@@ -281,9 +284,10 @@ def test_v1_mixed_legacy_system_messages_hoist_without_mutating_canonical_input(
     assert request.model_dump() == original
 
 
-def test_v1_tail_after_parallel_tool_batch_preserves_grouping_and_order() -> None:
+@pytest.mark.parametrize("model", ["claude-opus-4-8", "claude-sonnet-5"])
+def test_v1_tail_after_parallel_tool_batch_preserves_grouping_and_order(model: str) -> None:
     params = _capture(
-        _provider(),
+        _provider(model),
         ChatRequest(
             messages=[
                 Message(role="user", content="run both"),
