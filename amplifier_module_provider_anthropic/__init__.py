@@ -449,15 +449,33 @@ def _recoverable_input_overflow(error: AnthropicBadRequestError) -> tuple[int, i
     if getattr(error, "status_code", None) != 400:
         return None
     body = getattr(error, "body", None)
-    if not isinstance(body, dict) or body.get("type") != "invalid_request_error":
+    if not isinstance(body, dict):
         return None
-    message = body.get("message")
+    if body.get("type") == "error":
+        structured_error = body.get("error")
+    elif body.get("type") == "invalid_request_error":
+        # Older SDKs normalize the inner error object before exposing .body.
+        structured_error = body
+    else:
+        return None
+    if (
+        not isinstance(structured_error, dict)
+        or structured_error.get("type") != "invalid_request_error"
+    ):
+        return None
+    message = structured_error.get("message")
     request_id = getattr(error, "request_id", None)
+    if not request_id:
+        request_id = body.get("request_id")
     if not request_id:
         response = getattr(error, "response", None)
         headers = getattr(response, "headers", {}) if response is not None else {}
         request_id = headers.get("request-id") or headers.get("x-request-id")
-    if not isinstance(message, str) or not request_id:
+    if (
+        not isinstance(message, str)
+        or not isinstance(request_id, str)
+        or not request_id.strip()
+    ):
         return None
     match = _RECOVERABLE_INPUT_OVERFLOW_RE.fullmatch(message)
     if match is None:
@@ -483,9 +501,11 @@ class _OverflowFeedback:
     """One-shot, provider-private evidence for an input-only rejected request."""
 
     owner: object
+    request: ChatRequest
     request_fingerprint: str
     options_fingerprint: str
     assembly_fingerprint: str
+    prefix_state: OrderedDict[str, tuple[list[str], int | None]]
     actual_input_tokens: int
     input_limit_tokens: int
     max_output_tokens: int
@@ -3996,6 +4016,7 @@ class AnthropicProvider:
         if (
             not isinstance(feedback, _OverflowFeedback)
             or feedback.owner is not self._overflow_feedback_owner
+            or failed_request is not feedback.request
             or feedback.consumed
             or isinstance(context_estimate, bool)
             or not isinstance(context_estimate, int)
@@ -4012,7 +4033,10 @@ class AnthropicProvider:
         if caps is None:
             return None
         assembly = self._assemble_request_params(
-            failed_request, request_options=options, request_caps=caps
+            failed_request,
+            request_options=options,
+            request_caps=caps,
+            prefix_state=OrderedDict(feedback.prefix_state),
         )
         if (
             assembly is None
@@ -4074,11 +4098,12 @@ class AnthropicProvider:
                 effective_model,
                 _DEPRECATED_MODELS[effective_model],
             )
+        prefix_state_before_assembly = OrderedDict(self._prefix_fingerprints)
         assembly = self._assemble_request_params(
             request,
             request_options=kwargs,
             request_caps=request_caps,
-            prefix_state=OrderedDict(self._prefix_fingerprints),
+            prefix_state=OrderedDict(prefix_state_before_assembly),
             emit_diagnostics=True,
         )
         if assembly is None:
@@ -4091,8 +4116,9 @@ class AnthropicProvider:
         interleaved_thinking_enabled = assembly.interleaved_thinking_enabled
 
         # Keep only short fingerprints for a possible input-only server
-        # rejection.  The feedback itself is attached only after a strict 400;
-        # no request payload is retained by this provider-private mechanism.
+        # rejection. The request reference adds an identity binding without
+        # copying it; the staged prefix state lets recovery validate the exact
+        # rejected assembly even though dispatch has committed its new state.
         overflow_request_fingerprint = self._fingerprint(request.model_dump())
         overflow_options_fingerprint = self._fingerprint(kwargs)
         overflow_assembly_fingerprint = self._fingerprint(params)
@@ -4412,9 +4438,11 @@ class AnthropicProvider:
                             "_anthropic_overflow_feedback",
                             _OverflowFeedback(
                                 owner=self._overflow_feedback_owner,
+                                request=request,
                                 request_fingerprint=overflow_request_fingerprint,
                                 options_fingerprint=overflow_options_fingerprint,
                                 assembly_fingerprint=overflow_assembly_fingerprint,
+                                prefix_state=prefix_state_before_assembly,
                                 actual_input_tokens=actual,
                                 input_limit_tokens=limit,
                                 max_output_tokens=params["max_tokens"],
