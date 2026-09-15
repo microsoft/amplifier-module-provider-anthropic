@@ -406,10 +406,29 @@ _STATIC_BUDGET_MODEL_VERSIONS: dict[str, frozenset[tuple[int, int]]] = {
 }
 
 # This is deliberately private and fixed rather than a provider configuration
-# knob or a claimed Anthropic limit.  It makes a calibrated byte estimate
+# knob or a claimed Anthropic limit. It makes an exact vendor count
 # conservative while leaving the vendor's independently advertised input limit
 # intact.
 _INPUT_BUDGET_SAFETY_RESERVE = 4096
+_COUNT_TOKENS_TIMEOUT_SECONDS = 5.0
+
+# The count endpoint deliberately accepts a narrower request shape than
+# messages.create(). Project from the one shared assembled request instead of
+# maintaining a second assembler. In particular, max_tokens is dispatch-only:
+# it remains local for the returned decision but must never reach count_tokens.
+_COUNT_TOKENS_PARAM_KEYS: frozenset[str] = frozenset(
+    {
+        "model",
+        "messages",
+        "system",
+        "tools",
+        "tool_choice",
+        "thinking",
+        "output_config",
+        "cache_control",
+        "extra_headers",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Context-overflow detection markers
@@ -1337,10 +1356,6 @@ class AnthropicProvider:
             str, tuple[list[str], int | None]
         ] = OrderedDict()
 
-        # Per-model calibration is intentionally only a scalar worst observed
-        # token/serialized-byte ratio.  It never stores request content,
-        # assembled params, or response payloads.
-        self._input_token_ratio_by_model: dict[str, float] = {}
         self._overflow_feedback_owner = object()
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
@@ -3433,37 +3448,6 @@ class AnthropicProvider:
             return None
         return hashlib.sha256(encoded).hexdigest()
 
-    @staticmethod
-    def _serialized_input_bytes(params: dict[str, Any]) -> int | None:
-        """Return the full wire payload's UTF-8 size, or unavailable."""
-        try:
-            encoded = json.dumps(
-                params, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-            ).encode("utf-8")
-        except (TypeError, ValueError):
-            return None
-        return len(encoded)
-
-    @staticmethod
-    def _has_unaccountable_media(params: dict[str, Any]) -> bool:
-        """Media cannot safely be estimated from JSON bytes."""
-        messages = params.get("messages")
-        if not isinstance(messages, list):
-            return True
-        for message in messages:
-            if not isinstance(message, dict):
-                return True
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if isinstance(block, dict) and block.get("type") in {
-                    "image",
-                    "document",
-                }:
-                    return True
-        return False
-
     def _budget_capabilities_for(self, model_id: Any) -> ModelCapabilities | None:
         """Use only a known static window or an already-cached runtime window."""
         if not isinstance(model_id, str):
@@ -3916,47 +3900,23 @@ class AnthropicProvider:
             interleaved_thinking_enabled=interleaved_thinking_enabled,
         )
 
-    def _record_input_calibration(self, params: dict[str, Any], response: Any) -> None:
-        """Learn a conservative scalar conversion from successful raw usage."""
-        if self._has_unaccountable_media(params):
-            return
-        byte_count = self._serialized_input_bytes(params)
-        usage = getattr(response, "usage", None)
-        if byte_count is None or byte_count <= 0 or usage is None:
-            return
-        def usage_value(name: str) -> int:
-            value = getattr(usage, name, None)
-            if value is None and isinstance(usage, dict):
-                value = usage.get(name)
-            return value if isinstance(value, int) and not isinstance(value, bool) else 0
-        gross_input = sum(
-            usage_value(name)
-            for name in (
-                "input_tokens",
-                "cache_creation_input_tokens",
-                "cache_read_input_tokens",
-            )
-        )
-        if gross_input > 0:
-            model = params.get("model")
-            if isinstance(model, str):
-                self._input_token_ratio_by_model[model] = max(
-                    gross_input / byte_count,
-                    self._input_token_ratio_by_model.get(model, 0.0),
-                )
+    @staticmethod
+    def _count_tokens_params(params: Mapping[str, Any]) -> dict[str, Any]:
+        """Project assembled dispatch params to the count endpoint's schema."""
+        return {
+            key: params[key]
+            for key in _COUNT_TOKENS_PARAM_KEYS
+            if key in params
+        }
 
-    def request_budget(
+    async def request_budget(
         self,
         request: ChatRequest,
         *,
         context_estimate: int,
         request_options: Mapping[str, Any] | None = None,
     ) -> dict[str, int] | None:
-        """Return a warm, conservative input decision or unavailable.
-
-        Cold byte measurements are deliberately not used as token estimates:
-        only successful Anthropic usage calibrates the conversion.
-        """
+        """Return an exact Anthropic input decision or unavailable."""
         if (
             isinstance(context_estimate, bool)
             or not isinstance(context_estimate, int)
@@ -3970,26 +3930,39 @@ class AnthropicProvider:
         assembly = self._assemble_request_params(
             request, request_options=options, request_caps=caps
         )
-        if assembly is None or self._has_unaccountable_media(assembly.params):
+        if assembly is None:
             return None
         params = assembly.params
         model = params.get("model")
         if not isinstance(model, str):
             return None
-        ratio = self._input_token_ratio_by_model.get(model)
         limit = self._budget_input_limit(model, caps)
-        bytes_used = self._serialized_input_bytes(params)
         output = params.get("max_tokens")
         if (
-            ratio is None
-            or limit is None
-            or bytes_used is None
+            limit is None
             or isinstance(output, bool)
             or not isinstance(output, int)
             or output <= 0
         ):
             return None
-        estimated = math.ceil(bytes_used * ratio) + _INPUT_BUDGET_SAFETY_RESERVE
+        try:
+            token_count = await asyncio.wait_for(
+                self.client.messages.count_tokens(
+                    **self._count_tokens_params(params),
+                    timeout=_COUNT_TOKENS_TIMEOUT_SECONDS,
+                ),
+                timeout=_COUNT_TOKENS_TIMEOUT_SECONDS,
+            )
+        except Exception:  # noqa: BLE001 -- count failures must fail closed
+            return None
+        counted_input = getattr(token_count, "input_tokens", None)
+        if (
+            isinstance(counted_input, bool)
+            or not isinstance(counted_input, int)
+            or counted_input < 0
+        ):
+            return None
+        estimated = counted_input + _INPUT_BUDGET_SAFETY_RESERVE
         target = context_estimate
         if estimated > limit:
             target = min(
@@ -4315,7 +4288,6 @@ class AnthropicProvider:
 
                                 # Stream drained. Final message is now ready.
                                 response = await stream.get_final_message()
-                                self._record_input_calibration(params, response)
 
                                 # Capture rate limit headers from stream response
                                 if hasattr(stream, "response") and stream.response:
@@ -4377,7 +4349,6 @@ class AnthropicProvider:
                         timeout=self.timeout,
                     )
                     response = await raw_response.parse()
-                    self._record_input_calibration(params, response)
                     rate_limit_info = self._extract_rate_limit_headers(
                         raw_response.headers
                     )
