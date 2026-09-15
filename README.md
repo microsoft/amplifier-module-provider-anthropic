@@ -238,6 +238,31 @@ A `provider:retry` event is emitted before each retry sleep with the following f
 | `error_type` | Kernel error class name |
 | `error_message` | Error description |
 
+### Adaptive Input Budgeting and Overflow Recovery
+
+The provider exposes optional synchronous `request_budget()` and
+`recover_context_overflow()` methods for a retention-aware context manager.
+`request_budget()` is deliberately **cold-unavailable**: until a successful
+Anthropic response has supplied usage, it returns `None` instead of pretending
+that serialized request bytes are native token counts. After success, it keeps
+only a per-model scalar worst observed input-tokens-per-byte ratio. Its estimate
+includes `input_tokens`, `cache_creation_input_tokens`, and
+`cache_read_input_tokens`, plus a fixed 4,096-token safety reserve.
+
+That is a conservative calibrated estimate, not a token-count API call or a
+native-token guarantee. Inputs with media, unknown model windows, or
+unserializable wire values remain unavailable rather than being rejected from
+their byte size. An explicit `ChatRequest.max_output_tokens` remains the wire
+output cap even when adaptive thinking would otherwise enlarge an implicit cap.
+
+Recovery is narrower still. Only a structured Anthropic
+`invalid_request_error` HTTP 400 whose request id and exact input-only overflow
+counts are present can authorize it. The private feedback is bound to the same
+unchanged request, options, and assembled wire payload; it is consumed once and
+permits one smaller context retry. Joint input/output limit errors, malformed
+responses, and any stream that has produced its first SDK event are never
+eligible. The provider never retries a context error by itself.
+
 ## Conversation-Region Prompt Caching
 
 The provider places up to four Anthropic cache breakpoints per request: one on
