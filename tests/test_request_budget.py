@@ -6,7 +6,13 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 from amplifier_core import ModuleCoordinator
-from amplifier_core.message_models import ChatRequest, Message, ToolSpec
+from amplifier_core.message_models import (
+    ChatRequest,
+    Message,
+    TextBlock,
+    ThinkingBlock,
+    ToolSpec,
+)
 
 from amplifier_module_provider_anthropic import AnthropicProvider
 from tests._helpers import FakeCoordinator
@@ -63,6 +69,59 @@ def _request(*, cap: int | None = None) -> ChatRequest:
         ],
         reasoning_effort="high",
         max_output_tokens=cap,
+    )
+
+
+class _StreamManager:
+    """Minimal successful SDK stream that captures the real outbound params."""
+
+    def __init__(self, response: object) -> None:
+        self.response = SimpleNamespace(headers={})
+        self._response = response
+
+    async def __aenter__(self) -> "_StreamManager":
+        return self
+
+    async def __aexit__(self, *_: object) -> bool:
+        return False
+
+    def __aiter__(self):
+        async def events():
+            return
+            yield  # pragma: no cover - keeps this an async generator
+
+        return events()
+
+    async def get_final_message(self) -> object:
+        return self._response
+
+
+def _rich_adaptive_request() -> ChatRequest:
+    """Adaptive thinking, signed history, and a realistic large tool burst."""
+    return ChatRequest(
+        messages=[
+            Message(role="system", content="System authority."),
+            Message(role="developer", content="Developer context."),
+            Message(role="user", content="First question."),
+            Message(
+                role="assistant",
+                content=[
+                    ThinkingBlock(thinking="Internal reasoning.", signature="signed-history"),
+                    TextBlock(text="Prior answer."),
+                ],
+            ),
+            Message(role="user", content="Use all available detail."),
+        ],
+        tools=[
+            ToolSpec(
+                name=f"lookup_{index}",
+                description=f"Find value {index}.",
+                parameters={"type": "object", "properties": {"value": {"type": "string"}}},
+            )
+            for index in range(45)
+        ],
+        reasoning_effort="high",
+        max_output_tokens=128_000,
     )
 
 
@@ -148,9 +207,11 @@ class TestRequestBudget:
         _, sent = provider.client.messages.with_raw_response.create.call_args
         caps = provider._budget_capabilities_for(MODEL)
         assert caps is not None
-        assembled = provider._assemble_budget_params(
+        assembly = provider._assemble_request_params(
             request, request_options={}, request_caps=caps
         )
+        assert assembly is not None
+        assembled = assembly.params
 
         assert assembled == {key: value for key, value in sent.items() if key != "timeout"}
 
@@ -175,11 +236,77 @@ class TestRequestBudget:
         state_before = provider._prefix_fingerprints.copy()
         caps = provider._budget_capabilities_for(MODEL)
         assert caps is not None
-        assembled = provider._assemble_budget_params(
+        assembly = provider._assemble_request_params(
             second, request_options={}, request_caps=caps
         )
+        assert assembly is not None
+        assembled = assembly.params
 
         assert provider._prefix_fingerprints == state_before
         asyncio.run(provider.complete(second))
         _, sent = provider.client.messages.with_raw_response.create.call_args
         assert assembled == {key: value for key, value in sent.items() if key != "timeout"}
+
+    def test_disabled_history_inference_keeps_prior_prefix_state_during_probe(self) -> None:
+        provider = _provider(cache_infer_stability_from_history=False)
+        request = _request(cap=12_345)
+        provider._prefix_fingerprints["existing"] = (["prior"], 1)
+        state_before = provider._prefix_fingerprints.copy()
+        caps = provider._budget_capabilities_for(MODEL)
+        assert caps is not None
+
+        assembly = provider._assemble_request_params(
+            request, request_options={}, request_caps=caps
+        )
+
+        assert assembly is not None
+        assert provider._prefix_fingerprints == state_before
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_raw_response()
+        )
+        asyncio.run(provider.complete(request))
+        _, sent = provider.client.messages.with_raw_response.create.call_args
+        assert assembly.params == {
+            key: value for key, value in sent.items() if key != "timeout"
+        }
+        assert provider._prefix_fingerprints == state_before
+
+    def test_warm_adaptive_signed_history_and_45_tools_match_both_dispatches(self) -> None:
+        request = _rich_adaptive_request()
+
+        nonstream = _provider()
+        nonstream.client.messages.with_raw_response.create = AsyncMock(
+            side_effect=[_raw_response(), _raw_response()]
+        )
+        asyncio.run(nonstream.complete(_request()))
+        caps = nonstream._budget_capabilities_for(MODEL)
+        assert caps is not None
+        nonstream_assembly = nonstream._assemble_request_params(
+            request, request_options={}, request_caps=caps
+        )
+        assert nonstream_assembly is not None
+        asyncio.run(nonstream.complete(request))
+        _, sent_nonstream = nonstream.client.messages.with_raw_response.create.call_args
+        assert nonstream_assembly.params == {
+            key: value for key, value in sent_nonstream.items() if key != "timeout"
+        }
+
+        stream = _provider(use_streaming=True)
+        streamed_response = _raw_response().parse.return_value
+        stream.client.messages.stream = MagicMock(
+            return_value=_StreamManager(streamed_response)
+        )
+        asyncio.run(stream.complete(_request()))
+        stream_caps = stream._budget_capabilities_for(MODEL)
+        assert stream_caps is not None
+        stream_assembly = stream._assemble_request_params(
+            request, request_options={}, request_caps=stream_caps
+        )
+        assert stream_assembly is not None
+        asyncio.run(stream.complete(request))
+        _, sent_stream = stream.client.messages.stream.call_args
+        assert stream_assembly.params == sent_stream
+        assert sent_stream["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert len(sent_stream["tools"]) == 45
+        signed_block = sent_stream["messages"][2]["content"][0]
+        assert signed_block["signature"] == "signed-history"

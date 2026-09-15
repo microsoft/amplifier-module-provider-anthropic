@@ -467,6 +467,18 @@ def _recoverable_input_overflow(error: AnthropicBadRequestError) -> tuple[int, i
 
 
 @dataclass
+class _RequestAssembly:
+    """Wire params plus staged state and telemetry consumed by dispatch."""
+
+    params: dict[str, Any]
+    prefix_state: OrderedDict[str, tuple[list[str], int | None]]
+    system_blocks: list[dict[str, Any]] | None
+    thinking_enabled: bool
+    thinking_budget: int | None
+    interleaved_thinking_enabled: bool
+
+
+@dataclass
 class _OverflowFeedback:
     """One-shot, provider-private evidence for an input-only rejected request."""
 
@@ -3459,81 +3471,104 @@ class AnthropicProvider:
             return 1_000_000
         return caps.base_context_window if caps.base_context_window > 0 else None
 
-    def _assemble_budget_params(
+    def _assemble_request_params(
         self,
         request: ChatRequest,
         *,
         request_options: Mapping[str, Any],
         request_caps: ModelCapabilities,
-    ) -> dict[str, Any] | None:
-        """Pure wire assembly used for calibrated budgeting and feedback checks.
+        prefix_state: OrderedDict[str, tuple[list[str], int | None]] | None = None,
+        emit_diagnostics: bool = False,
+    ) -> _RequestAssembly | None:
+        """Synchronously assemble the sole Anthropic wire representation.
 
-        This intentionally shares conversion helpers with dispatch and includes
-        its adaptive-thinking, tool, cache, extra and wire-only behavior.  It
-        uses a copied prefix state: a probe is never allowed to advance the
-        live cache-observation state.
+        Capability resolution is deliberately outside this helper.  Callers may
+        therefore use cached/static capabilities for a pure budget probe, while
+        dispatch resolves capabilities asynchronously and commits the staged
+        prefix state only after this method has finished.
         """
         options = dict(request_options)
         effective_model = options.get("model", self.default_model)
         if not isinstance(effective_model, str):
             return None
-        system_msgs = [m for m in request.messages if m.role == "system"]
-        developer_msgs = [m for m in request.messages if m.role == "developer"]
+        staged_prefix_state = (
+            OrderedDict(self._prefix_fingerprints)
+            if prefix_state is None
+            else prefix_state
+        )
+        system_msgs = [message for message in request.messages if message.role == "system"]
+        developer_msgs = [message for message in request.messages if message.role == "developer"]
         conversation = [
-            m for m in request.messages if m.role in ("user", "assistant", "tool")
+            message
+            for message in request.messages
+            if message.role in ("user", "assistant", "tool")
         ]
+        unstable_suffix_len, has_ephemeral_signal = self._unstable_suffix_length(conversation)
         system_blocks = self._format_system_with_cache(system_msgs)
         all_messages = [
             *[
                 {
                     "role": "user",
-                    "content": f"<context_file>\n{m.content if isinstance(m.content, str) else ''}\n</context_file>",
+                    "content": (
+                        "<context_file>\n"
+                        f"{message.content if isinstance(message.content, str) else ''}"
+                        "\n</context_file>"
+                    ),
                 }
-                for m in developer_msgs
+                for message in developer_msgs
             ],
             *self._convert_messages(
-                [m.model_dump() for m in conversation], emit_warnings=False
+                [message.model_dump() for message in conversation],
+                emit_warnings=emit_diagnostics,
             ),
         ]
+        observed_state = "disabled"
         if self.enable_prompt_caching:
             self._normalize_content_for_cache_stability(all_messages)
-            # Run the same cache-placement transition against a shallow staged
-            # LRU. Values are replaced, never mutated, so the live observation
-            # remains untouched by this synchronous probe.
-            unstable_suffix_len, has_ephemeral_signal = self._unstable_suffix_length(
-                conversation
-            )
-            observed_len, observed_state = self._observed_unstable_suffix_length(
-                all_messages,
-                system_blocks,
-                len(developer_msgs),
-                prefix_state=OrderedDict(self._prefix_fingerprints),
-            )
-            if observed_len is not None:
-                unstable_suffix_len = max(unstable_suffix_len, observed_len)
-                has_ephemeral_signal = True
+            if self.cache_infer_stability_from_history:
+                observed_len, observed_state = self._observed_unstable_suffix_length(
+                    all_messages,
+                    system_blocks,
+                    len(developer_msgs),
+                    prefix_state=staged_prefix_state,
+                )
+                if observed_len is not None:
+                    if emit_diagnostics and observed_len > unstable_suffix_len:
+                        logger.debug(
+                            "[PROVIDER] Prompt caching: observed unstable suffix of "
+                            "%d message(s) (declared via metadata: %d) -- using the "
+                            "larger, more conservative value.",
+                            observed_len,
+                            unstable_suffix_len,
+                        )
+                    unstable_suffix_len = max(unstable_suffix_len, observed_len)
+                    has_ephemeral_signal = True
             cache_slots = 4 - int(bool(system_blocks)) - int(bool(request.tools))
-            if (
-                observed_state != "no_shared_prefix"
-                and has_ephemeral_signal
-                and cache_slots > 0
-            ):
+            if observed_state == "no_shared_prefix":
+                if emit_diagnostics:
+                    logger.warning(
+                        "[PROVIDER] Prompt caching: this request shares no leading "
+                        "message with the previous request in the same conversation, "
+                        "so no cached prefix can ever match (Anthropic matches from "
+                        "the start of the request). Skipping conversation-region "
+                        "cache breakpoints. Most likely cause: a leading context/"
+                        "developer message regenerated per request with volatile "
+                        "content (timestamp, git status, session id)."
+                    )
+            else:
                 self._apply_conversation_cache_control(
                     all_messages,
                     unstable_suffix_len,
                     has_ephemeral_signal,
                     cache_slots,
-                    emit_warnings=False,
+                    emit_warnings=emit_diagnostics,
                 )
 
         params: dict[str, Any] = {
             "model": effective_model,
             "messages": all_messages,
-            "max_tokens": (
-                request.max_output_tokens
-                if request.max_output_tokens is not None
-                else options.get("max_tokens", self.max_tokens)
-            ),
+            "max_tokens": request.max_output_tokens
+            or options.get("max_tokens", self.max_tokens),
         }
         if system_blocks:
             params["system"] = system_blocks
@@ -3543,141 +3578,296 @@ class AnthropicProvider:
                 if request.temperature is not None
                 else options.get("temperature", self.temperature)
             )
+        elif emit_diagnostics and (
+            request.temperature is not None or options.get("temperature") is not None
+        ):
+            logger.info(
+                "[PROVIDER] Model %s does not support sampling parameters"
+                " — ignoring temperature setting",
+                params["model"],
+            )
+
         if request.tools:
-            tools = copy.deepcopy(self._convert_tools_from_request(request.tools))
+            tools = self._convert_tools_from_request(request.tools)
             tools, _ = self._apply_tool_cache_control(tools)
             params["tools"] = tools
         if options.get("enable_web_search", self.enable_web_search):
-            params.setdefault("tools", []).insert(
-                0, self._build_web_search_tool(options)
-            )
+            params.setdefault("tools", []).insert(0, self._build_web_search_tool(options))
+            if emit_diagnostics:
+                logger.info("[PROVIDER] Native web search tool enabled")
         if "tools" in params:
             if options.get("tool_choice"):
                 params["tool_choice"] = options["tool_choice"]
             elif request.tool_choice:
-                choice = request.tool_choice
-                params["tool_choice"] = {
-                    "none": {"type": "none"},
-                    "auto": {"type": "auto"},
-                    "required": {"type": "any"},
-                }.get(choice, choice)
+                if request.tool_choice == "none":
+                    params["tool_choice"] = {"type": "none"}
+                elif request.tool_choice == "auto":
+                    params["tool_choice"] = {"type": "auto"}
+                elif request.tool_choice == "required":
+                    params["tool_choice"] = {"type": "any"}
+                else:
+                    params["tool_choice"] = request.tool_choice
 
         reasoning_effort = getattr(request, "reasoning_effort", None)
         if reasoning_effort is None:
-            reasoning_effort = self.config.get(
-                "reasoning_effort", self.config.get("effort")
-            )
+            config_key = "reasoning_effort"
+            config_effort = self.config.get(config_key)
+            if config_effort is None:
+                config_key, config_effort = "effort", self.config.get("effort")
+            if config_effort is not None:
+                normalized = str(config_effort).strip().lower()
+                if normalized in ("low", "medium", "high", "xhigh", "max"):
+                    reasoning_effort = normalized
+                elif emit_diagnostics:
+                    logger.warning(
+                        "[PROVIDER] Ignoring invalid config '%s'=%r (valid values: %s)",
+                        config_key,
+                        config_effort,
+                        "low, medium, high, xhigh, max",
+                    )
+
         config_thinking = (
             self._config_bool(self.config["extended_thinking"])
             if "extended_thinking" in self.config
             else None
         )
         thinking_enabled = bool(options.get("extended_thinking"))
-        resolved_thinking_type: str | None = None
         if "extended_thinking" not in options:
-            thinking_enabled = (
-                config_thinking
-                if config_thinking is not None
-                else reasoning_effort is not None
+            if config_thinking is not None:
+                thinking_enabled = config_thinking
+            elif reasoning_effort is not None:
+                thinking_enabled = True
+        requested_budget_source: str | None = None
+        requested_budget_raw: Any = None
+        if options.get("thinking_budget_tokens") is not None:
+            requested_budget_source, requested_budget_raw = (
+                "kwargs",
+                options["thinking_budget_tokens"],
             )
-        if thinking_enabled and request_caps.supports_thinking:
-            explicit_budget = options.get(
-                "thinking_budget_tokens",
-                self.config.get("thinking_budget_tokens"),
+        elif self.config.get("thinking_budget_tokens") is not None:
+            requested_budget_source, requested_budget_raw = (
+                "config",
+                self.config["thinking_budget_tokens"],
             )
+        requested_budget: int | None = None
+        if requested_budget_source is not None:
             try:
-                budget = int(
-                    explicit_budget
-                    if explicit_budget is not None
-                    else (
-                        4096
-                        if reasoning_effort == "low"
-                        else request_caps.default_thinking_budget
-                    )
-                )
+                requested_budget = int(requested_budget_raw)
             except (TypeError, ValueError):
-                return None
-            budget = max(1024, budget)
-            thinking_type = options.get(
-                "thinking_type",
-                (
-                    "enabled"
-                    if reasoning_effort == "low"
-                    else self.config.get("thinking_type", "adaptive")
-                ),
+                if emit_diagnostics:
+                    logger.warning(
+                        "[PROVIDER] Ignoring invalid %s 'thinking_budget_tokens'=%r "
+                        "(expected an integer) — falling back to the resolved default.",
+                        requested_budget_source,
+                        requested_budget_raw,
+                    )
+                requested_budget_source = None
+
+        thinking_budget: int | None = None
+        interleaved_thinking_enabled = False
+        resolved_thinking_type: str | None = None
+        model_ceiling = request_caps.max_output_tokens
+        if thinking_enabled and not request_caps.supports_thinking:
+            if emit_diagnostics:
+                logger.info(
+                    "[PROVIDER] Model %s does not support extended thinking "
+                    "— ignoring thinking request",
+                    effective_model,
+                )
+            thinking_enabled = False
+        if (
+            emit_diagnostics
+            and reasoning_effort in ("xhigh", "max")
+            and not request_caps.supports_output_config
+            and thinking_enabled
+        ):
+            logger.warning(
+                "[PROVIDER] reasoning_effort=%r has no effect on %s (no output_config "
+                "support) — resolves identically to 'high'. Supported efforts for this "
+                "model: %s",
+                reasoning_effort,
+                effective_model,
+                request_caps.supported_efforts,
             )
+        if thinking_enabled:
             if request_caps.thinking_always_on:
-                thinking_type = "adaptive"
-                resolved_thinking_type = "adaptive"
-            elif (
-                thinking_type == "adaptive"
-                and request_caps.supports_adaptive_thinking
-            ) or not request_caps.supports_manual_thinking:
-                params["thinking"] = {"type": "adaptive"}
-                thinking_type = "adaptive"
                 resolved_thinking_type = "adaptive"
             else:
-                params["thinking"] = {
-                    "type": "enabled",
-                    "budget_tokens": min(budget, request_caps.max_output_tokens - 1),
-                }
-                thinking_type = "enabled"
-                resolved_thinking_type = "enabled"
-            if thinking_type == "adaptive" and not request_caps.thinking_always_on:
-                params["thinking"] = {"type": "adaptive"}
-            if request_caps.thinking_display_required and "thinking" in params:
-                params["thinking"]["display"] = options.get(
-                    "thinking_display",
-                    self.config.get("thinking_display", "summarized"),
+                effort_thinking_type: str | None = None
+                effort_budget: int | None = None
+                if reasoning_effort == "low":
+                    effort_thinking_type, effort_budget = "enabled", 4096
+                elif reasoning_effort in ("medium", "high", "xhigh", "max"):
+                    effort_thinking_type = "adaptive"
+                    effort_budget = request_caps.default_thinking_budget
+                budget_tokens = (
+                    requested_budget
+                    or effort_budget
+                    or request_caps.default_thinking_budget
                 )
-            if request_caps.supports_sampling:
-                params["temperature"] = 1.0
-            buffer = options.get(
-                "thinking_budget_buffer",
-                self.config.get("thinking_budget_buffer", 8192),
-            )
-            try:
-                target = min(
-                    budget + int(buffer), request_caps.max_output_tokens
+                budget_tokens = max(1024, int(budget_tokens))
+                max_budget_tokens = (
+                    model_ceiling
+                    if params.get("tools")
+                    else max(1024, model_ceiling - 1)
                 )
-            except (TypeError, ValueError):
-                return None
-            params["max_tokens"] = min(
-                max(params["max_tokens"] or 0, target), request_caps.max_output_tokens
-            )
+                budget_tokens = min(budget_tokens, max_budget_tokens)
+                buffer_tokens = options.get("thinking_budget_buffer") or self.config.get(
+                    "thinking_budget_buffer", 8192
+                )
+                thinking_budget = budget_tokens
+                thinking_type = (
+                    options.get("thinking_type")
+                    or effort_thinking_type
+                    or self.config.get("thinking_type", "adaptive")
+                )
+                if thinking_type == "adaptive" and request_caps.supports_adaptive_thinking:
+                    params["thinking"] = {"type": "adaptive"}
+                    resolved_thinking_type = "adaptive"
+                elif not request_caps.supports_manual_thinking:
+                    if emit_diagnostics and thinking_type != "adaptive":
+                        logger.info(
+                            "[PROVIDER] Model %s does not support manual thinking "
+                            "(type='enabled') — using adaptive instead of '%s'",
+                            effective_model,
+                            thinking_type,
+                        )
+                    params["thinking"] = {"type": "adaptive"}
+                    resolved_thinking_type = "adaptive"
+                else:
+                    if thinking_type == "adaptive":
+                        thinking_type = "enabled"
+                    resolved_thinking_type = thinking_type
+                    params["thinking"] = {
+                        "type": thinking_type,
+                        "budget_tokens": budget_tokens,
+                    }
+                if request_caps.thinking_display_required:
+                    params["thinking"]["display"] = options.get(
+                        "thinking_display",
+                        self.config.get("thinking_display", "summarized"),
+                    )
+                if request_caps.supports_sampling:
+                    params["temperature"] = 1.0
+                target_tokens = min(budget_tokens + buffer_tokens, model_ceiling)
+                if params.get("max_tokens"):
+                    params["max_tokens"] = min(
+                        max(params["max_tokens"], target_tokens), model_ceiling
+                    )
+                else:
+                    params["max_tokens"] = target_tokens
+                interleaved_thinking_enabled = bool(params.get("tools"))
+                if emit_diagnostics:
+                    logger.info(
+                        "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, "
+                        "temperature=%s, max_tokens=%s, interleaved=%s)",
+                        thinking_budget,
+                        buffer_tokens,
+                        params.get("temperature", "n/a"),
+                        params["max_tokens"],
+                        interleaved_thinking_enabled,
+                    )
 
-        if request_caps.supports_output_config and reasoning_effort is not None:
-            explicit_opt_out = (
-                options.get("extended_thinking") is False
-                if "extended_thinking" in options
-                else config_thinking is False
+        # An explicit budget must never be silently ignored.  This shared guard
+        # runs for dispatch only; a pure preflight is intentionally log-free.
+        if (
+            emit_diagnostics
+            and requested_budget_source is not None
+            and requested_budget is not None
+        ):
+            wire_thinking = params.get("thinking")
+            sent_budget = (
+                wire_thinking.get("budget_tokens")
+                if isinstance(wire_thinking, dict)
+                else None
             )
-            if not (explicit_opt_out and "effort" not in options):
-                effort = options.get("effort", reasoning_effort)
-                if effort in request_caps.supported_efforts:
-                    params["output_config"] = {"effort": effort}
+            if sent_budget != requested_budget:
+                if not thinking_enabled and not request_caps.supports_thinking:
+                    reason = (
+                        f"model {params['model']} does not support extended "
+                        "thinking, so no thinking budget is sent at all"
+                    )
+                elif not thinking_enabled:
+                    reason = (
+                        "extended thinking is not enabled, so the budget is "
+                        "never read — set `reasoning_effort` (low|medium|high|"
+                        "xhigh|max) or `extended_thinking: true` to turn it on"
+                    )
+                elif request_caps.thinking_always_on:
+                    reason = (
+                        f"{params['model']} always thinks and manages its own "
+                        "budget — the API rejects a thinking param on this "
+                        "model, so no budget can be sent and this value is "
+                        "not used for anything"
+                    )
+                elif resolved_thinking_type == "adaptive":
+                    reason = (
+                        "thinking.type='adaptive' — the API forbids "
+                        "budget_tokens in adaptive mode (the model manages its "
+                        "own budget); the value only feeds max_tokens sizing "
+                        f"(resolved max_tokens={params.get('max_tokens')}). "
+                        "Set `thinking_type: enabled` to send an explicit budget"
+                    )
+                else:
+                    reason = (
+                        "clamped to this model's limits (minimum 1024, maximum "
+                        f"{model_ceiling if params.get('tools') else max(1024, model_ceiling - 1)})"
+                    )
+                logger.warning(
+                    "[PROVIDER] %s 'thinking_budget_tokens'=%s did not reach the "
+                    "wire: sent %s. Reason: %s.",
+                    requested_budget_source,
+                    requested_budget,
+                    sent_budget if sent_budget is not None else "no thinking budget",
+                    reason,
+                )
+
+        explicit_thinking_opt_out = (
+            options["extended_thinking"] is False
+            if "extended_thinking" in options
+            else config_thinking is False
+        )
+        if (
+            request_caps.supports_output_config
+            and reasoning_effort is not None
+            and not (explicit_thinking_opt_out and "effort" not in options)
+        ):
+            effort = options.get("effort", reasoning_effort)
+            if effort in request_caps.supported_efforts:
+                params["output_config"] = {"effort": effort}
+            elif emit_diagnostics:
+                logger.warning(
+                    "[PROVIDER] Effort level '%s' not supported by %s "
+                    "(supported: %s) — omitting output_config.effort",
+                    effort,
+                    effective_model,
+                    request_caps.supported_efforts,
+                )
         has_task_budget = False
         if request_caps.supports_task_budget:
-            task_budget = options.get(
-                "task_budget_tokens", self.config.get("task_budget_tokens")
-            )
+            task_budget = options.get("task_budget_tokens")
+            if task_budget is None:
+                task_budget = self.config.get("task_budget_tokens")
             if task_budget is not None:
-                try:
-                    total = max(20000, int(task_budget))
-                except (TypeError, ValueError):
-                    return None
+                total = max(20000, int(task_budget))
                 params.setdefault("output_config", {})["task_budget"] = {
                     "type": "tokens",
                     "total": total,
                 }
                 has_task_budget = True
-        speed = self.config.get("speed")
         fast_mode = False
-        if speed is not None and request_caps.supports_speed:
-            params["speed"] = speed
-            fast_mode = speed == "fast"
-        if options.get("stop_sequences"):
-            params["stop_sequences"] = options["stop_sequences"]
+        speed = self.config.get("speed")
+        if speed is not None:
+            if request_caps.supports_speed:
+                params["speed"] = speed
+                fast_mode = speed == "fast"
+            elif emit_diagnostics:
+                logger.warning(
+                    "[PROVIDER] Model %s does not support the speed parameter — omitting",
+                    effective_model,
+                )
+        if stop_sequences := options.get("stop_sequences"):
+            params["stop_sequences"] = stop_sequences
         headers = self._build_request_beta_headers(
             request_caps=request_caps,
             tools_present=bool(params.get("tools")),
@@ -3691,24 +3881,20 @@ class AnthropicProvider:
                 **dict(params.get("extra_headers", {})),
                 "anthropic-beta": ",".join(headers),
             }
-
-        # Extras retain their user-wins semantics, but an explicit request cap
-        # is a stronger portable authority and is restored after extras.
-        self._merge_extra_request_params(params, emit_warnings=False)
+        self._merge_extra_request_params(params, emit_warnings=emit_diagnostics)
         if request.max_output_tokens is not None:
-            if (
-                isinstance(request.max_output_tokens, bool)
-                or not isinstance(request.max_output_tokens, int)
-                or request.max_output_tokens <= 0
-            ):
-                return None
-            params["max_tokens"] = min(
-                request.max_output_tokens, request_caps.max_output_tokens
-            )
-        elif params.get("max_tokens", 0) > request_caps.max_output_tokens:
-            params["max_tokens"] = request_caps.max_output_tokens
+            params["max_tokens"] = min(request.max_output_tokens, model_ceiling)
+        elif params.get("max_tokens") and params["max_tokens"] > model_ceiling:
+            params["max_tokens"] = model_ceiling
         _route_wire_only_params(params)
-        return params
+        return _RequestAssembly(
+            params=params,
+            prefix_state=staged_prefix_state,
+            system_blocks=system_blocks,
+            thinking_enabled=thinking_enabled,
+            thinking_budget=thinking_budget,
+            interleaved_thinking_enabled=interleaved_thinking_enabled,
+        )
 
     def _record_input_calibration(self, params: dict[str, Any], response: Any) -> None:
         """Learn a conservative scalar conversion from successful raw usage."""
@@ -3761,11 +3947,12 @@ class AnthropicProvider:
         caps = self._budget_capabilities_for(options.get("model", self.default_model))
         if caps is None:
             return None
-        params = self._assemble_budget_params(
+        assembly = self._assemble_request_params(
             request, request_options=options, request_caps=caps
         )
-        if params is None or self._has_unaccountable_media(params):
+        if assembly is None or self._has_unaccountable_media(assembly.params):
             return None
+        params = assembly.params
         model = params.get("model")
         if not isinstance(model, str):
             return None
@@ -3824,10 +4011,13 @@ class AnthropicProvider:
         caps = self._budget_capabilities_for(options.get("model", self.default_model))
         if caps is None:
             return None
-        params = self._assemble_budget_params(
+        assembly = self._assemble_request_params(
             failed_request, request_options=options, request_caps=caps
         )
-        if params is None or self._fingerprint(params) != feedback.assembly_fingerprint:
+        if (
+            assembly is None
+            or self._fingerprint(assembly.params) != feedback.assembly_fingerprint
+        ):
             return None
         target = min(
             context_estimate - 1,
@@ -3871,746 +4061,34 @@ class AnthropicProvider:
             f"Received ChatRequest with {len(request.messages)} messages (raw={self.raw})"
         )
 
-        # Separate messages by role
-        system_msgs = [m for m in request.messages if m.role == "system"]
-        developer_msgs = [m for m in request.messages if m.role == "developer"]
-        conversation = [
-            m for m in request.messages if m.role in ("user", "assistant", "tool")
-        ]
-
-        logger.debug(
-            f"Separated: {len(system_msgs)} system, {len(developer_msgs)} developer, {len(conversation)} conversation"
-        )
-
-        # Determine ephemeral status BEFORE conversion -- Message.metadata is
-        # only available on the original Message objects; _convert_messages
-        # discards unrecognized keys when it rebuilds Anthropic-format dicts.
-        unstable_suffix_len, has_ephemeral_signal = self._unstable_suffix_length(
-            conversation
-        )
-
-        # Track how many of the 4 Anthropic cache breakpoints are used, so we
-        # never exceed the API's hard limit (a 5th cache_control is a request
-        # error, not a soft failure).
-        breakpoints_used = 0
-
-        # Format system messages as content block array (required for caching)
-        system_blocks = self._format_system_with_cache(system_msgs)
-        if system_blocks and self.enable_prompt_caching:
-            breakpoints_used += 1
-
-        if system_blocks:
-            logger.info(
-                f"[PROVIDER] System message length: {len(system_blocks[0]['text'])} chars (caching={'cache_control' in system_blocks[0]})"
-            )
-        else:
-            logger.info("[PROVIDER] No system messages")
-
-        # Convert developer messages to XML-wrapped user messages (at top)
-        context_user_msgs = []
-        for i, dev_msg in enumerate(developer_msgs):
-            content = dev_msg.content if isinstance(dev_msg.content, str) else ""
-            content_preview = content[:100] + ("..." if len(content) > 100 else "")
-            logger.info(
-                f"[PROVIDER] Converting developer message {i + 1}/{len(developer_msgs)}: length={len(content)}"
-            )
-            logger.debug(f"[PROVIDER] Developer message preview: {content_preview}")
-            wrapped = f"<context_file>\n{content}\n</context_file>"
-            context_user_msgs.append({"role": "user", "content": wrapped})
-
-        logger.info(
-            f"[PROVIDER] Created {len(context_user_msgs)} XML-wrapped context messages"
-        )
-
-        # Convert conversation messages
-        conversation_msgs = self._convert_messages(
-            [m.model_dump() for m in conversation]
-        )
-        logger.info(
-            f"[PROVIDER] Converted {len(conversation_msgs)} conversation messages"
-        )
-
-        # Combine: context THEN conversation
-        all_messages = context_user_msgs + conversation_msgs
-
-        # Apply up to 2 rolling cache breakpoints over STABLE conversation
-        # content (never on the trailing ephemeral messages identified
-        # above). Budget is whatever remains of the 4-breakpoint API limit
-        # after system (0 or 1) and tools (0 or 1, applied below) -- tools
-        # hasn't run yet at this point, so reserve its slot conservatively.
-        _tools_will_use_a_slot = bool(request.tools and self.enable_prompt_caching)
-        conversation_budget = (
-            4 - breakpoints_used - (1 if _tools_will_use_a_slot else 0)
-        )
-
-        # Before placing anything, measure the unstable tail rather than
-        # relying solely on the orchestrator declaring it. Fingerprints must
-        # be taken here -- after `all_messages` is assembled, BEFORE any
-        # cache_control is stamped onto it.
-        observed_state = "disabled"
-        if self.enable_prompt_caching:
-            # Must run BEFORE fingerprinting and stamping: it is what makes a
-            # message's wire shape independent of whether this turn's rolling
-            # breakpoint happened to land on it.
-            self._normalize_content_for_cache_stability(all_messages)
-
-        if self.enable_prompt_caching and self.cache_infer_stability_from_history:
-            observed_len, observed_state = self._observed_unstable_suffix_length(
-                all_messages, system_blocks, len(context_user_msgs)
-            )
-            if observed_len is not None:
-                if observed_len > unstable_suffix_len:
-                    logger.debug(
-                        "[PROVIDER] Prompt caching: observed unstable suffix of "
-                        "%d message(s) (declared via metadata: %d) -- using the "
-                        "larger, more conservative value.",
-                        observed_len,
-                        unstable_suffix_len,
-                    )
-                unstable_suffix_len = max(unstable_suffix_len, observed_len)
-                # An observation IS a signal: it answers the same question
-                # metadata would have, from evidence this provider gathered
-                # itself. Without this, a deployment that never populates
-                # Message.metadata stays permanently in the skip path.
-                has_ephemeral_signal = True
-
-        if observed_state == "no_shared_prefix":
-            # Placing a breakpoint would burn a 1.25x cache WRITE every turn
-            # for a prefix that can never be read back.
-            logger.warning(
-                "[PROVIDER] Prompt caching: this request shares no leading "
-                "message with the previous request in the same conversation, "
-                "so no cached prefix can ever match (Anthropic matches from "
-                "the start of the request). Skipping conversation-region "
-                "cache breakpoints. Most likely cause: a leading context/"
-                "developer message regenerated per request with volatile "
-                "content (timestamp, git status, session id)."
-            )
-            conversation_breakpoints_used = 0
-        else:
-            all_messages, conversation_breakpoints_used = (
-                self._apply_conversation_cache_control(
-                    all_messages,
-                    unstable_suffix_len,
-                    has_ephemeral_signal,
-                    conversation_budget,
-                )
-            )
-        breakpoints_used += conversation_breakpoints_used
-        logger.info(f"[PROVIDER] Final message count for API: {len(all_messages)}")
-
-        # Resolve model and capabilities BEFORE building params dict,
-        # so per-model param gating (temperature, output_config) can apply.
         effective_model = kwargs.get("model", self.default_model)
         request_caps = await self._get_request_capabilities(effective_model)
-        model_ceiling = request_caps.max_output_tokens
-
-        # Emit once-per-process deprecation warning for models nearing retirement
         if (
             effective_model in _DEPRECATED_MODELS
             and effective_model not in _warned_deprecated_models
         ):
             _warned_deprecated_models.add(effective_model)
-            retire_date = _DEPRECATED_MODELS[effective_model]
             logger.warning(
                 "[PROVIDER] Model %s is deprecated and will be retired on %s. "
                 "Please migrate to a newer model.",
                 effective_model,
-                retire_date,
+                _DEPRECATED_MODELS[effective_model],
             )
-
-        # Prepare request parameters
-        params: dict[str, Any] = {
-            "model": effective_model,
-            "messages": all_messages,
-            "max_tokens": request.max_output_tokens
-            or kwargs.get("max_tokens", self.max_tokens),
-        }
-
-        # Only include temperature for models that support sampling.
-        # Opus 4.7+ silently ignores temperature — omitting it avoids user confusion
-        # and keeps request payloads clean.
-        if request_caps.supports_sampling:
-            params["temperature"] = (
-                request.temperature
-                if request.temperature is not None
-                else kwargs.get("temperature", self.temperature)
-            )
-        else:
-            if request.temperature is not None or kwargs.get("temperature") is not None:
-                logger.info(
-                    "[PROVIDER] Model %s does not support sampling parameters"
-                    " — ignoring temperature setting",
-                    params["model"],
-                )
-
-        if system_blocks:
-            params["system"] = system_blocks
-
-        # Add tools if provided
-        if request.tools:
-            tools = self._convert_tools_from_request(request.tools)
-            tools, tool_breakpoint_used = self._apply_tool_cache_control(tools)
-            params["tools"] = tools
-            if tool_breakpoint_used:
-                breakpoints_used += 1
-
-        # Add native web search tool if enabled (via config or kwargs)
-        # This is a model-native tool that doesn't need function conversion
-        web_search_enabled = kwargs.get("enable_web_search", self.enable_web_search)
-        if web_search_enabled:
-            web_search_tool = self._build_web_search_tool(kwargs)
-            if "tools" not in params:
-                params["tools"] = []
-            # Add web search tool at the beginning (native tools typically come first)
-            params["tools"].insert(0, web_search_tool)
-            logger.info("[PROVIDER] Native web search tool enabled")
-
-        if "tools" in params:
-            # Explicit provider kwargs retain their existing truthy-only
-            # semantics and vendor-wire shape. Translate only portable
-            # request-level string choices at the provider boundary.
-            if "tool_choice" in kwargs:
-                tool_choice = kwargs["tool_choice"]
-                if tool_choice:
-                    params["tool_choice"] = tool_choice
-            elif tool_choice := request.tool_choice:
-                if tool_choice == "none":
-                    params["tool_choice"] = {"type": "none"}
-                elif tool_choice == "auto":
-                    params["tool_choice"] = {"type": "auto"}
-                elif tool_choice == "required":
-                    params["tool_choice"] = {"type": "any"}
-                else:
-                    params["tool_choice"] = tool_choice
-        resolved_thinking_type: str | None = None
-
-        # An EXPLICITLY requested thinking budget — kwargs first, then config.
-        # Captured here, before any resolution, for two reasons:
-        #   1. it is what the budget chain below now resolves from, so an
-        #      explicit config value outranks the effort→budget ladder
-        #      (the ladder is a derived default; config is caller intent); and
-        #   2. the silent-discard guard after the thinking block compares it
-        #      against what actually reached the wire.
-        # Before this, config `thinking_budget_tokens` sat BELOW the effort
-        # ladder in the chain, and the ladder always produced a value whenever
-        # any reasoning_effort was set — so the config key was accepted without
-        # complaint and then discarded, and the only budgets reachable from
-        # config were {4096 (effort: low), <model default>}.
-        requested_budget_source: str | None = None
-        requested_budget_raw: Any = None
-        if kwargs.get("thinking_budget_tokens") is not None:
-            requested_budget_source = "kwargs"
-            requested_budget_raw = kwargs["thinking_budget_tokens"]
-        elif self.config.get("thinking_budget_tokens") is not None:
-            requested_budget_source = "config"
-            requested_budget_raw = self.config["thinking_budget_tokens"]
-
-        requested_budget: int | None = None
-        if requested_budget_source is not None:
-            try:
-                requested_budget = int(requested_budget_raw)
-            except (TypeError, ValueError):
-                # Fail soft, log loudly — the same policy the numeric config
-                # helpers use at construction. A typo must not kill every
-                # request with a ValueError from int().
-                logger.warning(
-                    "[PROVIDER] Ignoring invalid %s 'thinking_budget_tokens'=%r "
-                    "(expected an integer) — falling back to the resolved default.",
-                    requested_budget_source,
-                    requested_budget_raw,
-                )
-                requested_budget_source = None
-                requested_budget = None
-
-        # Enable extended thinking if requested (equivalent to OpenAI's reasoning)
-        #
-        # Precedence chain (highest to lowest):
-        #   1. kwargs["extended_thinking"]   — explicit per-request override
-        #   2. config["extended_thinking"]   — explicit session-level override
-        #   3. request.reasoning_effort      — portable kernel interface (Phase 2)
-        #   4. config["reasoning_effort"]    — session-level effort default
-        #
-        # kwargs["extended_thinking"]=False can disable thinking even when
-        # reasoning_effort is set (explicit opt-out); config["extended_thinking"]
-        # is the same opt-in/opt-out one level down. config["extended_thinking"]
-        # exists so a config-only caller can turn thinking on WITHOUT also
-        # choosing an effort: before it, `thinking_budget_tokens` could never be
-        # read at all on that path (thinking was never enabled), which is the
-        # fifth silently-inert configuration this key had.
-        thinking_enabled = bool(kwargs.get("extended_thinking"))
-        config_extended_thinking: bool | None = None
-        if "extended_thinking" in self.config:
-            config_extended_thinking = self._config_bool(
-                self.config["extended_thinking"]
-            )
-
-        # Phase 2: Check request.reasoning_effort when kwargs don't specify
-        reasoning_effort = getattr(request, "reasoning_effort", None)
-        # Phase 3: fall back to the provider's config-level `effort` default.
-        # Lets users set effort once in their provider config (settings.yaml /
-        # bundle `config:` block) instead of per-request or via kwargs.
-        #
-        # Two precedence chains are in play here and they are NOT the same:
-        #   (1) reasoning_effort — drives extended thinking (on/off + depth) and,
-        #       on Opus 4.7+, output_config.effort.  Precedence (highest wins):
-        #           request.reasoning_effort > config["effort"]
-        #   (2) kwargs["effort"] — an output_config.effort-ONLY override applied
-        #       later (see the output_config block).  It does NOT feed this
-        #       thinking path and does NOT enable thinking on its own.
-        #
-        # IMPORTANT — this is NOT a complete chain: output_config.effort is a
-        # *second*, independently-gated field (see the output_config block
-        # below), not merely a side effect of resolving reasoning_effort here.
-        # On models with supports_output_config, output_config.effort IS the
-        # thinking control surface, so kwargs["extended_thinking"]=False (an
-        # explicit "no reasoning on this call" opt-out) is honored there too:
-        # an ambient/ resolved reasoning_effort is NOT applied to
-        # output_config when the caller explicitly opted out of thinking,
-        # unless the caller ALSO passed an explicit kwargs["effort"]
-        # override (a deliberate output_config-only request that wins
-        # regardless of the opt-out). See the output_config block for the
-        # exact condition.
-        if reasoning_effort is None:
-            # Canonical config key first ("reasoning_effort", matching the
-            # kernel's portable request.reasoning_effort), then the legacy
-            # "effort" alias. When both are set the canonical key wins (a
-            # one-time warning is emitted in __init__).
-            config_key = "reasoning_effort"
-            config_effort = self.config.get("reasoning_effort")
-            if config_effort is None:
-                config_key = "effort"
-                config_effort = self.config.get("effort")
-            if config_effort is not None:
-                # Validate/normalise the config value so a typo (e.g. "ultra",
-                # "High", "EXTRA HIGH") can't silently flip thinking on with a
-                # value the ladder/output_config don't understand.
-                normalized = str(config_effort).strip().lower()
-                valid_efforts = ("low", "medium", "high", "xhigh", "max")
-                if normalized in valid_efforts:
-                    reasoning_effort = normalized
-                else:
-                    logger.warning(
-                        "[PROVIDER] Ignoring invalid config '%s'=%r (valid values: %s)",
-                        config_key,
-                        config_effort,
-                        ", ".join(valid_efforts),
-                    )
-
-        if "extended_thinking" not in kwargs:
-            if config_extended_thinking is not None:
-                # An explicit config opt-in/opt-out outranks the effort
-                # implication below, mirroring how kwargs["extended_thinking"]
-                # outranks it. Unset (the default) leaves the implication
-                # untouched — see the elif.
-                thinking_enabled = config_extended_thinking
-            elif reasoning_effort is not None:
-                # reasoning_effort implies extended_thinking=True. This is a
-                # deliberate Amplifier mapping (commit bc026a43): the portable
-                # reasoning_effort hint enables Anthropic extended thinking, the
-                # same way OpenAI's reasoning effort engages its reasoning. effort
-                # and thinking are independent at the API level; coupling them is
-                # Amplifier's "reason harder" product semantics.
-                thinking_enabled = True
-
-        thinking_budget = None
-        interleaved_thinking_enabled = False
-        if thinking_enabled:
-            # Guard: skip thinking entirely for models that don't support it
-            # (e.g. Haiku). Without this check we would send budget_tokens=0
-            # which violates the API's >= 1024 minimum.
-            if not request_caps.supports_thinking:
-                logger.info(
-                    "[PROVIDER] Model %s does not support extended thinking"
-                    " — ignoring thinking request",
-                    params["model"],
-                )
-                thinking_enabled = False
-
-        # reasoning_effort is now fully resolved, and thinking_enabled is now
-        # final (kwargs["extended_thinking"]=False forces it off above;
-        # request_caps.supports_thinking=False forces it off just above too).
-        # Warn here — covering BOTH the request path and the config path
-        # (PR #84's intent) — when the caller asked for more than "high" on a
-        # model that has no output_config support. This must run after
-        # thinking_enabled is final: when thinking is disabled (explicit
-        # extended_thinking=False, or a model with no thinking support at
-        # all, e.g. Haiku), reasoning_effort is not applied anywhere —
-        # output_config.effort is skipped by the inverse of this same
-        # capability check below, and the effort→thinking ladder is skipped
-        # entirely. In that case "resolves identically to 'high'" would be
-        # false; nothing is applied at all, so warning would be misleading.
-        # Only warn when thinking_enabled is True, i.e. the effort ladder
-        # below actually runs and collapses "xhigh"/"max" to "high".
-        if (
-            reasoning_effort in ("xhigh", "max")
-            and not request_caps.supports_output_config
-            and thinking_enabled
-        ):
-            logger.warning(
-                "[PROVIDER] reasoning_effort=%r has no effect on %s (no output_config "
-                "support) — resolves identically to 'high'. Supported efforts for this "
-                "model: %s",
-                reasoning_effort,
-                effective_model,
-                request_caps.supported_efforts,
-            )
-
-        if thinking_enabled:
-            # Fable 5: thinking is always on. Never inject a thinking
-            # param — the API handles it implicitly. Sending {type:disabled} causes
-            # an HTTP 400. Set resolved_thinking_type for downstream use (beta headers).
-            if request_caps.thinking_always_on:
-                resolved_thinking_type = "adaptive"
-            else:
-                # Phase 2: reasoning_effort maps to thinking_type + budget_tokens.
-                # This sits between kwargs (highest) and config (lowest) in precedence.
-                #
-                # | reasoning_effort | thinking_type | budget_tokens             |
-                # |-----------------|---------------|---------------------------|
-                # | "low"           | "enabled"     | 4096 (minimal thinking)   |
-                # | "medium"        | "adaptive"*   | model default             |
-                # | "high"          | "adaptive"*   | generous (model default)  |
-                # | None            | (existing)    | (existing)                |
-                # * falls back to "enabled" if model doesn't support adaptive
-                # * On Opus 4.7+ "enabled" is intercepted → forced to "adaptive"
-                #   (models without supports_manual_thinking reject type="enabled")
-
-                effort_thinking_type: str | None = None
-                effort_budget: int | None = None
-                if reasoning_effort == "low":
-                    effort_thinking_type = "enabled"
-                    effort_budget = 4096
-                elif reasoning_effort == "medium":
-                    effort_thinking_type = "adaptive"
-                    effort_budget = request_caps.default_thinking_budget
-                elif reasoning_effort == "high":
-                    effort_thinking_type = "adaptive"
-                    effort_budget = request_caps.default_thinking_budget
-                elif reasoning_effort == "xhigh":
-                    effort_thinking_type = "adaptive"
-                    effort_budget = request_caps.default_thinking_budget
-                elif reasoning_effort == "max":
-                    # "max" (Opus 4.8+/Sonnet 4.6) uses adaptive thinking. This
-                    # branch only changes behaviour when a user set
-                    # config.thinking_type="enabled": it forces adaptive instead of
-                    # inheriting "enabled". (The resolved default is already
-                    # "adaptive", so without it "max" still resolves to adaptive.)
-                    # The real intensity for "max" is carried by output_config.effort.
-                    effort_thinking_type = "adaptive"
-                    effort_budget = request_caps.default_thinking_budget
-
-                # Resolve budget: explicit (kwargs > config) > reasoning_effort
-                #                 > model default
-                #
-                # `requested_budget` is the caller's EXPLICIT ask, resolved
-                # above. It now outranks the effort→budget ladder, which was
-                # previously between kwargs and config and therefore shadowed
-                # config on every request that set any reasoning_effort. The
-                # ladder is a derived default (for every effort except "low" it
-                # simply restates request_caps.default_thinking_budget); an
-                # explicitly configured number is caller intent, and explicit
-                # beats derived.
-                #
-                # Byte-identical on the default path: with no explicit budget
-                # anywhere, `requested_budget` is None and this collapses to
-                # `effort_budget or request_caps.default_thinking_budget`,
-                # exactly as before.
-                budget_tokens = (
-                    requested_budget
-                    or effort_budget
-                    or request_caps.default_thinking_budget
-                )
-                budget_tokens = max(1024, int(budget_tokens))
-                max_budget_tokens = (
-                    model_ceiling
-                    if params.get("tools")
-                    else max(1024, model_ceiling - 1)
-                )
-                budget_tokens = min(budget_tokens, max_budget_tokens)
-                # Default buffer raised from 4096 → 8192 to accommodate Opus 4.7's
-                # denser tokenizer (1.0–1.35× more tokens for equivalent text).
-                buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
-                    "thinking_budget_buffer", 8192
-                )
-
-                thinking_budget = budget_tokens
-
-                # Resolve thinking_type: kwargs > reasoning_effort > config > "adaptive"
-                thinking_type = (
-                    kwargs.get("thinking_type")
-                    or effort_thinking_type
-                    or self.config.get("thinking_type", "adaptive")
-                )
-
-                # Adaptive thinking: model controls its own budget.  The API schema
-                # is a discriminated union — "adaptive" accepts NO extra fields
-                # (budget_tokens is forbidden).  Fall back to "enabled" with an
-                # explicit budget when the model doesn't support adaptive.
-                if (
-                    thinking_type == "adaptive"
-                    and request_caps.supports_adaptive_thinking
-                ):
-                    params["thinking"] = {"type": "adaptive"}
-                    resolved_thinking_type = "adaptive"
-                elif not request_caps.supports_manual_thinking:
-                    # Model rejects type="enabled" (e.g. Opus 4.7+) — force adaptive.
-                    # This is safe because models that don't support manual thinking
-                    # always support adaptive thinking.
-                    if thinking_type != "adaptive":
-                        logger.info(
-                            "[PROVIDER] Model %s does not support manual thinking "
-                            "(type='enabled') — using adaptive instead of '%s'",
-                            params["model"],
-                            thinking_type,
-                        )
-                    params["thinking"] = {"type": "adaptive"}
-                    resolved_thinking_type = "adaptive"
-                else:
-                    # "enabled" mode (all thinking-capable models): explicit budget
-                    if thinking_type == "adaptive":
-                        # Caller asked for adaptive but model doesn't support it
-                        thinking_type = "enabled"
-                    resolved_thinking_type = thinking_type
-                    params["thinking"] = {
-                        "type": thinking_type,
-                        "budget_tokens": budget_tokens,
-                    }
-
-                # For models where thinking.display defaults to "omitted" (Opus 4.7+),
-                # request "summarized" so thinking content is visible to users.
-                # Users can override via config or kwargs to "omitted" if desired.
-                if request_caps.thinking_display_required:
-                    display = kwargs.get(
-                        "thinking_display",
-                        self.config.get("thinking_display", "summarized"),
-                    )
-                    params["thinking"]["display"] = display
-
-                # Anthropic requires temperature=1.0 when thinking is enabled
-                # on models that support sampling. Non-sampling models (4.7+)
-                # ignore temperature entirely — don't inject it.
-                if request_caps.supports_sampling:
-                    params["temperature"] = 1.0
-
-                # Ensure max_tokens accommodates thinking budget + response.
-                # For adaptive mode the model manages its own budget within
-                # max_tokens, so we still need a generous ceiling.
-                # Cap to the model's API-enforced output ceiling so we never
-                # exceed what the backend allows (e.g. Opus 4.5 caps at 64K).
-                target_tokens = min(budget_tokens + buffer_tokens, model_ceiling)
-                if params.get("max_tokens"):
-                    params["max_tokens"] = min(
-                        max(params["max_tokens"], target_tokens), model_ceiling
-                    )
-                else:
-                    params["max_tokens"] = target_tokens
-
-                interleaved_thinking_enabled = bool(params.get("tools"))
-
-                logger.info(
-                    "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=%s, max_tokens=%s, interleaved=%s)",
-                    thinking_budget,
-                    buffer_tokens,
-                    params.get("temperature", "n/a"),
-                    params["max_tokens"],
-                    interleaved_thinking_enabled,
-                )
-
-        # ------------------------------------------------------------------
-        # Silent-discard guard for `thinking_budget_tokens`
-        # ------------------------------------------------------------------
-        # An explicitly requested budget that does not reach
-        # thinking.budget_tokens must SAY SO. The defect this closes is not the
-        # precedence order — it is the silence: the key was accepted without
-        # complaint and then dropped, exactly the way a discarded `effort` was
-        # before it got a loader guard. Runs once, after thinking is fully
-        # resolved, so it covers every way the value can fail to land:
-        # thinking off, model can't think, adaptive mode (where the API forbids
-        # budget_tokens outright), and clamping to the model's limits.
-        #
-        # Fires ONLY when the caller explicitly asked for a budget, so the
-        # default path stays byte-identical and silent.
-        if requested_budget_source is not None and requested_budget is not None:
-            wire_thinking = params.get("thinking")
-            sent_budget = (
-                wire_thinking.get("budget_tokens")
-                if isinstance(wire_thinking, dict)
-                else None
-            )
-            if sent_budget != requested_budget:
-                if not thinking_enabled and not request_caps.supports_thinking:
-                    reason = (
-                        f"model {params['model']} does not support extended "
-                        f"thinking, so no thinking budget is sent at all"
-                    )
-                elif not thinking_enabled:
-                    reason = (
-                        "extended thinking is not enabled, so the budget is "
-                        "never read — set `reasoning_effort` (low|medium|high|"
-                        "xhigh|max) or `extended_thinking: true` to turn it on"
-                    )
-                elif request_caps.thinking_always_on:
-                    reason = (
-                        f"{params['model']} always thinks and manages its own "
-                        "budget — the API rejects a thinking param on this "
-                        "model, so no budget can be sent and this value is "
-                        "not used for anything"
-                    )
-                elif resolved_thinking_type == "adaptive":
-                    reason = (
-                        "thinking.type='adaptive' — the API forbids "
-                        "budget_tokens in adaptive mode (the model manages its "
-                        "own budget); the value only feeds max_tokens sizing "
-                        f"(resolved max_tokens={params.get('max_tokens')}). "
-                        "Set `thinking_type: enabled` to send an explicit budget"
-                    )
-                else:
-                    reason = (
-                        "clamped to this model's limits (minimum 1024, maximum "
-                        f"{model_ceiling if params.get('tools') else max(1024, model_ceiling - 1)})"
-                    )
-                logger.warning(
-                    "[PROVIDER] %s 'thinking_budget_tokens'=%s did not reach the "
-                    "wire: sent %s. Reason: %s.",
-                    requested_budget_source,
-                    requested_budget,
-                    sent_budget if sent_budget is not None else "no thinking budget",
-                    reason,
-                )
-
-        if params.get("max_tokens") and params["max_tokens"] > model_ceiling:
-            logger.info(
-                "[PROVIDER] Clamping max_tokens from %s to %s for %s",
-                params["max_tokens"],
-                model_ceiling,
-                params["model"],
-            )
-            params["max_tokens"] = model_ceiling
-
-        # Build output_config for models that support it (Opus 4.7+).
-        # output_config.effort is the primary control surface for thinking
-        # intensity on these models, replacing the budget_tokens approach.
-        #
-        # kwargs["extended_thinking"]=False is an explicit, per-call "no
-        # reasoning on this call" opt-out (see thinking_enabled above). On
-        # supports_output_config models, output_config.effort IS the
-        # thinking control surface — so silently applying an ambient/
-        # resolved reasoning_effort here would reintroduce reasoning the
-        # caller explicitly turned off, defeating the opt-out. An explicit
-        # kwargs["effort"] still wins even when the caller opted out of
-        # thinking: it's a deliberate, per-call output_config-only override
-        # (not an ambient default), matching the existing precedence note
-        # below.
-        # config["extended_thinking"]=false is the same explicit opt-out one
-        # level down (kwargs still wins). Unset config leaves this False, so
-        # the default path is unchanged.
-        explicit_thinking_opt_out = (
-            kwargs["extended_thinking"] is False
-            if "extended_thinking" in kwargs
-            else config_extended_thinking is False
-        )
-        explicit_effort_override = "effort" in kwargs
-        if (
-            request_caps.supports_output_config
-            and reasoning_effort is not None
-            and not (explicit_thinking_opt_out and not explicit_effort_override)
-        ):
-            # kwargs["effort"] allows overriding output_config.effort independently
-            # of reasoning_effort (e.g. reasoning_effort="high" for thinking type,
-            # but effort="xhigh" for output config intensity).
-            effort = kwargs.get("effort", reasoning_effort)
-            if effort in request_caps.supported_efforts:
-                params["output_config"] = {"effort": effort}
-                logger.info(
-                    "[PROVIDER] output_config.effort=%s for %s",
-                    effort,
-                    params["model"],
-                )
-            else:
-                logger.warning(
-                    "[PROVIDER] Effort level '%s' not supported by %s "
-                    "(supported: %s) — omitting output_config.effort",
-                    effort,
-                    params["model"],
-                    request_caps.supported_efforts,
-                )
-
-        # Task budget (beta): output_config.task_budget for Opus 4.7+
-        # COE CONSTRAINT: Use `is not None` (not `or`) to avoid falsy-zero bug.
-        has_task_budget = False
-        if request_caps.supports_task_budget:
-            task_budget_tokens = kwargs.get("task_budget_tokens")
-            if task_budget_tokens is None:
-                task_budget_tokens = self.config.get("task_budget_tokens")
-            if task_budget_tokens is not None:
-                task_budget_tokens = max(20000, int(task_budget_tokens))
-                if "output_config" not in params:
-                    params["output_config"] = {}
-                params["output_config"]["task_budget"] = {
-                    "type": "tokens",
-                    "total": task_budget_tokens,
-                }
-                has_task_budget = True
-                logger.info(
-                    "[PROVIDER] output_config.task_budget=%d for %s",
-                    task_budget_tokens,
-                    params["model"],
-                )
-
-        # Speed parameter (Opus 4.8+): inject into API params when model supports it.
-        # Mirrors the supports_sampling pattern — if unsupported, log warning and omit.
-        fast_mode_enabled = False
-        speed = self.config.get("speed")
-        if speed is not None:
-            if request_caps.supports_speed:
-                params["speed"] = speed
-                fast_mode_enabled = speed == "fast"
-                logger.info(
-                    "[PROVIDER] speed=%s for %s",
-                    speed,
-                    params["model"],
-                )
-            else:
-                logger.warning(
-                    "[PROVIDER] Model %s does not support the speed parameter — omitting",
-                    params["model"],
-                )
-
-        # Add stop_sequences if specified
-        if stop_sequences := kwargs.get("stop_sequences"):
-            params["stop_sequences"] = stop_sequences
-
-        request_beta_headers = self._build_request_beta_headers(
+        assembly = self._assemble_request_params(
+            request,
+            request_options=kwargs,
             request_caps=request_caps,
-            tools_present=bool(params.get("tools")),
-            resolved_thinking_type=resolved_thinking_type,
-            has_task_budget=has_task_budget,
-            fast_mode=fast_mode_enabled,
-            tools=params.get("tools"),
+            prefix_state=OrderedDict(self._prefix_fingerprints),
+            emit_diagnostics=True,
         )
-        if request_beta_headers:
-            extra_headers = dict(params.get("extra_headers", {}))
-            extra_headers["anthropic-beta"] = ",".join(request_beta_headers)
-            params["extra_headers"] = extra_headers
-
-        # The documented escape hatch, merged LAST -- after every provider-computed
-        # value, and BEFORE _route_wire_only_params so that a user-supplied
-        # `temperature`/`speed` is relocated to extra_body by the same router that
-        # handles the provider's own.
-        self._merge_extra_request_params(params)
-
-        # An explicit portable request cap is the final authority. Adaptive
-        # thinking may enlarge an implicit default, and extra_request_params
-        # remains user-wins for all other fields, but neither may increase a
-        # caller's explicit output boundary.
-        if request.max_output_tokens is not None:
-            params["max_tokens"] = min(request.max_output_tokens, model_ceiling)
-
-        # Move wire-only params off the typed SDK surface. Must be the last
-        # mutation of `params` before the call -- everything above may still
-        # add or overwrite the keys this relocates.
-        _route_wire_only_params(params)
+        if assembly is None:
+            raise ValueError("Anthropic request assembly requires a string model")
+        self._prefix_fingerprints = assembly.prefix_state
+        params = assembly.params
+        system_blocks = assembly.system_blocks
+        thinking_enabled = assembly.thinking_enabled
+        thinking_budget = assembly.thinking_budget
+        interleaved_thinking_enabled = assembly.interleaved_thinking_enabled
 
         # Keep only short fingerprints for a possible input-only server
         # rejection.  The feedback itself is attached only after a strict 400;

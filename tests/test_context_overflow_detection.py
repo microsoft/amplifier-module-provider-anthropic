@@ -60,6 +60,27 @@ def _make_anthropic_error(cls, message="error", status_code=400):
     return cls(message, response=mock_response, body=None)
 
 
+class _FirstEventThenOverflow:
+    """SDK stream that proves even message_start makes recovery ineligible."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.response = MagicMock(headers={})
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    def __aiter__(self):
+        async def events():
+            yield type("RawMessageStartEvent", (), {})()
+            raise self.error
+
+        return events()
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -293,6 +314,27 @@ class TestRecoverableInputOverflow:
         request = _simple_request()
         provider.client.messages.with_raw_response.create = AsyncMock(
             side_effect=self._structured_error(message, request_id=request_id)
+        )
+
+        with pytest.raises(KernelContextLengthError) as raised:
+            asyncio.run(provider.complete(request))
+
+        assert (
+            provider.recover_context_overflow(
+                request, raised.value, context_estimate=100_000
+            )
+            is None
+        )
+
+    def test_first_sdk_message_start_makes_strict_input_overflow_unrecoverable(self):
+        provider = _make_provider()
+        provider.use_streaming = True
+        request = _simple_request()
+        error = self._structured_error(
+            "prompt is too long: 208310 tokens > 200000 maximum"
+        )
+        provider.client.messages.stream = MagicMock(
+            return_value=_FirstEventThenOverflow(error)
         )
 
         with pytest.raises(KernelContextLengthError) as raised:
