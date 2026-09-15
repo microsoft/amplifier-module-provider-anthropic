@@ -416,6 +416,7 @@ _COUNT_TOKENS_TIMEOUT_SECONDS = 5.0
 # messages.create(). Project from the one shared assembled request instead of
 # maintaining a second assembler. In particular, max_tokens is dispatch-only:
 # it remains local for the returned decision but must never reach count_tokens.
+# `output_config` and top-level `cache_control` are dispatch-only as well.
 _COUNT_TOKENS_PARAM_KEYS: frozenset[str] = frozenset(
     {
         "model",
@@ -424,8 +425,6 @@ _COUNT_TOKENS_PARAM_KEYS: frozenset[str] = frozenset(
         "tools",
         "tool_choice",
         "thinking",
-        "output_config",
-        "cache_control",
         "extra_headers",
     }
 )
@@ -5159,6 +5158,11 @@ class AnthropicProvider:
                                     logger.warning(
                                         f"Unsupported image source type: {source.get('type')}"
                                     )
+                            elif block_type == "document":
+                                # Documents are already in Anthropic's input
+                                # shape. Preserve the source and nested cache
+                                # metadata for both dispatch and count.
+                                content_blocks.append(self._clean_content_block(block))
 
                     if content_blocks:
                         anthropic_messages.append(

@@ -7,6 +7,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import anthropic
+import pytest
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import (
     ChatRequest,
@@ -101,6 +102,20 @@ def _rich_adaptive_request() -> ChatRequest:
                     ),
                 ],
             ),
+            Message.model_construct(
+                role="user",
+                content=[
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": "cGRm",
+                        },
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    }
+                ],
+            ),
         ],
         tools=[
             ToolSpec(
@@ -161,6 +176,7 @@ class TestRequestBudget:
             "max_output_tokens": 12_345,
         }
 
+    @pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
     def test_count_projects_shared_assembly_and_preserves_rich_dispatch_shape(self) -> None:
         initial = _rich_adaptive_request()
         request = initial.model_copy(
@@ -177,7 +193,13 @@ class TestRequestBudget:
             },
             deep=True,
         )
-        provider = _provider(beta_headers=["test-count-beta"])
+        provider = _provider(
+            beta_headers=["test-count-beta"],
+            extra_request_params={
+                "cache_control": {"type": "ephemeral"},
+                "output_config": {"effort": "high"},
+            },
+        )
         provider.client.messages.with_raw_response.create = AsyncMock(
             side_effect=[_raw_response(), _raw_response()]
         )
@@ -198,25 +220,56 @@ class TestRequestBudget:
         assert decision is not None
         assert provider._prefix_fingerprints == state_before
         _, counted = provider.client.messages.count_tokens.call_args
-        assert counted == {
-            **provider._count_tokens_params(assembly.params),
-            "timeout": 5.0,
+        expected_count_keys = {
+            "model",
+            "messages",
+            "system",
+            "tools",
+            "tool_choice",
+            "thinking",
+            "extra_headers",
+            "timeout",
         }
+        assert set(counted) == expected_count_keys
+        assert counted["model"] == MODEL
+        assert counted["system"] == assembly.params["system"]
+        assert counted["messages"] == assembly.params["messages"]
+        assert counted["tools"] == assembly.params["tools"]
+        assert counted["tool_choice"] == assembly.params["tool_choice"]
+        assert counted["thinking"] == assembly.params["thinking"]
+        assert counted["extra_headers"] == assembly.params["extra_headers"]
+        assert counted["timeout"] == 5.0
         assert "max_tokens" not in counted
+        assert "output_config" not in counted
+        assert "cache_control" not in counted
         assert counted["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert len(counted["tools"]) == 45
         assert counted["tool_choice"] == {"type": "any"}
         assert counted["messages"][2]["content"][0]["signature"] == "signed-history"
         assert counted["messages"][3]["content"][1]["type"] == "image"
+        assert counted["messages"][4]["content"][0] == {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "cGRm",
+            },
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }
+        assert counted["system"][0]["cache_control"] == {"type": "ephemeral"}
+        assert counted["tools"][-1]["cache_control"] == {"type": "ephemeral"}
         assert "test-count-beta" in counted["extra_headers"]["anthropic-beta"]
 
         asyncio.run(provider.complete(request))
         _, dispatched = provider.client.messages.with_raw_response.create.call_args
         assert {
-            key: dispatched[key]
-            for key in provider._count_tokens_params(dispatched)
-        } == provider._count_tokens_params(assembly.params)
+            key: dispatched[key] for key in expected_count_keys - {"timeout"}
+        } == {
+            key: counted[key] for key in expected_count_keys - {"timeout"}
+        }
         assert dispatched["max_tokens"] == 128_000
+        assert dispatched["cache_control"] == {"type": "ephemeral"}
+        assert dispatched["output_config"] == {"effort": "high"}
 
     def test_explicit_output_cap_remains_local_to_budget_decision(self) -> None:
         provider = _provider(extra_request_params={"max_tokens": 64_000})
