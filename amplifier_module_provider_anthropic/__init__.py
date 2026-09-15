@@ -24,9 +24,9 @@ from decimal import Decimal
 from threading import Lock
 from typing import Any
 from typing import ClassVar
-from typing import Mapping
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
 
@@ -4433,20 +4433,16 @@ class AnthropicProvider:
                         and isinstance(params.get("max_tokens"), int)
                     ):
                         actual, limit = parsed
-                        setattr(
-                            translated,
-                            "_anthropic_overflow_feedback",
-                            _OverflowFeedback(
-                                owner=self._overflow_feedback_owner,
-                                request=request,
-                                request_fingerprint=overflow_request_fingerprint,
-                                options_fingerprint=overflow_options_fingerprint,
-                                assembly_fingerprint=overflow_assembly_fingerprint,
-                                prefix_state=prefix_state_before_assembly,
-                                actual_input_tokens=actual,
-                                input_limit_tokens=limit,
-                                max_output_tokens=params["max_tokens"],
-                            ),
+                        translated._anthropic_overflow_feedback = _OverflowFeedback(
+                            owner=self._overflow_feedback_owner,
+                            request=request,
+                            request_fingerprint=overflow_request_fingerprint,
+                            options_fingerprint=overflow_options_fingerprint,
+                            assembly_fingerprint=overflow_assembly_fingerprint,
+                            prefix_state=prefix_state_before_assembly,
+                            actual_input_tokens=actual,
+                            input_limit_tokens=limit,
+                            max_output_tokens=params["max_tokens"],
                         )
                     raise translated from e
                 elif (

@@ -1,8 +1,9 @@
 """Focused offline contract tests for calibrated Anthropic request budgeting."""
 
 import asyncio
+from copy import deepcopy
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Self, cast
 from unittest.mock import AsyncMock, MagicMock
 
 from amplifier_core import ModuleCoordinator
@@ -16,7 +17,6 @@ from amplifier_core.message_models import (
 
 from amplifier_module_provider_anthropic import AnthropicProvider
 from tests._helpers import FakeCoordinator
-
 
 MODEL = "claude-sonnet-5"
 
@@ -79,7 +79,7 @@ class _StreamManager:
         self.response = SimpleNamespace(headers={})
         self._response = response
 
-    async def __aenter__(self) -> "_StreamManager":
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *_: object) -> bool:
@@ -272,19 +272,36 @@ class TestRequestBudget:
         assert provider._prefix_fingerprints == state_before
 
     def test_warm_adaptive_signed_history_and_45_tools_match_both_dispatches(self) -> None:
-        request = _rich_adaptive_request()
+        initial = _rich_adaptive_request()
+        request = initial.model_copy(
+            update={
+                "messages": [
+                    *initial.messages,
+                    Message(role="assistant", content="Previous rich-turn answer."),
+                    Message(
+                        role="user",
+                        content="Follow-up to the same rich conversation.",
+                        metadata={"ephemeral": True},
+                    ),
+                ]
+            },
+            deep=True,
+        )
 
         nonstream = _provider()
         nonstream.client.messages.with_raw_response.create = AsyncMock(
             side_effect=[_raw_response(), _raw_response()]
         )
-        asyncio.run(nonstream.complete(_request()))
+        asyncio.run(nonstream.complete(initial))
+        nonstream_state = deepcopy(nonstream._prefix_fingerprints)
+        assert nonstream_state
         caps = nonstream._budget_capabilities_for(MODEL)
         assert caps is not None
         nonstream_assembly = nonstream._assemble_request_params(
             request, request_options={}, request_caps=caps
         )
         assert nonstream_assembly is not None
+        assert nonstream._prefix_fingerprints == nonstream_state
         asyncio.run(nonstream.complete(request))
         _, sent_nonstream = nonstream.client.messages.with_raw_response.create.call_args
         assert nonstream_assembly.params == {
@@ -296,13 +313,16 @@ class TestRequestBudget:
         stream.client.messages.stream = MagicMock(
             return_value=_StreamManager(streamed_response)
         )
-        asyncio.run(stream.complete(_request()))
+        asyncio.run(stream.complete(initial))
+        stream_state = deepcopy(stream._prefix_fingerprints)
+        assert stream_state
         stream_caps = stream._budget_capabilities_for(MODEL)
         assert stream_caps is not None
         stream_assembly = stream._assemble_request_params(
             request, request_options={}, request_caps=stream_caps
         )
         assert stream_assembly is not None
+        assert stream._prefix_fingerprints == stream_state
         asyncio.run(stream.complete(request))
         _, sent_stream = stream.client.messages.stream.call_args
         assert stream_assembly.params == sent_stream

@@ -492,8 +492,10 @@ class TestRecoverableInputOverflow:
         "message,request_id",
         [
             (
-                "input length and `max_tokens` exceed context limit: "
-                "189127 + 16000 > 200000",
+                (
+                    "input length and `max_tokens` exceed context limit: "
+                    "189127 + 16000 > 200000"
+                ),
                 "req-1",
             ),
             ("prompt is too long: 0 tokens > 200000 maximum", "req-1"),
