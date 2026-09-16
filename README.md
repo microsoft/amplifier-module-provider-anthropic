@@ -251,14 +251,18 @@ beta headers. The dispatch-only `max_tokens` value is never sent to count.
 Count calls have a five-second deadline and no retry. Unknown model windows,
 count errors (including 429), timeouts, and malformed count responses return
 `None`; no byte-ratio, character heuristic, cached count, or other estimate is
-used. An explicit `ChatRequest.max_output_tokens` remains the wire output cap
-even when adaptive thinking would otherwise enlarge an implicit cap.
+used. Each unavailable reason emits one safe warning per resolved model, without
+request or response data. An explicit `ChatRequest.max_output_tokens` remains
+the wire output cap even when adaptive thinking would otherwise enlarge an
+implicit cap.
 
 Recovery is narrower still. Only a structured Anthropic
 `invalid_request_error` HTTP 400 whose request id and exact input-only overflow
-counts are present can authorize it. The private feedback is bound to the same
-unchanged request, options, and assembled wire payload; it is consumed once and
-permits one smaller context retry. Joint input/output limit errors, malformed
+counts are present can authorize it. A strict documented combined
+input/`max_tokens` grammar is also eligible only when its positive arithmetic
+derives a lower input limit. The private feedback is bound to the same unchanged
+request, options, and assembled wire payload; it is consumed once and permits
+one smaller context retry. Other joint input/output limit errors, malformed
 responses, and any stream that has produced its first SDK event are never
 eligible. The provider never retries a context error by itself.
 

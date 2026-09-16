@@ -309,3 +309,67 @@ class TestRequestBudget:
 
             assert decision is None
             provider.client.messages.with_raw_response.create.assert_not_called()
+
+    def test_count_unavailable_diagnostics_are_safe_and_once_per_category(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        provider = _provider()
+        sensitive_error = RuntimeError(
+            "customer content and [REDACTED:SECRET] must not appear in diagnostics"
+        )
+        provider.client.messages.count_tokens = AsyncMock(
+            side_effect=[sensitive_error, sensitive_error]
+        )
+
+        with caplog.at_level("WARNING"):
+            assert (
+                asyncio.run(provider.request_budget(_request(), context_estimate=200_000))
+                is None
+            )
+            assert (
+                asyncio.run(provider.request_budget(_request(), context_estimate=200_000))
+                is None
+            )
+
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if "Anthropic token count unavailable" in record.getMessage()
+        ]
+        assert warnings == [
+            "[PROVIDER] Anthropic token count unavailable for model "
+            "claude-sonnet-5 (request_error); dispatching without a count."
+        ]
+        assert "customer content" not in caplog.text
+        assert "[REDACTED:SECRET]" not in caplog.text
+
+    def test_malformed_count_diagnostic_is_once_per_model_and_category(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        provider = _provider()
+        provider.client.messages.count_tokens = AsyncMock(
+            side_effect=[
+                SimpleNamespace(input_tokens="not-an-int"),
+                SimpleNamespace(input_tokens=True),
+            ]
+        )
+
+        with caplog.at_level("WARNING"):
+            assert (
+                asyncio.run(provider.request_budget(_request(), context_estimate=200_000))
+                is None
+            )
+            assert (
+                asyncio.run(provider.request_budget(_request(), context_estimate=200_000))
+                is None
+            )
+
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if "Anthropic token count unavailable" in record.getMessage()
+        ]
+        assert warnings == [
+            "[PROVIDER] Anthropic token count unavailable for model "
+            "claude-sonnet-5 (malformed_response); dispatching without a count."
+        ]

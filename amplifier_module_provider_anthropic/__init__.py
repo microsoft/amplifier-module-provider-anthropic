@@ -460,6 +460,12 @@ _RECOVERABLE_INPUT_OVERFLOW_RE = re.compile(
     r"(?P<limit>[1-9]\d*)\s+maximum\s*$",
     re.IGNORECASE,
 )
+_RECOVERABLE_COMBINED_OVERFLOW_RE = re.compile(
+    r"^input length and `max_tokens` exceed context limit:\s*"
+    r"(?P<actual>[1-9]\d*)\s*\+\s*(?P<output>[1-9]\d*)\s*>\s*"
+    r"(?P<limit>[1-9]\d*)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _recoverable_input_overflow(error: AnthropicBadRequestError) -> tuple[int, int] | None:
@@ -496,10 +502,19 @@ def _recoverable_input_overflow(error: AnthropicBadRequestError) -> tuple[int, i
     ):
         return None
     match = _RECOVERABLE_INPUT_OVERFLOW_RE.fullmatch(message)
+    if match is not None:
+        actual, limit = int(match["actual"]), int(match["limit"])
+        return (actual, limit) if actual > limit > 0 else None
+    match = _RECOVERABLE_COMBINED_OVERFLOW_RE.fullmatch(message)
     if match is None:
         return None
-    actual, limit = int(match["actual"]), int(match["limit"])
-    return (actual, limit) if actual > limit > 0 else None
+    actual = int(match["actual"])
+    output = int(match["output"])
+    combined_limit = int(match["limit"])
+    input_limit = combined_limit - output
+    if actual + output <= combined_limit or input_limit <= 0 or input_limit >= actual:
+        return None
+    return actual, input_limit
 
 
 @dataclass
@@ -1356,6 +1371,7 @@ class AnthropicProvider:
         ] = OrderedDict()
 
         self._overflow_feedback_owner = object()
+        self._count_unavailable_warning_categories: set[tuple[str, str]] = set()
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
         #
@@ -3908,6 +3924,18 @@ class AnthropicProvider:
             if key in params
         }
 
+    def _warn_count_unavailable(self, model: str, category: str) -> None:
+        """Log each safe count-unavailable category once per resolved model."""
+        if (model, category) in self._count_unavailable_warning_categories:
+            return
+        self._count_unavailable_warning_categories.add((model, category))
+        logger.warning(
+            "[PROVIDER] Anthropic token count unavailable for model %s (%s); "
+            "dispatching without a count.",
+            model,
+            category,
+        )
+
     async def request_budget(
         self,
         request: ChatRequest,
@@ -3952,7 +3980,14 @@ class AnthropicProvider:
                 ),
                 timeout=_COUNT_TOKENS_TIMEOUT_SECONDS,
             )
+        except asyncio.TimeoutError:
+            self._warn_count_unavailable(model, "timeout")
+            return None
+        except AnthropicRateLimitError:
+            self._warn_count_unavailable(model, "rate_limit")
+            return None
         except Exception:  # noqa: BLE001 -- count failures must fail closed
+            self._warn_count_unavailable(model, "request_error")
             return None
         counted_input = getattr(token_count, "input_tokens", None)
         if (
@@ -3960,6 +3995,7 @@ class AnthropicProvider:
             or not isinstance(counted_input, int)
             or counted_input < 0
         ):
+            self._warn_count_unavailable(model, "malformed_response")
             return None
         estimated = counted_input + _INPUT_BUDGET_SAFETY_RESERVE
         target = context_estimate
