@@ -1524,7 +1524,10 @@ class AnthropicProvider:
             id="anthropic",
             display_name="Anthropic",
             credential_env_vars=["ANTHROPIC_API_KEY"],
-            capabilities=list(self._default_caps.capability_tags),
+            capabilities=[
+                *self._default_caps.capability_tags,
+                "request_budget:provider_count",
+            ],
             defaults={
                 "model": self.default_model,
                 "max_tokens": 4096,
@@ -3932,7 +3935,7 @@ class AnthropicProvider:
         self._count_unavailable_warning_categories.add((model, category))
         logger.warning(
             "[PROVIDER] Anthropic token count unavailable for model %s (%s); "
-            "dispatching without a count.",
+            "input count is unavailable.",
             model,
             category,
         )
@@ -3943,7 +3946,7 @@ class AnthropicProvider:
         *,
         context_estimate: int,
         request_options: Mapping[str, Any] | None = None,
-    ) -> dict[str, int] | None:
+    ) -> dict[str, Any] | None:
         """Return an exact Anthropic input decision or unavailable."""
         if (
             isinstance(context_estimate, bool)
@@ -4010,6 +4013,11 @@ class AnthropicProvider:
             "input_limit_tokens": limit,
             "context_token_budget": target,
             "max_output_tokens": output,
+            "measurement": {
+                "kind": "provider_count",
+                "source": "anthropic.messages.count_tokens",
+                "input_tokens": counted_input,
+            },
         }
 
     def recover_context_overflow(

@@ -174,7 +174,43 @@ class TestRequestBudget:
             "input_limit_tokens": 200_000,
             "context_token_budget": 157_419,
             "max_output_tokens": 12_345,
+            "measurement": {
+                "kind": "provider_count",
+                "source": "anthropic.messages.count_tokens",
+                "input_tokens": 250_000,
+            },
         }
+
+    def test_provider_count_measurement_preserves_raw_zero_and_reserve(self) -> None:
+        provider = _provider()
+        provider.client.messages.count_tokens = AsyncMock(
+            return_value=SimpleNamespace(input_tokens=0)
+        )
+
+        decision = asyncio.run(
+            provider.request_budget(_request(), context_estimate=200_000)
+        )
+
+        assert decision is not None
+        assert decision["measurement"] == {
+            "kind": "provider_count",
+            "source": "anthropic.messages.count_tokens",
+            "input_tokens": 0,
+        }
+        assert decision["estimated_input_tokens"] == 4096
+        assert decision["input_limit_tokens"] == 200_000
+        assert decision["context_token_budget"] == 200_000
+        assert decision["max_output_tokens"] == 128_000
+
+    def test_provider_count_capability_is_additive_and_does_not_mutate_model_tags(self) -> None:
+        provider = _provider()
+        shared_tags_before = tuple(provider._default_caps.capability_tags)
+
+        capabilities = provider.get_info().capabilities
+
+        assert capabilities == [*shared_tags_before, "request_budget:provider_count"]
+        assert provider._default_caps.capability_tags == shared_tags_before
+        assert "request_budget:provider_count" not in shared_tags_before
 
     @pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
     def test_count_projects_shared_assembly_and_preserves_rich_dispatch_shape(self) -> None:
@@ -218,6 +254,11 @@ class TestRequestBudget:
         decision = asyncio.run(provider.request_budget(request, context_estimate=200_000))
 
         assert decision is not None
+        assert decision["measurement"] == {
+            "kind": "provider_count",
+            "source": "anthropic.messages.count_tokens",
+            "input_tokens": 10_000,
+        }
         assert provider._prefix_fingerprints == state_before
         _, counted = provider.client.messages.count_tokens.call_args
         expected_count_keys = {
@@ -338,7 +379,7 @@ class TestRequestBudget:
         ]
         assert warnings == [
             "[PROVIDER] Anthropic token count unavailable for model "
-            "claude-sonnet-5 (request_error); dispatching without a count."
+            "claude-sonnet-5 (request_error); input count is unavailable."
         ]
         assert "customer content" not in caplog.text
         assert "[REDACTED:SECRET]" not in caplog.text
@@ -371,5 +412,5 @@ class TestRequestBudget:
         ]
         assert warnings == [
             "[PROVIDER] Anthropic token count unavailable for model "
-            "claude-sonnet-5 (malformed_response); dispatching without a count."
+            "claude-sonnet-5 (malformed_response); input count is unavailable."
         ]

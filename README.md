@@ -256,6 +256,22 @@ request or response data. An explicit `ChatRequest.max_output_tokens` remains
 the wire output cap even when adaptive thinking would otherwise enlarge an
 implicit cap.
 
+When this endpoint returns a valid count, `request_budget()` keeps its existing
+budget fields and additively includes:
+
+```python
+"measurement": {
+    "kind": "provider_count",
+    "source": "anthropic.messages.count_tokens",
+    "input_tokens": 12345,  # raw count-endpoint input_tokens value
+}
+```
+
+The provider advertises this optional provenance through
+`request_budget:provider_count`. Consumers must negotiate that capability and
+still treat an absent or malformed `measurement` as unavailable; existing
+budget-only callers continue to use the unchanged budget fields.
+
 Recovery is narrower still. Only a structured Anthropic
 `invalid_request_error` HTTP 400 whose request id and exact input-only overflow
 counts are present can authorize it. A strict documented combined
