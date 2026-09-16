@@ -463,7 +463,8 @@ _RECOVERABLE_INPUT_OVERFLOW_RE = re.compile(
 _RECOVERABLE_COMBINED_OVERFLOW_RE = re.compile(
     r"^input length and `max_tokens` exceed context limit:\s*"
     r"(?P<actual>[1-9]\d*)\s*\+\s*(?P<output>[1-9]\d*)\s*>\s*"
-    r"(?P<limit>[1-9]\d*)\s*$",
+    r"(?P<limit>[1-9]\d*)"
+    r"(?:(?-i:, decrease input length or `max_tokens` and try again))?\s*$",
     re.IGNORECASE,
 )
 

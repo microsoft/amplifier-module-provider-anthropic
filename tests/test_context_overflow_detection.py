@@ -352,12 +352,19 @@ class TestRecoverableInputOverflow:
             "max_output_tokens": 128_000,
         }
 
-    def test_combined_error_returns_one_bound_recovery_decision(self):
+    @pytest.mark.parametrize(
+        "suffix",
+        (
+            "",
+            ", decrease input length or `max_tokens` and try again",
+        ),
+    )
+    def test_combined_error_returns_one_bound_recovery_decision(self, suffix: str):
         provider = _make_provider()
         request = _simple_request()
         error = self._structured_error(
             "input length and `max_tokens` exceed context limit: "
-            "189127 + 16000 > 200000"
+            f"189127 + 16000 > 200000{suffix}"
         )
         provider.client.messages.with_raw_response.create = AsyncMock(side_effect=error)
 
@@ -544,6 +551,8 @@ class TestRecoverableInputOverflow:
             "input length and `max_tokens` exceed context limit: 189127 + 0 > 200000",
             "input length and `max_tokens` exceed context limit: 100 + 200 > 100",
             "input length and `max_tokens` exceed context limit: 189127 + 16000 > 200000, decrease input length",
+            "input length and `max_tokens` exceed context limit: "
+            "189127 + 16000 > 200000, decrease input length or max_tokens and try again",
             "input length and max_tokens exceed context limit: 189127 + 16000 > 200000",
         ],
     )
@@ -553,6 +562,25 @@ class TestRecoverableInputOverflow:
         provider.client.messages.with_raw_response.create = AsyncMock(
             side_effect=self._structured_error(message)
         )
+
+        with pytest.raises(KernelContextLengthError) as raised:
+            asyncio.run(provider.complete(request))
+
+        assert (
+            provider.recover_context_overflow(
+                request, raised.value, context_estimate=100_000
+            )
+            is None
+        )
+
+    def test_combined_error_with_arbitrary_suffix_cannot_recover(self):
+        provider = _make_provider()
+        request = _simple_request()
+        error = self._structured_error(
+            "input length and `max_tokens` exceed context limit: "
+            "189127 + 16000 > 200000, arbitrary trailing text"
+        )
+        provider.client.messages.with_raw_response.create = AsyncMock(side_effect=error)
 
         with pytest.raises(KernelContextLengthError) as raised:
             asyncio.run(provider.complete(request))
