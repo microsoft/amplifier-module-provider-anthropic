@@ -12,12 +12,14 @@ __amplifier_module_type__ = "provider"
 import asyncio
 import copy
 import difflib
+import errno
 import hashlib
 import json
 import logging
 import math
 import os
 import re
+import ssl
 import time
 import uuid
 from decimal import Decimal
@@ -57,7 +59,7 @@ from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolCall
 from anthropic import APIStatusError as AnthropicAPIStatusError
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 from anthropic import AuthenticationError as AnthropicAuthenticationError
 from anthropic import BadRequestError as AnthropicBadRequestError
 from anthropic import RateLimitError as AnthropicRateLimitError
@@ -65,8 +67,66 @@ from anthropic import Timeout as AnthropicTimeout
 from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
+import httpx2
 
 from ._cost import compute_cost
+
+# Process-wide TLS trust store, built once on first client creation.
+# httpx2 re-reads certifi's cacert.pem from disk for every new client; that
+# path lives inside the amplifier tool venv, and `amplifier update` replaces
+# the venv while sessions are running. Each sub-agent delegation creates a
+# new client, so without this cache every delegation after an update dies
+# with a bare FileNotFoundError ("[Errno 2] No such file or directory").
+_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def _shared_ssl_context() -> ssl.SSLContext | None:
+    """Return the cached process-wide SSL context, building it on first use.
+
+    Returns None if the trust store cannot be read (e.g. the venv was already
+    replaced before the first client existed); callers then fall back to the
+    SDK default path and the ENOENT translation below makes the failure loud.
+
+    Known residual: connections through an https://-scheme proxy
+    (HTTPS_PROXY=https://...) are NOT protected -- httpcore2 builds its own
+    lazy certifi-backed context for the proxy hop, so a venv swap still
+    breaks those; they get the loud ENOENT diagnostic instead of surviving.
+    """
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        try:
+            _SSL_CONTEXT = httpx2.create_ssl_context()
+        except OSError:
+            return None
+    return _SSL_CONTEXT
+
+
+def _enoent_in_chain(exc: BaseException) -> bool:
+    """True if exc or any exception in its cause/context chain is ENOENT.
+
+    Walks BOTH __cause__ and __context__: `raise X from Y` inside an
+    `except Z:` block populates both, and the ENOENT can sit on either
+    branch. The traversal is complete (breadth-first, no depth/node budget)
+    -- the seen-set makes it cycle-safe and any real exception graph is
+    finite, so a budget could only ever silently skip the ENOENT and leave
+    it retryable.
+    """
+    seen: set[int] = set()
+    queue: list[BaseException] = [exc]
+    head = 0
+    while head < len(queue):
+        current = queue[head]
+        head += 1
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, OSError) and current.errno == errno.ENOENT:
+            return True
+        for nxt in (current.__cause__, current.__context__):
+            if nxt is not None:
+                queue.append(nxt)
+    return False
+
 
 # Params the Messages API still accepts on the wire but the SDK does not expose
 # as typed keyword arguments.
@@ -1509,12 +1569,27 @@ class AnthropicProvider:
             # The SDK re-exports its own timeout type, so this survives another
             # transport swap like the 1.0 move from httpx to httpx2 -- a bare
             # `import httpx` is precisely what broke on that upgrade.
+            #
+            # http_client: pass the process-wide SSL context (see
+            # `_shared_ssl_context` above) so a client built AFTER `amplifier
+            # update` replaces the tool venv still has a valid TLS trust
+            # store, instead of re-reading a certifi path that no longer
+            # exists. If the context could not be built at all (the venv was
+            # already gone before any client existed), fall back to the SDK
+            # default client (http_client=None) -- construction then either
+            # succeeds against a still-intact trust store or fails loudly,
+            # and the ENOENT translation below turns that failure into an
+            # actionable, non-retryable diagnostic instead of an opaque retry.
+            ssl_context = _shared_ssl_context()
             self._client = AsyncAnthropic(
                 api_key=self._api_key,
                 base_url=self._base_url,
                 default_headers=self._default_headers,
                 max_retries=0,
                 timeout=AnthropicTimeout(self.timeout, connect=5.0),
+                http_client=DefaultAsyncHttpxClient(verify=ssl_context)
+                if ssl_context is not None
+                else None,
             )
         return self._client
 
@@ -4576,6 +4651,20 @@ class AnthropicProvider:
                 raise  # Already translated, don't double-wrap
 
             except Exception as e:
+                if _enoent_in_chain(e):
+                    # A file the client depends on (typically the TLS CA
+                    # bundle inside the amplifier venv) vanished mid-process.
+                    # Retrying cannot help; name the real cause instead.
+                    raise KernelLLMError(
+                        f"{e} -- a file the Anthropic client needs (usually "
+                        "the TLS CA bundle inside the amplifier venv) no "
+                        "longer exists. This typically means 'amplifier "
+                        "update' replaced the venv while this session was "
+                        "running. Restart the amplifier session to recover.",
+                        provider="anthropic",
+                        model=params["model"],
+                        retryable=False,
+                    ) from e
                 body = getattr(e, "body", None)
                 error_msg = (
                     json.dumps(body)
