@@ -1325,6 +1325,7 @@ class AnthropicProvider:
         self.extra_request_params: dict[str, Any] = dict(_extra)
         self._extra_params_warned_keys: set[str] = set()
         self._tool_choice_downgrade_warned = set()
+        self._opus55_warned_once: set[tuple[str, str]] = set()
 
         # Use streaming API by default to support large context windows (Anthropic requires streaming
         # for operations that may take > 10 minutes, e.g. with 300k+ token contexts)
@@ -3816,6 +3817,27 @@ class AnthropicProvider:
                     effective_model,
                 )
             thinking_enabled = False
+        if not request_caps.thinking_disableable and request_caps.supports_thinking:
+            # Opus 5.5+: thinking can never be turned off [WN]. Always run
+            # adaptive thinking, even when the caller explicitly asked to
+            # disable it or set no reasoning_effort at all (server default
+            # effort applies -- this provider sets no default, D5).
+            explicit_opt_out = (
+                options.get("extended_thinking") is False
+                if "extended_thinking" in options
+                else config_thinking is False
+            )
+            if explicit_opt_out and emit_diagnostics:
+                warn_key = ("thinking_disableable", effective_model)
+                if warn_key not in self._opus55_warned_once:
+                    self._opus55_warned_once.add(warn_key)
+                    logger.warning(
+                        "[PROVIDER] Cannot disable thinking on %s; thinking is "
+                        "always on for this model. Set reasoning_effort (e.g. "
+                        "'low') to reduce thinking instead.",
+                        effective_model,
+                    )
+            thinking_enabled = True
         if (
             emit_diagnostics
             and reasoning_effort in ("xhigh", "max")
