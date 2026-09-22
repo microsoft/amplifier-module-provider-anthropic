@@ -561,6 +561,40 @@ messages = [
 
 **Philosophy**: This is **graceful degradation** following kernel philosophy - errors in other modules (context management) don't crash the provider or kill the user's session
 
+## Native compaction
+
+`supports_native_compaction()`, `compact_context(ChatRequest)`, and
+`validate_compacted_context(message)` expose Anthropic's
+[on-demand compaction](https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand).
+The provider does not select history, trigger compaction, supply a summary prompt,
+retry it, or execute tools. Those decisions belong to the context manager.
+
+The adapter currently admits the documented Opus 4.6/4.7/4.8/5, Sonnet 4.6/5,
+Fable 5/5.1, and Mythos 5/5.1/Preview models on `https://api.anthropic.com`.
+Other endpoints and unrecognized models do not advertise this capability.
+It sends the `compact-2026-09-04` beta, measures the assembled request, and returns
+a derived carrier containing the complete signed vendor block. Continuation and
+recompaction restore that block first, unchanged, with the same beta header.
+The visible carrier label is never sent to the model. Original history is not mutated.
+Actual compaction usage is read from the vendor's iteration counters.
+
+Callers must supply the **current system prompt and tools**, the intended model,
+and an adequate output cap. A terminal assistant text's trailing whitespace is
+removed from the copied wire request to satisfy vendor validation; signed blocks
+and original messages are never edited. Missing tool results, partial summaries,
+incompatible checkpoints, and overrides of request context are rejected.
+
+Use the context-managed measured-request path with full request-context support.
+The provider advertises `native_compaction_requires_request_context = True`;
+context-managed marks these requests with
+`metadata.native_compaction_request_context = True`. Legacy context-managed
+messages-only compaction requests are rejected before transport, allowing their
+semantic fallback. Direct callers pass their complete `ChatRequest` to the method.
+
+Qualification includes mocked count/compact/continue/recompact and failure tests,
+plus live synthetic Sonnet 5 standalone and three-cycle conversation checks with
+checkpoint save/reload. Other supported models have not been live-qualified here.
+
 ## Dependencies
 
 - `amplifier-core>=1.0.0`
