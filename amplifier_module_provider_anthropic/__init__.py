@@ -67,6 +67,7 @@ from anthropic._exceptions import (
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 from ._cost import compute_cost
+from .compaction import NativeCompactionMixin, add_beta, extract_checkpoint
 
 # Params the Messages API still accepts on the wire but the SDK does not expose
 # as typed keyword arguments.
@@ -967,7 +968,7 @@ def _warn_unknown_config_keys(
         )
 
 
-class AnthropicProvider:
+class AnthropicProvider(NativeCompactionMixin):
     """Anthropic API integration.
 
     Provides Claude models with support for:
@@ -3514,6 +3515,11 @@ class AnthropicProvider:
         effective_model = options.get("model", self.default_model)
         if not isinstance(effective_model, str):
             return None
+        request, native_block = extract_checkpoint(request, effective_model)
+        if native_block is not None and not self._supports_compaction_model(effective_model):
+            raise ValueError("Native Anthropic context cannot be sent to this endpoint/model")
+        if native_block is not None:
+            self._validate_native_overrides()
         staged_prefix_state = (
             OrderedDict(self._prefix_fingerprints)
             if prefix_state is None
@@ -3910,6 +3916,10 @@ class AnthropicProvider:
         elif params.get("max_tokens") and params["max_tokens"] > model_ceiling:
             params["max_tokens"] = model_ceiling
         _route_wire_only_params(params)
+        if native_block is not None:
+            # Insert after cache normalization: signed transport is immutable.
+            params["messages"].insert(0, {"role": "assistant", "content": [native_block]})
+            add_beta(params)
         return _RequestAssembly(
             params=params,
             prefix_state=staged_prefix_state,
