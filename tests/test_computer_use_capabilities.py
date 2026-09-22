@@ -87,9 +87,27 @@ class TestComputerUseOpus:
         assert caps.supports_native_computer_use is False
 
     def test_opus_unknown_version_assumes_latest(self):
-        """Unknown opus version assumes latest (4.8+ gate), same forward-compat
-        convention as the rest of _get_capabilities."""
+        """Unknown opus version assumes latest, same forward-compat convention
+        as the rest of _get_capabilities. Updated for Opus 5.5 (2026-09-22):
+        "latest" is now 5.5, whose migration guidance replaces computer_20251124
+        with computer_toolset_20260801 rather than merely extending it -- see
+        test_opus_5_5_uses_computer_toolset below."""
         caps = AnthropicProvider._get_capabilities("claude-opus-latest")
+        assert caps.computer_use_tool_type == "computer_toolset_20260801"
+
+    def test_opus_5_5_uses_computer_toolset(self):
+        """claude-opus-5-5: Anthropic's migration guidance ("Migrate from
+        computer_20251124") replaces the tool type with computer_toolset_20260801;
+        the legacy type returns HTTP 400 on Opus 5.5."""
+        caps = AnthropicProvider._get_capabilities("claude-opus-5-5")
+        assert caps.computer_use_tool_type == "computer_toolset_20260801"
+        assert caps.supports_native_computer_use is True
+
+    def test_opus_5_still_gets_legacy_type(self):
+        """claude-opus-5 (known, non-5.5) must NOT be affected by the Opus 5.5
+        gate -- explicit regression guard for the "unknown == latest" change
+        above."""
+        caps = AnthropicProvider._get_capabilities("claude-opus-5")
         assert caps.computer_use_tool_type == "computer_20251124"
 
 

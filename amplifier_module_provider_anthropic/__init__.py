@@ -683,6 +683,29 @@ class ModelCapabilities:
         # verified 2026-08-29. Per-family values set explicitly below;
         # this is only the dataclass fallback.
     )
+    supports_forced_tool_choice: bool = (
+        True  # False = tool_choice type "any"/"tool" (forced choice) is REJECTED
+        # with HTTP 400 on both the Messages and count_tokens endpoints
+        # (Opus 5.5+). The provider must downgrade to {"type": "auto"} and
+        # surface a ChatResponse.degradation rather than let the request fail.
+    )
+    thinking_disableable: bool = (
+        True  # False = thinking can never be turned off; the model always runs
+        # adaptive thinking, so the provider must always send
+        # {"type": "adaptive", "display": ...} even when the caller asked to
+        # disable it (Opus 5.5+). NOT the same thing as thinking_always_on,
+        # which (in this codebase) means "never send a thinking param at all".
+    )
+    preserved_thinking: bool = (
+        False  # True = thinking blocks (and the whole assistant turn) are bound
+        # to a fixed conversation prefix: replaying a stored assistant turn
+        # must reproduce the exact prior wire content, append-only (Opus 5.5+).
+    )
+    supports_progress_updates: bool = (
+        False  # True = the beta thinking.display="updates" value is meaningful:
+        # the model may emit a short progress-update thinking block before a
+        # tool call (Opus 5.5+).
+    )
 
 
 @dataclass(frozen=True)
@@ -1880,6 +1903,16 @@ class AnthropicProvider:
         * **Fable 5 / Fable 5.1** — always-on adaptive thinking, 128K output, no manual thinking
         * **Opus 4.6+** (incl. Opus 5 — confirmed via numeric version-gate, verified
           2026-07-24) — 1M context, adaptive thinking, 128K output
+        * **Opus 5.5+** (Claude Opus 5.5, announced 2026-09-22) — everything Opus
+          4.6+ has, plus four breaking changes from Opus 5: thinking can never be
+          disabled (``thinking_disableable=False``), forced ``tool_choice``
+          (``any``/named ``tool``) is rejected with HTTP 400
+          (``supports_forced_tool_choice=False``), thinking blocks are bound to a
+          fixed conversation prefix (``preserved_thinking=True``), and the
+          computer-use tool type is ``computer_toolset_20260801`` instead of
+          ``computer_20251124`` (see below). Also gains the beta
+          ``thinking.display="updates"`` progress-update mode
+          (``supports_progress_updates=True``).
         * **Sonnet 4.5+** — 1M context, extended thinking, 64K output
         * **Haiku 4.5+** — fast inference, extended thinking, no adaptive, no 1M
 
@@ -1888,11 +1921,14 @@ class AnthropicProvider:
         evidence table:
 
         * **Opus 4.1-4.5** / **Sonnet/Haiku 4.5** — ``computer_20250124``
-        * **Opus/Sonnet 4.6+** (incl. Opus/Sonnet 5) — ``computer_20251124``
+        * **Opus/Sonnet 4.6+ through Opus 5** — ``computer_20251124``
+        * **Opus 5.5+** — ``computer_toolset_20260801`` (``computer_20251124`` is
+          rejected with HTTP 400 per Anthropic's "Migrate from computer_20251124"
+          guidance; not a superset relationship like the 4.6 jump)
         * Everything else (below the verified floor, or an unreachable/unverified
           model such as Fable) — unsupported (``None``)
 
-        These two generations are NOT interchangeable: pairing a model with the
+        These generations are NOT interchangeable: pairing a model with the
         wrong one returns HTTP 400, not a graceful fallback.
 
         When the version cannot be parsed from the model ID we assume the
@@ -1983,6 +2019,16 @@ class AnthropicProvider:
             is_47_plus = not version_known or (major, minor) >= (4, 7)
             is_48_plus = not version_known or (major, minor) >= (4, 8)
             is_5_plus = not version_known or (major, minor) >= (5, 0)
+            # Opus 5.5 (2026-09-22) shipped four breaking changes from Opus 5
+            # (verified against Anthropic's announcement and "What's new" page,
+            # see README "Claude Opus 5.5" section): thinking can never be
+            # disabled, forced tool_choice (any/named tool) is rejected with
+            # HTTP 400, thinking blocks are bound to a fixed conversation
+            # prefix, and the legacy computer_20251124 tool type is rejected
+            # in favor of computer_toolset_20260801. An unknown/future opus
+            # version is treated as 5.5+ (the file's existing convention:
+            # unknown version means the latest generation's rules apply).
+            is_55_plus = not version_known or (major, minor) >= (5, 5)
             # Computer-use wire type, live-probed against api.anthropic.com
             # 2026-08-03 (bare {"type": ..., "name": "computer", "display_width_px":
             # 1024, "display_height_px": 768} declarations, matching anthropic-beta
@@ -1996,9 +2042,14 @@ class AnthropicProvider:
             #   claude-opus-4-6/4-7/4-8, claude-opus-5 + computer_20251124 -> 200
             #     (computer_20250124 -> 400 on all of these — the newer generation
             #     supersedes rather than extends the older one)
+            #   claude-opus-5-5 + computer_20251124 -> 400 (Anthropic's migration
+            #     guidance: "Migrate from computer_20251124" -- the tool type is
+            #     replaced by computer_toolset_20260801, not merely superseded).
             # Below 4.1 is unverified: the only pre-4.1 opus model (claude-opus-4-20250514)
             # is retired (HTTP 404) in this workspace, so it could not be probed either way.
-            if is_46_plus:
+            if is_55_plus:
+                computer_use_tool_type = "computer_toolset_20260801"
+            elif is_46_plus:
                 computer_use_tool_type = "computer_20251124"
             elif version_known and (major, minor) >= (4, 1):
                 computer_use_tool_type = "computer_20250124"
@@ -2048,6 +2099,11 @@ class AnthropicProvider:
                 default_thinking_budget=64000 if is_46_plus else 32000,
                 supports_native_computer_use=computer_use_tool_type is not None,
                 computer_use_tool_type=computer_use_tool_type,
+                # Opus 5.5+ breaking-change gates (see is_55_plus comment above).
+                supports_forced_tool_choice=not is_55_plus,
+                thinking_disableable=not is_55_plus,
+                preserved_thinking=is_55_plus,
+                supports_progress_updates=is_55_plus,
                 # Non-monotonic by design -- 4.6->4096, 4.7->2048, 4.8->1024,
                 # 5->512 -- verified against
                 # platform.claude.com/en/docs/build-with-claude/prompt-caching,
@@ -2304,6 +2360,16 @@ class AnthropicProvider:
             supports_native_computer_use=base_caps.supports_native_computer_use,
             computer_use_tool_type=base_caps.computer_use_tool_type,
             capability_tags=tuple(capability_tags),
+            # Not derived from the Models API overlay fields above -- forwarded
+            # unchanged from the static base, same rationale as the computer-use
+            # fields immediately above. Previously omitted here entirely, which
+            # silently reset it to the dataclass default (1024) on every
+            # runtime-overridden request; e.g. Opus 5's real 512 became 1024.
+            min_cacheable_tokens=base_caps.min_cacheable_tokens,
+            supports_forced_tool_choice=base_caps.supports_forced_tool_choice,
+            thinking_disableable=base_caps.thinking_disableable,
+            preserved_thinking=base_caps.preserved_thinking,
+            supports_progress_updates=base_caps.supports_progress_updates,
         )
 
     async def _get_runtime_model_info(self, model_id: str) -> _RuntimeModelInfo | None:
