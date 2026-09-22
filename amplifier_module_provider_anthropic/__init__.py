@@ -54,6 +54,7 @@ from amplifier_core.utils import redact_secrets
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
+from amplifier_core.message_models import Degradation
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolCall
 from anthropic import APIStatusError as AnthropicAPIStatusError
@@ -528,6 +529,7 @@ class _RequestAssembly:
     thinking_enabled: bool
     thinking_budget: int | None
     interleaved_thinking_enabled: bool
+    degradation: Degradation | None = None
 
 
 @dataclass
@@ -1318,6 +1320,7 @@ class AnthropicProvider:
             )
         self.extra_request_params: dict[str, Any] = dict(_extra)
         self._extra_params_warned_keys: set[str] = set()
+        self._tool_choice_downgrade_warned = set()
 
         # Use streaming API by default to support large context windows (Anthropic requires streaming
         # for operations that may take > 10 minutes, e.g. with 300k+ token contexts)
@@ -3684,6 +3687,7 @@ class AnthropicProvider:
             params.setdefault("tools", []).insert(0, self._build_web_search_tool(options))
             if emit_diagnostics:
                 logger.info("[PROVIDER] Native web search tool enabled")
+        degradation: Degradation | None = None
         if "tools" in params:
             if options.get("tool_choice"):
                 params["tool_choice"] = options["tool_choice"]
@@ -3696,6 +3700,16 @@ class AnthropicProvider:
                     params["tool_choice"] = {"type": "any"}
                 else:
                     params["tool_choice"] = request.tool_choice
+            if "tool_choice" in params:
+                params["tool_choice"], choice_degradation = (
+                    self._gate_forced_tool_choice(
+                        params["tool_choice"],
+                        request_caps,
+                        model=effective_model,
+                        emit_diagnostics=emit_diagnostics,
+                    )
+                )
+                degradation = degradation or choice_degradation
 
         reasoning_effort = getattr(request, "reasoning_effort", None)
         if reasoning_effort is None:
@@ -3983,7 +3997,62 @@ class AnthropicProvider:
             thinking_enabled=thinking_enabled,
             thinking_budget=thinking_budget,
             interleaved_thinking_enabled=interleaved_thinking_enabled,
+            degradation=degradation,
         )
+
+    def _gate_forced_tool_choice(
+        self,
+        choice: Any,
+        caps: ModelCapabilities,
+        *,
+        model: str,
+        emit_diagnostics: bool = False,
+    ) -> tuple[Any, Degradation | None]:
+        """Downgrade a forced ``tool_choice`` the model rejects outright.
+
+        Opus 5.5+ (``caps.supports_forced_tool_choice is False``) returns
+        HTTP 400 for ``tool_choice`` type ``"any"`` or ``"tool"`` (forced
+        choice) -- confirmed in Anthropic's "What's new" migration guidance.
+        A deterministic 400 is useless to callers, so the forced choice is
+        downgraded to ``{"type": "auto"}`` (preserving
+        ``disable_parallel_tool_use`` when present) and reported via
+        ``ChatResponse.degradation``. This is weaker than Anthropic's
+        suggested replacement (strict tools + prompt wording), which the
+        provider cannot apply without editing the request prefix -- see the
+        README "Claude Opus 5.5" section.
+
+        Only a dict-shaped, already-mapped choice is gated; a caller-supplied
+        raw string is left alone (the typed mapping above always produces a
+        dict before this is called).
+        """
+        if caps.supports_forced_tool_choice or not isinstance(choice, dict):
+            return choice, None
+        if choice.get("type") not in ("any", "tool"):
+            return choice, None
+        new_choice: dict[str, Any] = {"type": "auto"}
+        if (disable_parallel := choice.get("disable_parallel_tool_use")) is not None:
+            new_choice["disable_parallel_tool_use"] = disable_parallel
+        if emit_diagnostics:
+            warn_key = (model, str(choice.get("type")))
+            if warn_key not in self._tool_choice_downgrade_warned:
+                self._tool_choice_downgrade_warned.add(warn_key)
+                logger.warning(
+                    "[PROVIDER] %s rejects forced tool_choice (type=%r) with HTTP "
+                    "400; downgrading to {'type': 'auto'}. Use strict tool "
+                    "schemas and prompt wording to steer tool use instead.",
+                    model,
+                    choice.get("type"),
+                )
+        degradation = Degradation(
+            requested=f"tool_choice={json.dumps(choice, sort_keys=True)}",
+            actual=f"tool_choice={json.dumps(new_choice, sort_keys=True)}",
+            reason=(
+                f"{model} rejects forced tool_choice (type any/tool) with HTTP "
+                "400; downgraded to auto. Use strict tool schemas and prompt "
+                "wording to steer tool use."
+            ),
+        )
+        return new_choice, degradation
 
     @staticmethod
     def _count_tokens_params(params: Mapping[str, Any]) -> dict[str, Any]:
@@ -4873,6 +4942,8 @@ class AnthropicProvider:
 
             # Build ChatResponse first
             chat_response = self._convert_to_chat_response(response)
+            if assembly.degradation is not None:
+                chat_response.degradation = assembly.degradation
 
             # Emit from canonical fields
             if self.coordinator and hasattr(self.coordinator, "hooks"):
