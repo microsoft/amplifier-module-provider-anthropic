@@ -400,7 +400,7 @@ _STATIC_FALLBACK_MODELS: dict[str, str] = {
 _STATIC_BUDGET_MODEL_VERSIONS: dict[str, frozenset[tuple[int, int]]] = {
     "fable": frozenset({(5, 0), (5, 1)}),
     "mythos": frozenset({(5, 0), (5, 1)}),
-    "opus": frozenset({(4, 5), (4, 6), (4, 7), (4, 8), (5, 0)}),
+    "opus": frozenset({(4, 5), (4, 6), (4, 7), (4, 8), (5, 0), (5, 5)}),
     "sonnet": frozenset({(4, 5), (4, 6), (5, 0)}),
     "haiku": frozenset({(4, 5)}),
 }

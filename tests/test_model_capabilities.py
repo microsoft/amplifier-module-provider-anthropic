@@ -453,6 +453,22 @@ class TestThinkingAlwaysOn:
         assert caps_48.min_cacheable_tokens == 1024
         assert dataclasses.replace(caps_5, min_cacheable_tokens=1024) == caps_48
 
+    def test_opus_55_capabilities_match_opus_5(self):
+        """claude-opus-5-5 (launched 2026-09-22) must match claude-opus-5's
+        full capability matrix: every gate in _get_capabilities keyed to
+        is_5_plus (or any lower threshold) is satisfied identically by
+        (5, 5) and (5, 0), since all of them are '>=' comparisons and no
+        is_55_plus threshold exists. No code change was required for Opus
+        5.5 capability detection.
+        """
+        caps_5 = AnthropicProvider._get_capabilities("claude-opus-5")
+        caps_55 = AnthropicProvider._get_capabilities("claude-opus-5-5")
+
+        assert caps_55 == caps_5
+        assert caps_55.family == "opus"
+        assert caps_55.min_cacheable_tokens == 512
+        assert caps_55.computer_use_tool_type == "computer_20251124"
+
 
 class TestGetCapabilitiesFable5:
     """Fable 5 capability matrix."""

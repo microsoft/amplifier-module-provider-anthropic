@@ -487,6 +487,52 @@ def test_opus_5_fast_mode_multiplier():
 
 
 # ---------------------------------------------------------------------------
+# Claude Opus 5.5 pricing ($4/$20, launched 2026-09-22, new recommended
+# default). cache_read is the one non-standard rate in this table: 0.05x
+# input ($0.20/MTok) instead of the usual 0.1x -- everything else follows
+# the standard multipliers off the new $4 input rate.
+# ---------------------------------------------------------------------------
+def test_opus_55_standard_rate():
+    cost = compute_cost(
+        "claude-opus-5-5", input_tokens=1_000_000, output_tokens=1_000_000
+    )
+    assert cost == Decimal("4.00") + Decimal("20.00")
+
+
+def test_opus_55_cache_read_cost():
+    """claude-opus-5-5: 1M cache-read -> $0.20 (0.05x input, NOT the usual 0.1x)."""
+    result = compute_cost("claude-opus-5-5", cache_read_input_tokens=1_000_000)
+    assert result == Decimal("0.20"), f"Expected Decimal('0.20'), got {result!r}"
+
+
+def test_opus_55_cache_write_5m_cost():
+    """claude-opus-5-5: 1M cache-write (legacy/5m) -> $5.00 (1.25x input)."""
+    result = compute_cost("claude-opus-5-5", cache_creation_input_tokens=1_000_000)
+    assert result == Decimal("5.00"), f"Expected Decimal('5.00'), got {result!r}"
+
+
+def test_opus_55_cache_write_1h_cost():
+    """claude-opus-5-5: 1M cache-write (1h TTL) -> $8.00 (2x input)."""
+    result = compute_cost(
+        "claude-opus-5-5", cache_creation_1h_input_tokens=1_000_000
+    )
+    assert result == Decimal("8.00"), f"Expected Decimal('8.00'), got {result!r}"
+
+
+def test_opus_55_fast_mode_multiplier():
+    standard = compute_cost(
+        "claude-opus-5-5", input_tokens=1_000_000, output_tokens=1_000_000
+    )
+    fast = compute_cost(
+        "claude-opus-5-5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        speed="fast",
+    )
+    assert fast == standard * 2
+
+
+# ---------------------------------------------------------------------------
 # Cache-write TTL split: bill 1h writes at 2x input, 5m writes at 1.25x input
 # ---------------------------------------------------------------------------
 #
