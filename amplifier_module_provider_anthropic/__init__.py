@@ -67,6 +67,7 @@ from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
+from . import _computer_toolset
 from ._cost import compute_cost
 
 # Params the Messages API still accepts on the wire but the SDK does not expose
@@ -530,6 +531,7 @@ class _RequestAssembly:
     thinking_budget: int | None
     interleaved_thinking_enabled: bool
     degradation: Degradation | None = None
+    computer_aliases: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -898,6 +900,8 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         # --- deferred: read in _build_web_search_tool ---
         "web_search_max_uses",
         "web_search_user_location",
+        # --- deferred: read in _assemble_request_params (Opus 5.5 computer toolset) ---
+        "computer_use_tool_type",
     }
 )
 
@@ -3588,6 +3592,29 @@ class AnthropicProvider:
             if prefix_state is None
             else prefix_state
         )
+        # Computer-use wire type for THIS request -- resolved once, up front,
+        # so both the tool-declaration translation below and the assistant
+        # tool_use replay in _convert_messages agree on the same target.
+        # computer_use_tool_type is an explicit override for gateways that
+        # front a different backend (e.g. a Bedrock gateway where Opus 5.5
+        # still takes computer_20251124); an invalid value is ignored with a
+        # warning rather than silently breaking every computer-use request.
+        effective_computer_type = request_caps.computer_use_tool_type
+        config_computer_type = self.config.get("computer_use_tool_type")
+        if config_computer_type is not None:
+            if config_computer_type in (
+                "computer_20250124",
+                "computer_20251124",
+                _computer_toolset.TOOLSET_TYPE,
+            ):
+                effective_computer_type = config_computer_type
+            elif emit_diagnostics:
+                logger.warning(
+                    "[PROVIDER] Ignoring invalid computer_use_tool_type=%r "
+                    "(valid values: computer_20250124, computer_20251124, %s)",
+                    config_computer_type,
+                    _computer_toolset.TOOLSET_TYPE,
+                )
         system_msgs = [message for message in request.messages if message.role == "system"]
         developer_msgs = [message for message in request.messages if message.role == "developer"]
         conversation = [
@@ -3612,6 +3639,7 @@ class AnthropicProvider:
             *self._convert_messages(
                 [message.model_dump() for message in conversation],
                 emit_warnings=emit_diagnostics,
+                computer_target_type=effective_computer_type,
             ),
         ]
         observed_state = "disabled"
@@ -3679,8 +3707,18 @@ class AnthropicProvider:
                 params["model"],
             )
 
+        computer_aliases: dict[str, str] = {}
         if request.tools:
             tools = self._convert_tools_from_request(request.tools)
+            tools, computer_aliases = _computer_toolset.translate_tools(
+                tools, effective_computer_type
+            )
+            if computer_aliases and emit_diagnostics:
+                logger.info(
+                    "[PROVIDER] Translated legacy computer-use tool to %s for %s",
+                    _computer_toolset.TOOLSET_TYPE,
+                    effective_model,
+                )
             tools, _ = self._apply_tool_cache_control(tools)
             params["tools"] = tools
         if options.get("enable_web_search", self.enable_web_search):
@@ -3998,6 +4036,7 @@ class AnthropicProvider:
             thinking_budget=thinking_budget,
             interleaved_thinking_enabled=interleaved_thinking_enabled,
             degradation=degradation,
+            computer_aliases=computer_aliases,
         )
 
     def _gate_forced_tool_choice(
@@ -4941,7 +4980,9 @@ class AnthropicProvider:
                     )
 
             # Build ChatResponse first
-            chat_response = self._convert_to_chat_response(response)
+            chat_response = self._convert_to_chat_response(
+                response, computer_aliases=assembly.computer_aliases
+            )
             if assembly.degradation is not None:
                 chat_response.degradation = assembly.degradation
 
@@ -5102,7 +5143,11 @@ class AnthropicProvider:
         return cleaned
 
     def _convert_messages(
-        self, messages: list[dict[str, Any]], *, emit_warnings: bool = True
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        emit_warnings: bool = True,
+        computer_target_type: str | None = None,
     ) -> list[dict[str, Any]]:
         """Convert messages to Anthropic format.
 
@@ -5243,14 +5288,22 @@ class AnthropicProvider:
 
                     # Add tool_use blocks
                     for tc in msg["tool_calls"]:
-                        content_blocks.append(
-                            {
-                                "type": "tool_use",
-                                "id": tc.get("id", ""),
-                                "name": tc.get("tool", ""),
-                                "input": tc.get("arguments", {}),
-                            }
+                        wire_name, wire_input, toolset_name = (
+                            _computer_toolset.to_wire_tool_call(
+                                tc.get("tool", ""),
+                                tc.get("arguments", {}),
+                                target_type=computer_target_type,
+                            )
                         )
+                        wire_block: dict[str, Any] = {
+                            "type": "tool_use",
+                            "id": tc.get("id", ""),
+                            "name": wire_name,
+                            "input": wire_input,
+                        }
+                        if toolset_name:
+                            wire_block["toolset_name"] = toolset_name
+                        content_blocks.append(wire_block)
 
                     anthropic_messages.append(
                         {"role": "assistant", "content": content_blocks}
@@ -6220,7 +6273,9 @@ class AnthropicProvider:
                 }
             ]
 
-    def _convert_to_chat_response(self, response: Any) -> ChatResponse:
+    def _convert_to_chat_response(
+        self, response: Any, *, computer_aliases: Mapping[str, str] | None = None
+    ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
         Args:
@@ -6259,14 +6314,26 @@ class AnthropicProvider:
                 event_blocks.append(ThinkingContent(text=block.thinking))
                 # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
             elif block.type == "tool_use":
+                # Opus 5.5's computer_toolset_20260801 emits a tool_use per
+                # member action (name = the member, e.g. "left_click",
+                # toolset_name = "computer") instead of the legacy single
+                # name="computer" + input.action shape. Translate back to
+                # the legacy shape so every existing "computer" tool
+                # implementation keeps working unchanged.
+                call_name, call_args = _computer_toolset.to_amplifier_call(
+                    block.name,
+                    block.input,
+                    getattr(block, "toolset_name", None),
+                    computer_aliases or {},
+                )
                 content_blocks.append(
-                    ToolCallBlock(id=block.id, name=block.name, input=block.input)
+                    ToolCallBlock(id=block.id, name=call_name, input=call_args)
                 )
                 tool_calls.append(
-                    ToolCall(id=block.id, name=block.name, arguments=block.input)
+                    ToolCall(id=block.id, name=call_name, arguments=call_args)
                 )
                 event_blocks.append(
-                    ToolCallContent(id=block.id, name=block.name, arguments=block.input)
+                    ToolCallContent(id=block.id, name=call_name, arguments=call_args)
                 )
             elif block.type == "web_search_tool_result":
                 # Handle native web search results from Anthropic
