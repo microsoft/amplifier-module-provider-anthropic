@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 def test_readme_documents_opus55_migration_and_config():
-    readme = (Path(__file__).parents[1] / "README.md").read_text()
+    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
     for required in (
         "### Claude Opus 5.5",
         "claude-opus-5-5",
