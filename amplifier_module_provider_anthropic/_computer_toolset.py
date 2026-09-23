@@ -1,0 +1,214 @@
+"""Narrow request-local adapter for Opus 5.5's native computer toolset.
+
+The core ToolSpec surface represents computer execution as an ordinary function
+tool.  Opus 5.5 instead expects one fixed native declaration and emits members
+of that declaration.  Keep that dialect boundary here: no provider instance
+state, no capability inference, and no broader endpoint classifier.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urlparse
+
+
+COMPUTER_TOOLSET_TYPE = "computer_toolset_20260801"
+COMPUTER_TOOLSET_NAME = "computer"
+PROVENANCE_TOOLSET = "_anthropic_computer_toolset_name"
+PROVENANCE_MEMBER = "_anthropic_computer_member_name"
+
+
+class ComputerToolsetError(ValueError):
+    """A local declaration/history error which must not reach the API."""
+
+
+@dataclass(frozen=True)
+class NativeComputerAdapter:
+    """The single native declaration active for one assembled request."""
+
+    alias: str
+    toolset_name: str = COMPUTER_TOOLSET_NAME
+
+
+def is_opus_55(model: str) -> bool:
+    """Recognize only the shipped Opus 5.5 model-id spellings."""
+    return bool(
+        re.fullmatch(
+            r"claude-opus-5(?:-5|\.5)(?:-\d{8})?",
+            model.lower(),
+        )
+    )
+
+
+def is_first_party_base_url(base_url: str | None) -> bool:
+    """True only for the SDK default or the exact public Anthropic hostname."""
+    if base_url is None:
+        return True
+    try:
+        return urlparse(base_url).hostname == "api.anthropic.com"
+    except (TypeError, ValueError):
+        return False
+
+
+def _tool_mapping(tool: Any) -> dict[str, Any]:
+    if isinstance(tool, dict):
+        return dict(tool)
+    if hasattr(tool, "model_dump"):
+        dumped = tool.model_dump(exclude_none=True)
+        if isinstance(dumped, dict):
+            return dict(dumped)
+    result: dict[str, Any] = {}
+    for name in (
+        "type",
+        "name",
+        "parameters",
+        "description",
+        "configs",
+        "cache_control",
+        "allowed_callers",
+        "display_width_px",
+        "display_height_px",
+        "display_number",
+        "enable_zoom",
+        "defer_loading",
+    ):
+        value = getattr(tool, name, None)
+        if value is not None:
+            result[name] = value
+    return result
+
+
+def _native_computer_type(tool: dict[str, Any]) -> bool:
+    tool_type = tool.get("type")
+    return tool_type == COMPUTER_TOOLSET_TYPE or (
+        isinstance(tool_type, str) and tool_type.startswith("computer_")
+    )
+
+
+def translate_tools(
+    tools: list[Any],
+    *,
+    model: str,
+    base_url: str | None,
+) -> tuple[list[Any], NativeComputerAdapter | None]:
+    """Translate the one supported native computer declaration for Opus 5.5.
+
+    Ordinary function tools and unrelated native tools are returned untouched.
+    Non-first-party endpoints fail loudly instead of pretending they implement
+    Anthropic's vendor-native toolset.
+    """
+    if not is_opus_55(model):
+        return list(tools), None
+
+    converted: list[Any] = []
+    adapter: NativeComputerAdapter | None = None
+    for raw_tool in tools:
+        tool = _tool_mapping(raw_tool)
+        if not _native_computer_type(tool):
+            converted.append(raw_tool)
+            continue
+        if not is_first_party_base_url(base_url):
+            raise ComputerToolsetError(
+                "Native computer-toolset declarations require Anthropic's first-party "
+                "API endpoint (the default or exact api.anthropic.com hostname); "
+                "this configured endpoint is not supported for Opus 5.5 native tools."
+            )
+        if adapter is not None:
+            raise ComputerToolsetError(
+                "Only one native computer declaration is allowed per Opus 5.5 request."
+            )
+        alias = tool.get("name", COMPUTER_TOOLSET_NAME)
+        if not isinstance(alias, str) or not alias:
+            raise ComputerToolsetError(
+                "A native computer declaration needs a non-empty ToolSpec name for dispatch."
+            )
+        if sum(1 for candidate in tools if _tool_mapping(candidate).get("name") == alias) > 1:
+            raise ComputerToolsetError(
+                f"Native computer dispatch alias {alias!r} is ambiguous in this request."
+            )
+        allowed = {
+            "type",
+            "name",
+            "parameters",
+            "description",
+            "configs",
+            "cache_control",
+            "allowed_callers",
+            "display_width_px",
+            "display_height_px",
+            "display_number",
+            "enable_zoom",
+            "defer_loading",
+        }
+        unknown = sorted(set(tool) - allowed)
+        if unknown:
+            raise ComputerToolsetError(
+                "Native computer declaration has unrepresentable field(s): "
+                + ", ".join(unknown)
+            )
+        if tool.get("defer_loading"):
+            raise ComputerToolsetError(
+                "Opus 5.5 computer_toolset_20260801 cannot represent legacy "
+                "defer_loading safely; remove it rather than widening deferred members."
+            )
+        legacy_declaration = tool.get("type") != COMPUTER_TOOLSET_TYPE
+        configs = tool.get("configs", {})
+        if not isinstance(configs, dict):
+            raise ComputerToolsetError("Native computer configs must be a mapping.")
+        wire_configs = dict(configs)
+        if "enable_zoom" in tool:
+            if not isinstance(tool["enable_zoom"], bool):
+                raise ComputerToolsetError(
+                    "Legacy native computer enable_zoom must be a boolean."
+                )
+            zoom = wire_configs.get("zoom", {})
+            if not isinstance(zoom, dict):
+                raise ComputerToolsetError("Native computer configs.zoom must be a mapping.")
+            wire_configs["zoom"] = {**zoom, "enabled": tool["enable_zoom"]}
+        elif legacy_declaration and "zoom" not in wire_configs:
+            wire_configs["zoom"] = {"enabled": False}
+        wire: dict[str, Any] = {
+            "type": COMPUTER_TOOLSET_TYPE,
+            "configs": wire_configs,
+        }
+        for key in ("cache_control", "allowed_callers"):
+            if key in tool:
+                wire[key] = tool[key]
+        converted.append(wire)
+        adapter = NativeComputerAdapter(alias=alias)
+    return converted, adapter
+
+
+def native_wire_tool_use(
+    block: dict[str, Any], adapter: NativeComputerAdapter | None
+) -> dict[str, Any] | None:
+    """Return an exact native wire block when persisted provenance authorizes it."""
+    if adapter is None:
+        return None
+    tagged = block.get(PROVENANCE_TOOLSET) == adapter.toolset_name
+    if not tagged and block.get("type") not in {"tool_call", "tool_use"}:
+        return None
+    legacy_matching_alias = (
+        PROVENANCE_TOOLSET not in block and block.get("name", block.get("tool")) == adapter.alias
+    )
+    if not (tagged or legacy_matching_alias):
+        return None
+    source_input = block.get("input", block.get("arguments", {}))
+    if not isinstance(source_input, dict):
+        raise ComputerToolsetError("Native computer history has a non-mapping input.")
+    action = block.get(PROVENANCE_MEMBER) if tagged else source_input.get("action")
+    if not isinstance(action, str) or not action:
+        raise ComputerToolsetError("Native computer history has no action member.")
+    native_input = dict(source_input)
+    if "action" in native_input:
+        native_input.pop("action")
+    return {
+        "type": "tool_use",
+        "id": block.get("id", ""),
+        "toolset_name": adapter.toolset_name,
+        "name": action,
+        "input": native_input,
+    }
+

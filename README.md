@@ -40,9 +40,21 @@ Opus 5.5 supports normal text, vision, function tools, streaming, effort, and
 prompt-cost tracking. Its thinking is always adaptive: an unset effort uses the
 vendor's `medium` effort, and `extended_thinking: false` cannot disable model
 thinking (the provider warns and preserves any selected effort and output cap).
-Native Anthropic computer-toolset declarations are not integrated for this
-provider/model release; ordinary function tools, including one named
-`computer`, remain supported. This does not change the default model.
+On Anthropic's first-party endpoint, Opus 5.5 adapts one explicit native
+computer declaration (legacy `computer_*` or
+`computer_toolset_20260801`) to `computer_toolset_20260801`. The adapter
+preserves the ToolSpec name as the executor dispatch alias and maps the native
+action member into `input.action`; ordinary function tools, including one named
+`computer`, and prior native-computer model behavior are unchanged. Native
+computer actions are single-action responses: the request uses
+`tool_choice: auto` with `disable_parallel_tool_use: true`; forced/named choice
+remains unsupported on Opus 5.5. `key.repeat` is passed through when the model
+emits it, but an executor must independently support repeat for it to take
+effect. Custom/proxy endpoints fail locally rather than claiming vendor-native
+toolset support. Provider-derived headers do not add a legacy computer-use beta
+for the new toolset; an explicitly configured beta header is retained. As elsewhere in this provider, expert
+`extra_request_params.tool_choice` is an explicit wire-level override and wins
+over this derived default. This does not change the default model.
 
 ## Configuration
 

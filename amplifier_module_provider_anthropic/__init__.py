@@ -67,6 +67,15 @@ from anthropic._exceptions import (
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 from ._cost import compute_cost
+from ._computer_toolset import (
+    COMPUTER_TOOLSET_NAME,
+    PROVENANCE_MEMBER,
+    PROVENANCE_TOOLSET,
+    ComputerToolsetError,
+    NativeComputerAdapter,
+    native_wire_tool_use,
+    translate_tools,
+)
 
 # Params the Messages API still accepts on the wire but the SDK does not expose
 # as typed keyword arguments.
@@ -528,6 +537,7 @@ class _RequestAssembly:
     thinking_enabled: bool
     thinking_budget: int | None
     interleaved_thinking_enabled: bool
+    native_computer_adapter: NativeComputerAdapter | None
 
 
 @dataclass
@@ -3543,6 +3553,19 @@ class AnthropicProvider:
         effective_model = options.get("model", self.default_model)
         if not isinstance(effective_model, str):
             return None
+        try:
+            request_tools, native_computer_adapter = translate_tools(
+                request.tools or [],
+                model=effective_model,
+                base_url=self._base_url,
+            )
+        except ComputerToolsetError as exc:
+            raise KernelInvalidRequestError(
+                str(exc),
+                provider="anthropic",
+                model=effective_model,
+                status_code=400,
+            ) from exc
         staged_prefix_state = (
             OrderedDict(self._prefix_fingerprints)
             if prefix_state is None
@@ -3572,6 +3595,7 @@ class AnthropicProvider:
             *self._convert_messages(
                 [message.model_dump() for message in conversation],
                 emit_warnings=emit_diagnostics,
+                native_computer_adapter=native_computer_adapter,
             ),
         ]
         observed_state = "disabled"
@@ -3681,35 +3705,22 @@ class AnthropicProvider:
                     model=effective_model,
                     status_code=400,
                 )
-
-        if request.tools:
             if (
-                not request_caps.supports_native_computer_use
-                and request_caps.requires_adaptive_thinking
+                native_computer_adapter is not None
+                and normalized_tool_choice.get("type") == "auto"
             ):
-                unsupported_native_types = []
-                for tool in request.tools:
-                    tool_type = (
-                        tool.get("type")
-                        if isinstance(tool, dict)
-                        else getattr(tool, "type", None)
-                    )
-                    if isinstance(tool_type, str) and (
-                        tool_type.startswith("computer_")
-                        or tool_type == "computer_toolset"
-                    ):
-                        unsupported_native_types.append(tool_type)
-                if unsupported_native_types:
-                    raise KernelInvalidRequestError(
-                        "Anthropic provider support for native computer-toolset "
-                        f"declarations ({', '.join(sorted(set(unsupported_native_types)))}) "
-                        "is not available for claude-opus-5-5. Use an ordinary "
-                        "function tool (including one named 'computer') instead.",
-                        provider="anthropic",
-                        model=effective_model,
-                        status_code=400,
-                    )
-            tools = self._convert_tools_from_request(request.tools)
+                # Copy above keeps caller-owned tool_choice dictionaries intact.
+                # A native computer response is one executor action, so make
+                # that request-wide restriction explicit on the wire.
+                normalized_tool_choice["disable_parallel_tool_use"] = True
+        elif native_computer_adapter is not None:
+            normalized_tool_choice = {
+                "type": "auto",
+                "disable_parallel_tool_use": True,
+            }
+
+        if request_tools:
+            tools = self._convert_tools_from_request(request_tools)
             tools, _ = self._apply_tool_cache_control(tools)
             params["tools"] = tools
         if options.get("enable_web_search", self.enable_web_search):
@@ -4036,6 +4047,7 @@ class AnthropicProvider:
             thinking_enabled=thinking_enabled,
             thinking_budget=thinking_budget,
             interleaved_thinking_enabled=interleaved_thinking_enabled,
+            native_computer_adapter=native_computer_adapter,
         )
 
     @staticmethod
@@ -4381,6 +4393,15 @@ class AnthropicProvider:
                                                 name = getattr(block, "name", None)
                                                 if name:
                                                     payload["name"] = name
+                                                toolset_name = getattr(
+                                                    block, "toolset_name", None
+                                                )
+                                                if toolset_name:
+                                                    # Display metadata only:
+                                                    # execution waits for the
+                                                    # request-local final-response
+                                                    # conversion below.
+                                                    payload["toolset_name"] = toolset_name
                                             await self.coordinator.hooks.emit(
                                                 "llm:stream_block_start",
                                                 payload,
@@ -4925,7 +4946,9 @@ class AnthropicProvider:
                     )
 
             # Build ChatResponse first
-            chat_response = self._convert_to_chat_response(response)
+            chat_response = self._convert_to_chat_response(
+                response, native_computer_adapter=assembly.native_computer_adapter
+            )
 
             # Emit from canonical fields
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -5096,7 +5119,11 @@ class AnthropicProvider:
         return None
 
     def _convert_messages(
-        self, messages: list[dict[str, Any]], *, emit_warnings: bool = True
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        emit_warnings: bool = True,
+        native_computer_adapter: NativeComputerAdapter | None = None,
     ) -> list[dict[str, Any]]:
         """Convert messages to Anthropic format.
 
@@ -5142,6 +5169,7 @@ class AnthropicProvider:
                             valid_tool_use_ids.add(block["id"])
 
         anthropic_messages = []
+        native_tool_use_ids: dict[str, str] = {}
         i = 0
 
         while i < len(messages):
@@ -5175,13 +5203,15 @@ class AnthropicProvider:
                         i += 1
                         continue
 
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": tool_msg.get("content", ""),
-                        }
-                    )
+                    result = {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_msg.get("content", ""),
+                    }
+                    toolset_name = native_tool_use_ids.get(tool_use_id)
+                    if toolset_name:
+                        result["toolset_name"] = toolset_name
+                    tool_results.append(result)
                     i += 1
 
                 # Only add user message if we have valid tool_results
@@ -5216,7 +5246,14 @@ class AnthropicProvider:
                                     type(raw_block).__name__,
                                 )
                             continue
-                        cleaned = self._clean_content_block(block)
+                        try:
+                            cleaned = native_wire_tool_use(
+                                block, native_computer_adapter
+                            ) or self._clean_content_block(block)
+                        except ComputerToolsetError as exc:
+                            raise KernelInvalidRequestError(
+                                str(exc), provider="anthropic", status_code=400
+                            ) from exc
                         content_blocks.append(cleaned)
                         if (
                             cleaned.get("type") == "tool_use"
@@ -5231,6 +5268,8 @@ class AnthropicProvider:
                                 )
                             canonical_tool_ids.add(cleaned["id"])
                             canonical_tools[cleaned["id"]] = cleaned
+                            if cleaned.get("toolset_name") == COMPUTER_TOOLSET_NAME:
+                                native_tool_use_ids[cleaned["id"]] = COMPUTER_TOOLSET_NAME
                     legacy_thinking = self._content_block_mapping(
                         msg.get("thinking_block")
                     )
@@ -5304,14 +5343,21 @@ class AnthropicProvider:
                             )
                         continue
                     legacy_tool_ids.add(tool_id)
-                    content_blocks.append(
-                        {
-                            "type": "tool_use",
-                            "id": tool_id,
-                            "name": tool_name,
-                            "input": call.get("input", call.get("arguments", {})),
-                        }
-                    )
+                    try:
+                        native = native_wire_tool_use(call, native_computer_adapter)
+                    except ComputerToolsetError as exc:
+                        raise KernelInvalidRequestError(
+                            str(exc), provider="anthropic", status_code=400
+                        ) from exc
+                    cleaned_call = native or {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": call.get("input", call.get("arguments", {})),
+                    }
+                    content_blocks.append(cleaned_call)
+                    if cleaned_call.get("toolset_name") == COMPUTER_TOOLSET_NAME:
+                        native_tool_use_ids[tool_id] = COMPUTER_TOOLSET_NAME
 
                 if not structured_content and content_blocks and content not in (None, ""):
                     # Preserve the old scalar-content shape for an ordinary
@@ -5402,7 +5448,7 @@ class AnthropicProvider:
         for tool in tools:
             # Check if this is a model-native tool (has 'type' that's not 'function')
             # Native tools like web_search_20250305 are passed through unchanged
-            tool_type = getattr(tool, "type", None)
+            tool_type = tool.get("type") if isinstance(tool, dict) else getattr(tool, "type", None)
             if tool_type and tool_type != "function":
                 # Model-native tool - pass through, minus the function-tool-only
                 # fields.
@@ -5427,7 +5473,7 @@ class AnthropicProvider:
                         native.pop(function_only_key, None)
                     anthropic_tools.append(native)
                 elif isinstance(tool, dict):
-                    anthropic_tools.append(tool)
+                    anthropic_tools.append(dict(tool))
                 else:
                     # Fallback: build dict from known attributes
                     native_tool: dict[str, Any] = {"type": tool_type}
@@ -5445,13 +5491,22 @@ class AnthropicProvider:
                 logger.debug(f"[PROVIDER] Added native tool: {tool_type}")
             else:
                 # Standard function tool - convert to Anthropic format
-                anthropic_tools.append(
-                    {
-                        "name": tool.name,
-                        "description": tool.description or "",
-                        "input_schema": tool.parameters,
-                    }
-                )
+                if isinstance(tool, dict):
+                    anthropic_tools.append(
+                        {
+                            "name": tool["name"],
+                            "description": tool.get("description") or "",
+                            "input_schema": tool["parameters"],
+                        }
+                    )
+                else:
+                    anthropic_tools.append(
+                        {
+                            "name": tool.name,
+                            "description": tool.description or "",
+                            "input_schema": tool.parameters,
+                        }
+                    )
         return anthropic_tools
 
     def _extract_web_search_citations(self, block: Any) -> list[dict[str, Any]]:
@@ -6245,7 +6300,12 @@ class AnthropicProvider:
                 }
             ]
 
-    def _convert_to_chat_response(self, response: Any) -> ChatResponse:
+    def _convert_to_chat_response(
+        self,
+        response: Any,
+        *,
+        native_computer_adapter: NativeComputerAdapter | None = None,
+    ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
         Args:
@@ -6269,6 +6329,22 @@ class AnthropicProvider:
         ] = []
         text_accumulator: list[str] = []
 
+        native_blocks = [
+            block
+            for block in response.content
+            if getattr(block, "type", None) == "tool_use"
+            and getattr(block, "toolset_name", None)
+            == getattr(native_computer_adapter, "toolset_name", None)
+        ]
+        if len(native_blocks) > 1:
+            raise KernelInvalidRequestError(
+                "Opus 5.5 native computer toolset returned multiple action members; "
+                "this provider accepts one computer action per response.",
+                provider="anthropic",
+                status_code=400,
+                retryable=False,
+            )
+
         for block in response.content:
             if block.type == "text":
                 content_blocks.append(TextBlock(text=block.text))
@@ -6287,14 +6363,43 @@ class AnthropicProvider:
             elif block.type == "redacted_thinking":
                 content_blocks.append(RedactedThinkingBlock(data=block.data))
             elif block.type == "tool_use":
+                is_native_computer = (
+                    native_computer_adapter is not None
+                    and getattr(block, "toolset_name", None)
+                    == native_computer_adapter.toolset_name
+                )
+                name = block.name
+                input_data = block.input
+                block_extra: dict[str, Any] = {}
+                if is_native_computer:
+                    if not isinstance(input_data, dict):
+                        raise KernelInvalidRequestError(
+                            "Native computer action input must be a mapping.",
+                            provider="anthropic",
+                            status_code=400,
+                            retryable=False,
+                        )
+                    if "action" in input_data:
+                        raise KernelInvalidRequestError(
+                            "Native computer action input contains reserved key 'action'.",
+                            provider="anthropic",
+                            status_code=400,
+                            retryable=False,
+                        )
+                    name = native_computer_adapter.alias
+                    input_data = {"action": block.name, **input_data}
+                    block_extra = {
+                        PROVENANCE_TOOLSET: native_computer_adapter.toolset_name,
+                        PROVENANCE_MEMBER: block.name,
+                    }
                 content_blocks.append(
-                    ToolCallBlock(id=block.id, name=block.name, input=block.input)
+                    ToolCallBlock(id=block.id, name=name, input=input_data, **block_extra)
                 )
                 tool_calls.append(
-                    ToolCall(id=block.id, name=block.name, arguments=block.input)
+                    ToolCall(id=block.id, name=name, arguments=input_data, **block_extra)
                 )
                 event_blocks.append(
-                    ToolCallContent(id=block.id, name=block.name, arguments=block.input)
+                    ToolCallContent(id=block.id, name=name, arguments=input_data)
                 )
             elif block.type == "web_search_tool_result":
                 # Handle native web search results from Anthropic

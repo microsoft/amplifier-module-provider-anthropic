@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import httpx2 as httpx
@@ -84,6 +85,19 @@ def _function_tool(name: str = "computer") -> ToolSpec:
     )
 
 
+def _native_computer(
+    *,
+    name: str = "computer",
+    tool_type: str = "computer_20251124",
+    **extra: Any,
+) -> ToolSpec:
+    tool = _function_tool(name)
+    setattr(tool, "type", tool_type)
+    for key, value in extra.items():
+        setattr(tool, key, value)
+    return tool
+
+
 @pytest.mark.parametrize("choice", ["auto", "none"])
 def test_opus55_normalizes_safe_tool_choices_from_request(choice: str) -> None:
     params = _assemble(_request(tool_choice=choice, tools=[_function_tool()]))
@@ -121,15 +135,304 @@ def test_opus55_rejects_forced_tool_choice_without_tools() -> None:
         _assemble(_request(tool_choice="required"))
 
 
-def test_opus55_rejects_only_native_computer_declarations() -> None:
-    native = _function_tool()
-    setattr(native, "type", "computer_20251124")
-    with pytest.raises(KernelInvalidRequestError, match="native computer-toolset"):
-        _assemble(_request(tools=[native]))
+def test_opus55_adapts_legacy_native_computer_declaration() -> None:
+    native = _native_computer(
+        name="desktop",
+        display_width_px=1440,
+        display_height_px=900,
+        enable_zoom=True,
+        cache_control={"type": "ephemeral"},
+        allowed_callers=["computer"],
+    )
+    params = _assemble(_request(tools=[native]))
+    assert params["tools"] == [
+        {
+            "type": "computer_toolset_20260801",
+            "configs": {"zoom": {"enabled": True}},
+            "cache_control": {"type": "ephemeral"},
+            "allowed_callers": ["computer"],
+        }
+    ]
+    assert "anthropic-beta" not in params.get("extra_headers", {})
 
+
+def test_opus55_native_computer_sets_single_action_auto_without_mutating_caller() -> None:
+    caller_choice = {"type": "auto"}
+    params = _assemble(
+        _request(tools=[_native_computer()], tool_choice=caller_choice)
+    )
+    assert caller_choice == {"type": "auto"}
+    assert params["tool_choice"] == {
+        "type": "auto",
+        "disable_parallel_tool_use": True,
+    }
+    assert _assemble(_request(tools=[_native_computer()], tool_choice=None))[
+        "tool_choice"
+    ] == {"type": "auto", "disable_parallel_tool_use": True}
+    assert _assemble(_request(tools=[_native_computer()], tool_choice="none"))[
+        "tool_choice"
+    ] == {"type": "none"}
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-opus-5-50",
+        "claude-opus-5-51-20260901",
+        "claude-opus-5-5preview",
+    ],
+)
+def test_only_exact_opus55_aliases_enable_native_computer_adapter(model: str) -> None:
+    params = _assemble(
+        _request(model=model, tools=[_native_computer()]),
+        model=model,
+    )
+    assert params["tools"][0]["type"] == "computer_20251124"
+
+
+def test_old_native_computer_keeps_legacy_dialect_and_beta_header() -> None:
+    params = _assemble(
+        _request(
+            model=PREVIOUS_OPUS_MODEL,
+            tools=[_native_computer(tool_type="computer_20251124")],
+        ),
+        model=PREVIOUS_OPUS_MODEL,
+    )
+    assert params["tools"][0]["type"] == "computer_20251124"
+    assert "computer-use-2025-11-24" in params["extra_headers"]["anthropic-beta"]
+
+
+def test_opus55_preserves_explicit_legacy_beta_header_after_translation() -> None:
+    provider = _provider(beta_headers=["computer-use-2025-11-24", "custom-beta"])
+    assembly = provider._assemble_request_params(
+        _request(tools=[_native_computer()]),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    )
+    assert assembly is not None
+    assert assembly.params["extra_headers"]["anthropic-beta"] == (
+        "computer-use-2025-11-24,custom-beta"
+    )
+
+
+def test_opus55_preserves_legacy_zoom_false_and_default() -> None:
+    disabled = _assemble(
+        _request(tools=[_native_computer(enable_zoom=False)])
+    )["tools"][0]
+    defaulted = _assemble(_request(tools=[_native_computer()]))["tools"][0]
+    assert disabled["configs"]["zoom"]["enabled"] is False
+    assert defaulted["configs"]["zoom"]["enabled"] is False
+
+
+def test_opus55_accepts_direct_toolset_without_function_schema() -> None:
+    direct = _native_computer(
+        tool_type="computer_toolset_20260801",
+        configs={"zoom": {"enabled": True}},
+    )
+    params = _assemble(_request(tools=[direct]))
+    assert params["tools"] == [
+        {
+            "type": "computer_toolset_20260801",
+            "configs": {"zoom": {"enabled": True}},
+        }
+    ]
+
+
+def test_opus55_rejects_unrepresentable_native_computer_field() -> None:
+    with pytest.raises(KernelInvalidRequestError, match="unrepresentable field"):
+        _assemble(_request(tools=[_native_computer(unexpected="value")]))
+
+
+def test_opus55_rejects_native_computer_at_custom_endpoint() -> None:
+    provider = _provider(base_url="https://gateway.example.test")
+    with pytest.raises(KernelInvalidRequestError, match="first-party"):
+        provider._assemble_request_params(
+            _request(tools=[_native_computer()]),
+            request_options={"model": MODEL},
+            request_caps=provider._get_capabilities(MODEL),
+        )
+
+
+def test_opus55_keeps_plain_function_named_computer() -> None:
     params = _assemble(_request(tools=[_function_tool("computer")]))
     assert params["tools"][0]["name"] == "computer"
     assert "type" not in params["tools"][0]
+
+
+def test_opus55_response_dispatch_and_history_are_request_scoped() -> None:
+    provider = _provider()
+    assembly = provider._assemble_request_params(
+        _request(tools=[_native_computer(name="desktop")]),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    )
+    assert assembly is not None
+    response = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="tool_use",
+                id="toolu_computer",
+                toolset_name="computer",
+                name="key",
+                input={"key": "TAB", "repeat": 3},
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        stop_reason="tool_use",
+        model=MODEL,
+    )
+    converted = provider._convert_to_chat_response(
+        response, native_computer_adapter=assembly.native_computer_adapter
+    )
+    call = converted.content[0]
+    assert call.name == "desktop"
+    assert call.input == {"action": "key", "key": "TAB", "repeat": 3}
+    persisted = Message(role="assistant", content=converted.content).model_dump()
+    wire = provider._convert_messages(
+        [
+            persisted,
+            {
+                "role": "tool",
+                "tool_call_id": "toolu_computer",
+                "content": "done",
+            },
+        ],
+        native_computer_adapter=assembly.native_computer_adapter,
+    )
+    assert wire[0]["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_computer",
+            "toolset_name": "computer",
+            "name": "key",
+            "input": {"key": "TAB", "repeat": 3},
+        }
+    ]
+    assert wire[1]["content"][0]["toolset_name"] == "computer"
+    legacy_fields_wire = provider._convert_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [converted.tool_calls[0].model_dump()],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "toolu_computer",
+                "content": "done",
+            },
+        ],
+        native_computer_adapter=assembly.native_computer_adapter,
+    )
+    assert legacy_fields_wire[0]["content"][0]["toolset_name"] == "computer"
+    assert legacy_fields_wire[1]["content"][0]["toolset_name"] == "computer"
+    plain = provider._convert_to_chat_response(response)
+    assert plain.content[0].name == "key"
+    legacy_wire = provider._convert_messages([persisted])
+    assert legacy_wire[0]["content"][0] == {
+        "type": "tool_use",
+        "id": "toolu_computer",
+        "name": "desktop",
+        "input": {"action": "key", "key": "TAB", "repeat": 3},
+    }
+
+
+def test_opus55_rejects_multiple_or_colliding_native_actions() -> None:
+    provider = _provider()
+    adapter = provider._assemble_request_params(
+        _request(tools=[_native_computer()]),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    ).native_computer_adapter
+    multiple = SimpleNamespace(
+        content=[
+            SimpleNamespace(type="tool_use", id="one", toolset_name="computer", name="left_click", input={}),
+            SimpleNamespace(type="tool_use", id="two", toolset_name="computer", name="right_click", input={}),
+        ],
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        stop_reason="tool_use",
+        model=MODEL,
+    )
+    with pytest.raises(KernelInvalidRequestError, match="multiple action"):
+        provider._convert_to_chat_response(multiple, native_computer_adapter=adapter)
+
+    collision = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="tool_use",
+                id="one",
+                toolset_name="computer",
+                name="left_click",
+                input={"action": "spoof"},
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        stop_reason="tool_use",
+        model=MODEL,
+    )
+    with pytest.raises(KernelInvalidRequestError, match="reserved key"):
+        provider._convert_to_chat_response(collision, native_computer_adapter=adapter)
+
+
+def test_opus55_real_sdk_mock_transport_serializes_native_toolset() -> None:
+    """The installed SDK must accept the adapter's wire body without a network call."""
+    from anthropic import AsyncAnthropic
+
+    captured: list[dict[str, Any]] = []
+
+    async def handler(request: Any) -> Any:
+        captured.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_native_mock",
+                "type": "message",
+                "role": "assistant",
+                "model": MODEL,
+                "stop_reason": "tool_use",
+                "stop_sequence": None,
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_native_mock",
+                        "toolset_name": "computer",
+                        "name": "key",
+                        "input": {"key": "TAB", "repeat": 2},
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    async def run() -> Any:
+        provider = _provider()
+        provider._runtime_model_info_cache[MODEL] = None
+        provider._client = AsyncAnthropic(
+            api_key="[REDACTED:SECRET]",
+            max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        try:
+            return await provider.complete(
+                _request(tools=[_native_computer(enable_zoom=True)]),
+                extended_thinking=False,
+            )
+        finally:
+            await provider.close()
+
+    response = asyncio.run(run())
+    assert captured[0]["tools"] == [
+        {
+            "type": "computer_toolset_20260801",
+            "configs": {"zoom": {"enabled": True}},
+        }
+    ]
+    assert response.tool_calls[0].name == "computer"
+    assert response.tool_calls[0].arguments == {
+        "action": "key",
+        "key": "TAB",
+        "repeat": 2,
+    }
 
 
 def test_opus55_requires_adaptive_thinking_without_expanding_output_cap(
