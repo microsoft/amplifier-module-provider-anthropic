@@ -356,6 +356,12 @@ NATIVE_TOOL_BETA_HEADERS: dict[str, str] = {
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
 BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
 BETA_HEADER_FAST_MODE = "fast-mode-2026-02-01"
+# Only meaningful on models with ModelCapabilities.supports_progress_updates
+# (Opus 5.5+): thinking.display="updates" streams progress-update thinking
+# blocks between tool calls instead of a post-hoc summary. Anthropic gates
+# this display value behind this header; sending it without the header is
+# rejected, and sending the header without the value is a harmless no-op.
+BETA_HEADER_THINKING_DISPLAY_UPDATES = "thinking-display-updates-2026-08-18"
 PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
 FALLBACK_STATE_VERSION = 1
@@ -2467,6 +2473,7 @@ class AnthropicProvider:
         has_task_budget: bool = False,
         fast_mode: bool = False,
         tools: list[dict[str, Any]] | None = None,
+        thinking_display: str | None = None,
     ) -> list[str]:
         """Build the anthropic-beta header set for a specific effective model.
 
@@ -2491,6 +2498,8 @@ class AnthropicProvider:
             headers.append(BETA_HEADER_TASK_BUDGETS)
         if fast_mode:
             headers.append(BETA_HEADER_FAST_MODE)
+        if thinking_display == "updates":
+            headers.append(BETA_HEADER_THINKING_DISPLAY_UPDATES)
         return self._dedupe_headers(headers)
 
     @staticmethod
@@ -3808,6 +3817,7 @@ class AnthropicProvider:
         thinking_budget: int | None = None
         interleaved_thinking_enabled = False
         resolved_thinking_type: str | None = None
+        thinking_display_value: str | None = None
         model_ceiling = request_caps.max_output_tokens
         if thinking_enabled and not request_caps.supports_thinking:
             if emit_diagnostics:
@@ -3906,10 +3916,25 @@ class AnthropicProvider:
                         "budget_tokens": budget_tokens,
                     }
                 if request_caps.thinking_display_required:
-                    params["thinking"]["display"] = options.get(
+                    resolved_display = options.get(
                         "thinking_display",
                         self.config.get("thinking_display", "summarized"),
                     )
+                    if (
+                        resolved_display == "updates"
+                        and not request_caps.supports_progress_updates
+                    ):
+                        if emit_diagnostics:
+                            logger.warning(
+                                "[PROVIDER] thinking_display='updates' is not "
+                                "supported by %s (requires a model with "
+                                "progress-update thinking, e.g. Opus 5.5+) -- "
+                                "using 'summarized' instead",
+                                effective_model,
+                            )
+                        resolved_display = "summarized"
+                    params["thinking"]["display"] = resolved_display
+                    thinking_display_value = resolved_display
                 if request_caps.supports_sampling:
                     params["temperature"] = 1.0
                 target_tokens = min(budget_tokens + buffer_tokens, model_ceiling)
@@ -4038,6 +4063,7 @@ class AnthropicProvider:
             has_task_budget=has_task_budget,
             fast_mode=fast_mode,
             tools=params.get("tools"),
+            thinking_display=thinking_display_value,
         )
         if headers:
             params["extra_headers"] = {
@@ -4045,6 +4071,20 @@ class AnthropicProvider:
                 "anthropic-beta": ",".join(headers),
             }
         self._merge_extra_request_params(params, emit_warnings=emit_diagnostics)
+        # A caller-supplied thinking.display="updates" via extra_request_params
+        # bypasses the derivation above (that override runs after headers are
+        # built). Cover it here too: `updates` must never go out without its
+        # beta header, on ANY path that can put it on the wire.
+        final_thinking = params.get("thinking")
+        if isinstance(final_thinking, dict) and final_thinking.get("display") == "updates":
+            existing = params.get("extra_headers", {}).get("anthropic-beta", "")
+            existing_set = {h for h in existing.split(",") if h}
+            if BETA_HEADER_THINKING_DISPLAY_UPDATES not in existing_set:
+                existing_set.add(BETA_HEADER_THINKING_DISPLAY_UPDATES)
+                params["extra_headers"] = {
+                    **dict(params.get("extra_headers", {})),
+                    "anthropic-beta": ",".join(sorted(existing_set)),
+                }
         if request.max_output_tokens is not None:
             params["max_tokens"] = min(request.max_output_tokens, model_ceiling)
         elif params.get("max_tokens") and params["max_tokens"] > model_ceiling:
@@ -5002,8 +5042,16 @@ class AnthropicProvider:
                     )
 
             # Build ChatResponse first
+            _sent_thinking = assembly.params.get("thinking")
+            _sent_display = (
+                _sent_thinking.get("display")
+                if isinstance(_sent_thinking, dict)
+                else None
+            )
             chat_response = self._convert_to_chat_response(
-                response, computer_aliases=assembly.computer_aliases
+                response,
+                computer_aliases=assembly.computer_aliases,
+                thinking_display=_sent_display,
             )
             if assembly.degradation is not None:
                 chat_response.degradation = assembly.degradation
@@ -6296,7 +6344,11 @@ class AnthropicProvider:
             ]
 
     def _convert_to_chat_response(
-        self, response: Any, *, computer_aliases: Mapping[str, str] | None = None
+        self,
+        response: Any,
+        *,
+        computer_aliases: Mapping[str, str] | None = None,
+        thinking_display: str | None = None,
     ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
@@ -6306,11 +6358,24 @@ class AnthropicProvider:
         Returns:
             AnthropicChatResponse with content blocks and streaming-compatible fields
         """
+        from amplifier_core.message_models import RedactedThinkingBlock
         from amplifier_core.message_models import TextBlock
         from amplifier_core.message_models import ThinkingBlock
         from amplifier_core.message_models import ToolCall
         from amplifier_core.message_models import ToolCallBlock
         from amplifier_core.message_models import Usage
+
+        # [TH]: with thinking.display="updates", Opus 5.5 (or any model with
+        # ModelCapabilities.supports_progress_updates) may emit a non-empty
+        # thinking block *between* tool calls that the caller should be able
+        # to show -- a "progress update" -- as well as one sentinel value
+        # ("This part of the response was interrupted before it finished.")
+        # that is user-visible under every display mode. Every other thinking
+        # block stays internal: it is the model's private reasoning, not
+        # response content, regardless of display mode.
+        _INTERRUPTED_THINKING_TEXT = (
+            "This part of the response was interrupted before it finished."
+        )
 
         content_blocks = []
         tool_calls = []
@@ -6326,15 +6391,30 @@ class AnthropicProvider:
                 text_accumulator.append(block.text)
                 event_blocks.append(TextContent(text=block.text))
             elif block.type == "thinking":
-                content_blocks.append(
-                    ThinkingBlock(
-                        thinking=block.thinking,
-                        signature=getattr(block, "signature", None),
-                        visibility="internal",
-                    )
+                is_progress_update = thinking_display == "updates" and (
+                    bool(block.thinking) or block.thinking == _INTERRUPTED_THINKING_TEXT
                 )
+                thinking_block_kwargs: dict[str, Any] = {
+                    "thinking": block.thinking,
+                    "signature": getattr(block, "signature", None),
+                    "visibility": "user" if is_progress_update else "internal",
+                }
+                if is_progress_update:
+                    thinking_block_kwargs["progress_update"] = True
+                content_blocks.append(ThinkingBlock(**thinking_block_kwargs))
                 event_blocks.append(ThinkingContent(text=block.thinking))
                 # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
+            elif block.type == "redacted_thinking":
+                # Anthropic redacted a thinking block's content for safety
+                # reasons (e.g. it may have discussed how to circumvent its
+                # safeguards); `data` is an encrypted opaque payload that must
+                # be replayed byte-exact on any subsequent turn but has no
+                # human-readable text. Previously silently dropped, which lost
+                # a content block the core round-trip contract requires
+                # providers to preserve.
+                content_blocks.append(
+                    RedactedThinkingBlock(data=block.data, visibility="internal")
+                )
             elif block.type == "tool_use":
                 # Opus 5.5's computer_toolset_20260801 emits a tool_use per
                 # member action (name = the member, e.g. "left_click",
