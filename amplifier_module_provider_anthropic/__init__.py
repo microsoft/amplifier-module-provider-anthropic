@@ -73,6 +73,7 @@ from ._computer_toolset import (
     PROVENANCE_TOOLSET,
     ComputerToolsetError,
     NativeComputerAdapter,
+    is_opus_55,
     native_wire_tool_use,
     translate_tools,
 )
@@ -2005,6 +2006,7 @@ class AnthropicProvider:
             is_48_plus = not version_known or (major, minor) >= (4, 8)
             is_5_plus = not version_known or (major, minor) >= (5, 0)
             is_55 = (major, minor) == (5, 5)
+            native_55_supported = is_opus_55(model_id)
             # Computer-use wire type, live-probed against api.anthropic.com
             # 2026-08-03 (bare {"type": ..., "name": "computer", "display_width_px":
             # 1024, "display_height_px": 768} declarations, matching anthropic-beta
@@ -2020,11 +2022,16 @@ class AnthropicProvider:
             #     supersedes rather than extends the older one)
             # Below 4.1 is unverified: the only pre-4.1 opus model (claude-opus-4-20250514)
             # is retired (HTTP 404) in this workspace, so it could not be probed either way.
-            if is_55:
+            if native_55_supported:
                 # This is an adapter capability rather than legacy
                 # computer-use support: actual declaration translation remains
                 # restricted to the first-party endpoint in translate_tools().
                 computer_use_tool_type = "computer_toolset_20260801"
+            elif is_55:
+                # _detect_version still recognizes 5.5 for the independently
+                # verified thinking/output contract, but native computer needs
+                # a model spelling this provider has actually verified.
+                computer_use_tool_type = None
             elif is_46_plus:
                 computer_use_tool_type = "computer_20251124"
             elif version_known and (major, minor) >= (4, 1):
@@ -5327,17 +5334,35 @@ class AnthropicProvider:
                     if tool_id in canonical_tool_ids:
                         # Current structured blocks win over stale duplicate
                         # legacy fields for the same call ID.
-                        if emit_warnings and canonical_tools[tool_id] != {
-                            "type": "tool_use",
-                            "id": tool_id,
-                            "name": tool_name,
-                            "input": call.get("input", call.get("arguments", {})),
-                        }:
-                            logger.warning(
-                                "Conflicting legacy assistant tool call id=%s; "
-                                "preserving canonical structured block.",
-                                tool_id,
-                            )
+                        if emit_warnings:
+                            try:
+                                normalized_legacy = native_wire_tool_use(
+                                    call, native_computer_adapter
+                                )
+                            except ComputerToolsetError:
+                                # A malformed stale mirror cannot invalidate
+                                # the canonical block that already won this ID.
+                                normalized_legacy = None
+                                logger.warning(
+                                    "Conflicting legacy assistant tool call id=%s; "
+                                    "preserving canonical structured block.",
+                                    tool_id,
+                                )
+                            else:
+                                normalized_legacy = normalized_legacy or {
+                                    "type": "tool_use",
+                                    "id": tool_id,
+                                    "name": tool_name,
+                                    "input": call.get(
+                                        "input", call.get("arguments", {})
+                                    ),
+                                }
+                                if canonical_tools[tool_id] != normalized_legacy:
+                                    logger.warning(
+                                        "Conflicting legacy assistant tool call id=%s; "
+                                        "preserving canonical structured block.",
+                                        tool_id,
+                                    )
                         continue
                     if tool_id in legacy_tool_ids:
                         if emit_warnings:

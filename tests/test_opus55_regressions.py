@@ -190,6 +190,28 @@ def test_only_exact_opus55_aliases_enable_native_computer_adapter(model: str) ->
     assert params["tools"][0]["type"] == "computer_20251124"
 
 
+@pytest.mark.parametrize(
+    "model",
+    ["claude-opus-5-5-latest", "claude-opus-5-5-202609", "claude-opus-5-5-"],
+)
+def test_unverified_opus55_suffix_rejects_native_computer_before_wire_assembly(
+    model: str,
+) -> None:
+    provider = _provider(default_model=model)
+    caps = provider._get_capabilities(model)
+
+    assert caps.supports_native_computer_use is False
+    assert caps.computer_use_tool_type is None
+    assert caps.requires_adaptive_thinking is True
+    assert caps.supports_forced_tool_choice is False
+    with pytest.raises(KernelInvalidRequestError, match="Unrecognized Opus 5.5 model suffix"):
+        provider._assemble_request_params(
+            _request(model=model, tools=[_native_computer()]),
+            request_options={"model": model},
+            request_caps=caps,
+        )
+
+
 def test_old_native_computer_keeps_legacy_dialect_and_beta_header() -> None:
     params = _assemble(
         _request(
@@ -1200,6 +1222,128 @@ def test_structured_canonical_tool_call_dedupes_legacy_alias() -> None:
         "toolu_current",
         "toolu_missing",
     ]
+
+
+def test_native_structured_cofield_normalizes_before_conflict_comparison(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = _provider()
+    adapter = provider._assemble_request_params(
+        _request(tools=[_native_computer(name="desktop")]),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    ).native_computer_adapter
+    history = [
+        {
+            "role": "assistant",
+            "content": [
+                ToolCallBlock(
+                    id="toolu_native",
+                    name="desktop",
+                    input={"action": "left_click", "coordinate": [2, 3]},
+                ).model_dump()
+            ],
+            "tool_calls": [
+                {
+                    "id": "toolu_native",
+                    "name": "desktop",
+                    "arguments": {"action": "left_click", "coordinate": [2, 3]},
+                }
+            ],
+        }
+    ]
+
+    wire = provider._convert_messages(
+        history, emit_warnings=True, native_computer_adapter=adapter
+    )
+
+    assert "Conflicting legacy assistant tool call" not in caplog.text
+    assert wire[0]["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_native",
+            "toolset_name": "computer",
+            "name": "left_click",
+            "input": {"coordinate": [2, 3]},
+        }
+    ]
+
+
+def test_conflicting_native_structured_cofield_warns_and_preserves_canonical(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = _provider()
+    adapter = provider._assemble_request_params(
+        _request(tools=[_native_computer(name="desktop")]),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    ).native_computer_adapter
+    history = [
+        {
+            "role": "assistant",
+            "content": [
+                ToolCallBlock(
+                    id="toolu_native",
+                    name="desktop",
+                    input={"action": "left_click", "coordinate": [2, 3]},
+                ).model_dump()
+            ],
+            "tool_calls": [
+                {
+                    "id": "toolu_native",
+                    "name": "desktop",
+                    "arguments": {"action": "right_click", "coordinate": [2, 3]},
+                }
+            ],
+        }
+    ]
+
+    wire = provider._convert_messages(
+        history, emit_warnings=True, native_computer_adapter=adapter
+    )
+
+    assert "Conflicting legacy assistant tool call id=toolu_native" in caplog.text
+    assert wire[0]["content"][0]["name"] == "left_click"
+    assert wire[0]["content"][0]["input"] == {"coordinate": [2, 3]}
+
+
+def test_malformed_native_cofield_warns_and_preserves_canonical(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = _provider()
+    adapter = provider._assemble_request_params(
+        _request(tools=[_native_computer(name="desktop")]),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    ).native_computer_adapter
+    history = [
+        {
+            "role": "assistant",
+            "content": [
+                ToolCallBlock(
+                    id="toolu_native",
+                    name="desktop",
+                    input={"action": "left_click", "coordinate": [2, 3]},
+                ).model_dump()
+            ],
+            "tool_calls": [
+                {
+                    "id": "toolu_native",
+                    "name": "desktop",
+                    "arguments": {"action": "left_click", "coordinate": [2, 3]},
+                    "_anthropic_computer_toolset_name": "computer",
+                }
+            ],
+        }
+    ]
+
+    wire = provider._convert_messages(
+        history, emit_warnings=True, native_computer_adapter=adapter
+    )
+
+    assert "Conflicting legacy assistant tool call id=toolu_native" in caplog.text
+    assert wire[0]["content"][0]["name"] == "left_click"
+    assert wire[0]["content"][0]["input"] == {"coordinate": [2, 3]}
 
 
 def test_pydantic_structured_tool_calls_authorize_tool_results() -> None:

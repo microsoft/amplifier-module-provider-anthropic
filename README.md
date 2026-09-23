@@ -48,12 +48,15 @@ preserves the ToolSpec name as the executor dispatch alias and maps the native
 action member into `input.action`; ordinary function tools, including one named
 `computer`, remain ordinary function tools. The actual request assembly guards
 this first-party-only boundary: custom/proxy endpoints fail locally rather than
-claiming vendor-native toolset support. This adapter is not a claim that the new
+claiming vendor-native toolset support, even though recognized Opus 5.5
+capabilities advertise the native path. This adapter is not a claim that the new
 toolset is fully equivalent to prior native-computer contracts. Native computer
 actions are single-action responses: the request uses `tool_choice: auto` with
 the **request-wide** `disable_parallel_tool_use: true`; forced/named choice
 remains unsupported on Opus 5.5. `key.repeat` is passed through when the model
-emits it, but takes effect only with an updated executor that supports repeat.
+emits it. An old executor without repeat support presses once and reports
+success even when `repeat > 1`. Update the computer-action executor to honor
+`key.repeat` before, or together with, activating this native Opus 5.5 path.
 Provider-derived headers do not add a legacy computer-use beta for the new
 toolset; an explicitly configured beta header is retained. As elsewhere in this provider, expert
 `extra_request_params.tool_choice` is an explicit wire-level override and wins

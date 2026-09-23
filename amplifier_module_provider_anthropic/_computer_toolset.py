@@ -50,6 +50,11 @@ def is_opus_55(model: str) -> bool:
     )
 
 
+def has_unverified_opus_55_suffix(model: str) -> bool:
+    """Recognize malformed Opus 5.5 suffixes without accepting them as aliases."""
+    return model.lower().startswith("claude-opus-5-5-") and not is_opus_55(model)
+
+
 def is_first_party_base_url(base_url: str | None) -> bool:
     """True only for the SDK default or the exact public Anthropic hostname."""
     if base_url is None:
@@ -111,6 +116,15 @@ def translate_tools(
     after a native declaration is found.
     """
     if not is_opus_55(model):
+        if has_unverified_opus_55_suffix(model) and any(
+            _native_computer_type(_tool_mapping(tool))
+            or _unknown_computer_type(_tool_mapping(tool))
+            for tool in tools
+        ):
+            raise ComputerToolsetError(
+                "Unrecognized Opus 5.5 model suffix; native computer declarations "
+                "are supported only for claude-opus-5-5 or a dated 8-digit alias."
+            )
         return list(tools), None
 
     converted: list[Any] = []
