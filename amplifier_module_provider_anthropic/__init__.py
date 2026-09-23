@@ -66,6 +66,8 @@ from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
+from . import _computer_toolset
+from . import _preserved_thinking
 from ._cost import compute_cost
 
 # Params the Messages API still accepts on the wire but the SDK does not expose
@@ -354,6 +356,12 @@ NATIVE_TOOL_BETA_HEADERS: dict[str, str] = {
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
 BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
 BETA_HEADER_FAST_MODE = "fast-mode-2026-02-01"
+# Only meaningful on models with ModelCapabilities.supports_progress_updates
+# (Opus 5.5+): thinking.display="updates" streams progress-update thinking
+# blocks between tool calls instead of a post-hoc summary. Anthropic gates
+# this display value behind this header; sending it without the header is
+# rejected, and sending the header without the value is a harmless no-op.
+BETA_HEADER_THINKING_DISPLAY_UPDATES = "thinking-display-updates-2026-08-18"
 PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
 FALLBACK_STATE_VERSION = 1
@@ -400,7 +408,7 @@ _STATIC_FALLBACK_MODELS: dict[str, str] = {
 _STATIC_BUDGET_MODEL_VERSIONS: dict[str, frozenset[tuple[int, int]]] = {
     "fable": frozenset({(5, 0), (5, 1)}),
     "mythos": frozenset({(5, 0), (5, 1)}),
-    "opus": frozenset({(4, 5), (4, 6), (4, 7), (4, 8), (5, 0)}),
+    "opus": frozenset({(4, 5), (4, 6), (4, 7), (4, 8), (5, 0), (5, 5)}),
     "sonnet": frozenset({(4, 5), (4, 6), (5, 0)}),
     "haiku": frozenset({(4, 5)}),
 }
@@ -528,6 +536,7 @@ class _RequestAssembly:
     thinking_enabled: bool
     thinking_budget: int | None
     interleaved_thinking_enabled: bool
+    computer_aliases: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -676,12 +685,42 @@ class ModelCapabilities:
         # is rejected outright (HTTP 400), unlike OpenAI's single bare "computer" type.
         # None means this model does not support the tool at all.
     )
+    computer_use_platform_aware: bool = (
+        False  # True = computer_use_tool_type above is only the first-party
+        # default; the effective wire type must instead be resolved per the
+        # request's base_url platform (see
+        # _computer_toolset.resolve_platform_computer_type). Opus 5.5+ only
+        # -- earlier generations use one wire type regardless of platform.
+    )
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
     min_cacheable_tokens: int = (
         1024  # Below this, the API silently skips caching (no error) --
         # platform.claude.com/en/docs/build-with-claude/prompt-caching,
         # verified 2026-08-29. Per-family values set explicitly below;
         # this is only the dataclass fallback.
+    )
+    supports_forced_tool_choice: bool = (
+        True  # False = tool_choice type "any"/"tool" (forced choice) is REJECTED
+        # with HTTP 400 on both the Messages and count_tokens endpoints
+        # (Opus 5.5+). The provider raises a local KernelInvalidRequestError
+        # before dispatch instead of sending the doomed request.
+    )
+    thinking_disableable: bool = (
+        True  # False = thinking can never be turned off; the model always runs
+        # adaptive thinking, so the provider must always send
+        # {"type": "adaptive", "display": ...} even when the caller asked to
+        # disable it (Opus 5.5+). NOT the same thing as thinking_always_on,
+        # which (in this codebase) means "never send a thinking param at all".
+    )
+    preserved_thinking: bool = (
+        False  # True = thinking blocks (and the whole assistant turn) are bound
+        # to a fixed conversation prefix: replaying a stored assistant turn
+        # must reproduce the exact prior wire content, append-only (Opus 5.5+).
+    )
+    supports_progress_updates: bool = (
+        False  # True = the beta thinking.display="updates" value is meaningful:
+        # the model may emit a short progress-update thinking block before a
+        # tool call (Opus 5.5+).
     )
 
 
@@ -693,6 +732,21 @@ class _RuntimeModelInfo:
     max_tokens: int | None = None
     supports_thinking: bool | None = None
     supports_adaptive_thinking: bool | None = None
+    # capabilities.thinking.types.enabled.supported -- manual ("enabled")
+    # thinking mode, distinct from adaptive above. Only used to NARROW the
+    # static value (never to widen it): Anthropic's own sample Models API
+    # response reports enabled.supported=true for claude-opus-5, which
+    # contradicts this provider's live-verified static value for that model
+    # (see D10/M59) -- so a runtime "true" is not trusted to turn a
+    # statically-False capability on, only a runtime "false" is trusted to
+    # turn a statically-True one off.
+    supports_manual_thinking: bool | None = None
+    # The subset of reasoning_effort levels capabilities.effort.<level>.supported
+    # reports true for, when the Models API response carries an `effort` key
+    # at all. None means the response had no effort capability data (leave
+    # the static list alone); an empty tuple means the response had the key
+    # but no level came back supported.
+    supported_efforts: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -870,9 +924,15 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "thinking_display",
         "task_budget_tokens",
         "speed",
+        "inference_geo",
         # --- deferred: read in _build_web_search_tool ---
         "web_search_max_uses",
         "web_search_user_location",
+        # --- deferred: read in _assemble_request_params (Opus 5.5 computer toolset) ---
+        "computer_use_tool_type",
+        "computer_batch_actions",
+        # --- deferred: read in _assemble_request_params (Opus 5.5 preserved thinking) ---
+        "thinking_prefix_mismatch_behavior",
     }
 )
 
@@ -1295,6 +1355,7 @@ class AnthropicProvider:
             )
         self.extra_request_params: dict[str, Any] = dict(_extra)
         self._extra_params_warned_keys: set[str] = set()
+        self._opus55_warned_once: set[tuple[str, str]] = set()
 
         # Use streaming API by default to support large context windows (Anthropic requires streaming
         # for operations that may take > 10 minutes, e.g. with 300k+ token contexts)
@@ -1469,6 +1530,18 @@ class AnthropicProvider:
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
         self._add_cost = add_cost or (lambda cost: None)
+
+        # T5 preserved-thinking (Opus 5.5+) state -- see _preserved_thinking.
+        # _thinking_drop_block: this session has switched to
+        # thinking.block_binding.prefix_mismatch_behavior="drop_block" after
+        # a prefix-binding rejection (D8); kept for the rest of the process
+        # lifetime of this provider instance. A NEW instance resumes the
+        # same setting via metadata.anthropic.thinking_binding on stored
+        # assistant messages (see _assemble_request_params), so this does
+        # not need to be persisted separately.
+        self._thinking_drop_block: bool = False
+        self._ephemeral_prefix_warned: bool = False
+        self._transformations_warned_models: set[str] = set()
 
     @property
     def client(self) -> AsyncAnthropic:
@@ -1880,6 +1953,16 @@ class AnthropicProvider:
         * **Fable 5 / Fable 5.1** — always-on adaptive thinking, 128K output, no manual thinking
         * **Opus 4.6+** (incl. Opus 5 — confirmed via numeric version-gate, verified
           2026-07-24) — 1M context, adaptive thinking, 128K output
+        * **Opus 5.5+** (Claude Opus 5.5, announced 2026-09-22) — everything Opus
+          4.6+ has, plus four breaking changes from Opus 5: thinking can never be
+          disabled (``thinking_disableable=False``), forced ``tool_choice``
+          (``any``/named ``tool``) is rejected with HTTP 400
+          (``supports_forced_tool_choice=False``), thinking blocks are bound to a
+          fixed conversation prefix (``preserved_thinking=True``), and the
+          computer-use tool type is ``computer_toolset_20260801`` instead of
+          ``computer_20251124`` (see below). Also gains the beta
+          ``thinking.display="updates"`` progress-update mode
+          (``supports_progress_updates=True``).
         * **Sonnet 4.5+** — 1M context, extended thinking, 64K output
         * **Haiku 4.5+** — fast inference, extended thinking, no adaptive, no 1M
 
@@ -1888,11 +1971,14 @@ class AnthropicProvider:
         evidence table:
 
         * **Opus 4.1-4.5** / **Sonnet/Haiku 4.5** — ``computer_20250124``
-        * **Opus/Sonnet 4.6+** (incl. Opus/Sonnet 5) — ``computer_20251124``
+        * **Opus/Sonnet 4.6+ through Opus 5** — ``computer_20251124``
+        * **Opus 5.5+** — ``computer_toolset_20260801`` (``computer_20251124`` is
+          rejected with HTTP 400 per Anthropic's "Migrate from computer_20251124"
+          guidance; not a superset relationship like the 4.6 jump)
         * Everything else (below the verified floor, or an unreachable/unverified
           model such as Fable) — unsupported (``None``)
 
-        These two generations are NOT interchangeable: pairing a model with the
+        These generations are NOT interchangeable: pairing a model with the
         wrong one returns HTTP 400, not a graceful fallback.
 
         When the version cannot be parsed from the model ID we assume the
@@ -1983,6 +2069,16 @@ class AnthropicProvider:
             is_47_plus = not version_known or (major, minor) >= (4, 7)
             is_48_plus = not version_known or (major, minor) >= (4, 8)
             is_5_plus = not version_known or (major, minor) >= (5, 0)
+            # Opus 5.5 (2026-09-22) shipped four breaking changes from Opus 5
+            # (verified against Anthropic's announcement and "What's new" page,
+            # see README "Claude Opus 5.5" section): thinking can never be
+            # disabled, forced tool_choice (any/named tool) is rejected with
+            # HTTP 400, thinking blocks are bound to a fixed conversation
+            # prefix, and the legacy computer_20251124 tool type is rejected
+            # in favor of computer_toolset_20260801. An unknown/future opus
+            # version is treated as 5.5+ (the file's existing convention:
+            # unknown version means the latest generation's rules apply).
+            is_55_plus = not version_known or (major, minor) >= (5, 5)
             # Computer-use wire type, live-probed against api.anthropic.com
             # 2026-08-03 (bare {"type": ..., "name": "computer", "display_width_px":
             # 1024, "display_height_px": 768} declarations, matching anthropic-beta
@@ -1996,9 +2092,14 @@ class AnthropicProvider:
             #   claude-opus-4-6/4-7/4-8, claude-opus-5 + computer_20251124 -> 200
             #     (computer_20250124 -> 400 on all of these — the newer generation
             #     supersedes rather than extends the older one)
+            #   claude-opus-5-5 + computer_20251124 -> 400 (Anthropic's migration
+            #     guidance: "Migrate from computer_20251124" -- the tool type is
+            #     replaced by computer_toolset_20260801, not merely superseded).
             # Below 4.1 is unverified: the only pre-4.1 opus model (claude-opus-4-20250514)
             # is retired (HTTP 404) in this workspace, so it could not be probed either way.
-            if is_46_plus:
+            if is_55_plus:
+                computer_use_tool_type = "computer_toolset_20260801"
+            elif is_46_plus:
                 computer_use_tool_type = "computer_20251124"
             elif version_known and (major, minor) >= (4, 1):
                 computer_use_tool_type = "computer_20250124"
@@ -2048,6 +2149,12 @@ class AnthropicProvider:
                 default_thinking_budget=64000 if is_46_plus else 32000,
                 supports_native_computer_use=computer_use_tool_type is not None,
                 computer_use_tool_type=computer_use_tool_type,
+                # Opus 5.5+ breaking-change gates (see is_55_plus comment above).
+                supports_forced_tool_choice=not is_55_plus,
+                thinking_disableable=not is_55_plus,
+                preserved_thinking=is_55_plus,
+                supports_progress_updates=is_55_plus,
+                computer_use_platform_aware=is_55_plus,
                 # Non-monotonic by design -- 4.6->4096, 4.7->2048, 4.8->1024,
                 # 5->512 -- verified against
                 # platform.claude.com/en/docs/build-with-claude/prompt-caching,
@@ -2236,7 +2343,25 @@ class AnthropicProvider:
             supports_adaptive_thinking=cls._capability_supported(
                 model_info, "capabilities", "thinking", "types", "adaptive"
             ),
+            supports_manual_thinking=cls._capability_supported(
+                model_info, "capabilities", "thinking", "types", "enabled"
+            ),
+            supported_efforts=cls._extract_supported_efforts(model_info),
         )
+
+    @classmethod
+    def _extract_supported_efforts(cls, model_info: Any) -> tuple[str, ...] | None:
+        """Models API `capabilities.effort.<level>.supported` -> the subset
+        of levels reported true, or None when the response carries no
+        `effort` key at all (nothing to narrow against)."""
+        effort_node = cls._resolve_model_info_value(model_info, "capabilities", "effort")
+        if effort_node is None:
+            return None
+        supported: list[str] = []
+        for level in ("low", "medium", "high", "xhigh", "max"):
+            if cls._capability_supported(model_info, "capabilities", "effort", level):
+                supported.append(level)
+        return tuple(supported)
 
     @classmethod
     def _apply_runtime_capability_overrides(
@@ -2277,6 +2402,22 @@ class AnthropicProvider:
         if supports_thinking and default_thinking_budget <= 0:
             default_thinking_budget = 32000
 
+        # Narrow-only overlays (D10 / T7): a runtime "false" can turn a
+        # statically-True capability off; a runtime "true" never turns a
+        # statically-False one on, because Anthropic's own sample Models API
+        # payloads are demonstrably not reliable in the "true" direction
+        # (see the field comment on _RuntimeModelInfo.supports_manual_thinking).
+        supports_manual_thinking = base_caps.supports_manual_thinking
+        if runtime_info.supports_manual_thinking is False:
+            supports_manual_thinking = False
+
+        supported_efforts = base_caps.supported_efforts
+        if runtime_info.supported_efforts is not None:
+            supported_efforts = tuple(
+                e for e in base_caps.supported_efforts
+                if e in runtime_info.supported_efforts
+            )
+
         return ModelCapabilities(
             family=base_caps.family,
             max_output_tokens=runtime_info.max_tokens or base_caps.max_output_tokens,
@@ -2284,12 +2425,12 @@ class AnthropicProvider:
             supports_1m=supports_1m,
             supports_thinking=supports_thinking,
             supports_adaptive_thinking=supports_adaptive_thinking,
-            supports_manual_thinking=base_caps.supports_manual_thinking,
+            supports_manual_thinking=supports_manual_thinking,
             supports_output_config=base_caps.supports_output_config,
             supports_task_budget=base_caps.supports_task_budget,
             supports_sampling=base_caps.supports_sampling,
             thinking_display_required=base_caps.thinking_display_required,
-            supported_efforts=base_caps.supported_efforts,
+            supported_efforts=supported_efforts,
             supports_speed=base_caps.supports_speed,
             supports_inline_system=base_caps.supports_inline_system,
             thinking_always_on=base_caps.thinking_always_on,
@@ -2304,6 +2445,17 @@ class AnthropicProvider:
             supports_native_computer_use=base_caps.supports_native_computer_use,
             computer_use_tool_type=base_caps.computer_use_tool_type,
             capability_tags=tuple(capability_tags),
+            # Not derived from the Models API overlay fields above -- forwarded
+            # unchanged from the static base, same rationale as the computer-use
+            # fields immediately above. Previously omitted here entirely, which
+            # silently reset it to the dataclass default (1024) on every
+            # runtime-overridden request; e.g. Opus 5's real 512 became 1024.
+            min_cacheable_tokens=base_caps.min_cacheable_tokens,
+            supports_forced_tool_choice=base_caps.supports_forced_tool_choice,
+            thinking_disableable=base_caps.thinking_disableable,
+            preserved_thinking=base_caps.preserved_thinking,
+            supports_progress_updates=base_caps.supports_progress_updates,
+            computer_use_platform_aware=base_caps.computer_use_platform_aware,
         )
 
     async def _get_runtime_model_info(self, model_id: str) -> _RuntimeModelInfo | None:
@@ -2393,6 +2545,7 @@ class AnthropicProvider:
         has_task_budget: bool = False,
         fast_mode: bool = False,
         tools: list[dict[str, Any]] | None = None,
+        thinking_display: str | None = None,
     ) -> list[str]:
         """Build the anthropic-beta header set for a specific effective model.
 
@@ -2417,6 +2570,15 @@ class AnthropicProvider:
             headers.append(BETA_HEADER_TASK_BUDGETS)
         if fast_mode:
             headers.append(BETA_HEADER_FAST_MODE)
+        if thinking_display == "updates":
+            headers.append(BETA_HEADER_THINKING_DISPLAY_UPDATES)
+        if request_caps.preserved_thinking:
+            # [PT]: this header is required to receive `input_transformations`
+            # on the response, and `thinking.block_binding` is rejected
+            # ("Extra inputs are not permitted") without it. Opus 5.5+
+            # always needs it since every request on that model is subject
+            # to the prefix-binding check.
+            headers.append(_preserved_thinking.BETA_HEADER_THINKING_BINDING)
         return self._dedupe_headers(headers)
 
     @staticmethod
@@ -2605,7 +2767,17 @@ class AnthropicProvider:
         """
         stripped = request.model_copy(deep=True)
         for message in stripped.messages:
-            if message.role != "assistant" or not isinstance(message.content, list):
+            if message.role != "assistant":
+                continue
+            # T5 [PT]: stripping the DISPLAYED thinking blocks but leaving a
+            # preserved-thinking exact-replay snapshot in metadata untouched
+            # would bring the just-stripped blocks right back on the very
+            # next preserved-thinking turn (e.g. a Fable refusal falling
+            # back to an Opus 5.5 turn already in history). Strip both.
+            message.metadata = _preserved_thinking.strip_thinking_from_metadata(
+                message.metadata
+            )
+            if not isinstance(message.content, list):
                 continue
             message.content = [
                 block
@@ -3003,8 +3175,18 @@ class AnthropicProvider:
         a corresponding tool result message. Returns missing pairs WITH their
         source message index so they can be inserted in the correct position.
 
-        Excludes tool call IDs that have already been repaired with synthetic
-        results to prevent infinite detection loops.
+        This is deliberately idempotent: an ID already repaired on a prior
+        call is reported again every time its tool_use has no matching
+        result in THIS request's messages -- a preserved-thinking target
+        (Opus 5.5+) replays a stored assistant turn byte-exact, and a
+        synthetic tool_result injected by ``complete()`` is only added to
+        this one request's (mutated in place) ``request.messages``, not
+        persisted back into the caller's message store, so the very next
+        request would again lack the result unless it is re-inserted every
+        time. ``self._repaired_tool_ids`` (see ``complete()``) exists only
+        to suppress the repeated WARNING log / ``provider:tool_sequence_repaired``
+        event for an ID once it is known to be a pre-existing gap, not to
+        exclude it from repair.
 
         Returns:
             List of (msg_index, call_id, tool_name, tool_arguments) tuples for unpaired calls.
@@ -3026,11 +3208,13 @@ class AnthropicProvider:
             ):
                 tool_results.add(msg.tool_call_id)
 
-        # Exclude IDs that have already been repaired to prevent infinite loops
+        # T5: no longer excludes self._repaired_tool_ids -- see the
+        # idempotence note in this method's docstring. That set now only
+        # suppresses the repeated WARNING log / repair event in complete().
         return [
             (msg_idx, call_id, name, args)
             for call_id, (msg_idx, name, args) in tool_calls.items()
-            if call_id not in tool_results and call_id not in self._repaired_tool_ids
+            if call_id not in tool_results
         ]
 
     def _create_synthetic_result(self, call_id: str, tool_name: str) -> Message:
@@ -3072,6 +3256,38 @@ class AnthropicProvider:
         """
         if getattr(response, "finish_reason", None) != "refusal":
             return response
+        if "fallbacks" in self.extra_request_params:
+            # Anthropic requires applications to choose either server-side
+            # fallback or a client retry ladder, never both. A server-side
+            # fallback response already carries the model/cost attribution of
+            # the model that actually answered, so do not issue another call.
+            logger.info(
+                "[PROVIDER] Server-side fallbacks are configured; skipping the "
+                "client refusal fallback ladder"
+            )
+            return response
+
+        stop_details = (
+            (response.metadata or {}).get("anthropic", {}).get("stop_details")
+            if getattr(response, "metadata", None)
+            else None
+        )
+        if (
+            isinstance(stop_details, dict)
+            and stop_details.get("category") == "reasoning_extraction"
+        ):
+            # [MG]: server-side fallback "doesn't retry requests declined
+            # with reasoning_extraction" -- Anthropic's own guidance for this
+            # refusal category. It is about the *prompt* asking the model to
+            # reveal its internal reasoning, not a model-quality issue a
+            # different/weaker model would resolve, so the client fallback
+            # ladder does not apply here either.
+            logger.info(
+                "[PROVIDER] %s refused with stop_details.category="
+                "'reasoning_extraction' -- not retrying on a fallback model",
+                effective_model,
+            )
+            return response
 
         fallback_model = self._refusal_fallback_target(effective_model)
         if fallback_model is None:
@@ -3103,11 +3319,22 @@ class AnthropicProvider:
         missing = self._find_missing_tool_results(request.messages)
 
         if missing:
-            logger.warning(
-                f"[PROVIDER] Anthropic: Detected {len(missing)} missing tool result(s). "
-                f"Injecting synthetic errors. This indicates a bug in context management. "
-                f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
-            )
+            # T5: repair is now idempotent (see _find_missing_tool_results'
+            # docstring) -- the SAME id can legitimately reappear on every
+            # call for a preserved-thinking target, since the synthetic
+            # result is never persisted back into the caller's message
+            # store. Only a genuinely NEW id is worth a WARNING / event;
+            # logging/emitting every request for an already-known gap would
+            # be noise, not a bug report.
+            new_ids = [
+                call_id for _, call_id, _, _ in missing if call_id not in self._repaired_tool_ids
+            ]
+            if new_ids:
+                logger.warning(
+                    f"[PROVIDER] Anthropic: Detected {len(missing)} missing tool result(s). "
+                    f"Injecting synthetic errors. This indicates a bug in context management. "
+                    f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
+                )
 
             # Group missing results by source assistant message index
             # We need to insert synthetic results IMMEDIATELY after each assistant message
@@ -3124,7 +3351,7 @@ class AnthropicProvider:
                 synthetics = []
                 for call_id, tool_name in by_msg_idx[msg_idx]:
                     synthetics.append(self._create_synthetic_result(call_id, tool_name))
-                    # Track this ID so we don't detect it as missing again in future iterations
+                    # Track this ID so a REPEAT detection doesn't re-log/re-emit.
                     self._repaired_tool_ids.add(call_id)
 
                 # Insert all synthetic results immediately after the assistant message
@@ -3132,16 +3359,17 @@ class AnthropicProvider:
                 for i, synthetic in enumerate(synthetics):
                     request.messages.insert(insert_pos + i, synthetic)
 
-            # Emit observability event
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
+            # Emit observability event -- only for newly-discovered ids.
+            if new_ids and self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     "provider:tool_sequence_repaired",
                     {
                         "provider": self.name,
-                        "repair_count": len(missing),
+                        "repair_count": len(new_ids),
                         "repairs": [
                             {"tool_call_id": call_id, "tool_name": tool_name}
                             for _, call_id, tool_name, _ in missing
+                            if call_id in new_ids
                         ],
                     },
                 )
@@ -3519,15 +3747,106 @@ class AnthropicProvider:
             if prefix_state is None
             else prefix_state
         )
-        system_msgs = [message for message in request.messages if message.role == "system"]
-        developer_msgs = [message for message in request.messages if message.role == "developer"]
+        # Computer-use wire type for THIS request -- resolved once, up front,
+        # so both the tool-declaration translation below and the assistant
+        # tool_use replay in _convert_messages agree on the same target.
+        # computer_use_tool_type is an explicit override for gateways that
+        # front a different backend (e.g. a Bedrock gateway where Opus 5.5
+        # still takes computer_20251124); an invalid value is ignored with a
+        # warning rather than silently breaking every computer-use request.
+        effective_computer_type = request_caps.computer_use_tool_type
+        computer_platform_label: str | None = None
+        if request_caps.computer_use_platform_aware:
+            # Opus 5.5+: the static family default above is only correct on
+            # the first-party API. Resolve the actual wire type from the
+            # request's base_url platform instead -- see
+            # _computer_toolset.classify_platform.
+            raw_base_url = self._base_url or os.environ.get("ANTHROPIC_BASE_URL")
+            effective_computer_type, computer_platform_label = (
+                _computer_toolset.resolve_platform_computer_type(raw_base_url)
+            )
+        config_computer_type = self.config.get("computer_use_tool_type")
+        if config_computer_type is not None:
+            if config_computer_type in (
+                "computer_20250124",
+                "computer_20251124",
+                _computer_toolset.TOOLSET_TYPE,
+            ):
+                effective_computer_type = config_computer_type
+            elif emit_diagnostics:
+                logger.warning(
+                    "[PROVIDER] Ignoring invalid computer_use_tool_type=%r "
+                    "(valid values: computer_20250124, computer_20251124, %s)",
+                    config_computer_type,
+                    _computer_toolset.TOOLSET_TYPE,
+                )
+        # T5 [PT: "Leave a role: \"system\" message where the caller put
+        # it"]: on a preserved-thinking target, only the LEADING run of
+        # system/developer messages (before the first user/assistant/tool
+        # message) gets today's treatment -- joined into the top-level
+        # `system` field, or hoisted to the front as context_file user
+        # messages. A LATER system/developer message is instead placed
+        # inline, append-only, at (a deterministic approximation of) its
+        # original position -- rebuilding the top-level `system` field or
+        # hoisting it to the front on every request would edit an already
+        # -sent prefix and trigger the prefix-binding check. Every other
+        # model keeps the exact prior behavior (every system/developer
+        # message, wherever it appears, is collected and hoisted).
+        use_inline_later_messages = (
+            request_caps.preserved_thinking and request_caps.supports_inline_system
+        )
+        if use_inline_later_messages:
+            first_conv_idx = next(
+                (
+                    idx
+                    for idx, message in enumerate(request.messages)
+                    if message.role in ("user", "assistant", "tool")
+                ),
+                len(request.messages),
+            )
+            leading_msgs = request.messages[:first_conv_idx]
+            rest_msgs = request.messages[first_conv_idx:]
+        else:
+            leading_msgs = request.messages
+            rest_msgs = []
+        system_msgs = [message for message in leading_msgs if message.role == "system"]
+        developer_msgs = [message for message in leading_msgs if message.role == "developer"]
         conversation = [
             message
-            for message in request.messages
+            for message in (leading_msgs if not use_inline_later_messages else rest_msgs)
             if message.role in ("user", "assistant", "tool")
         ]
         unstable_suffix_len, has_ephemeral_signal = self._unstable_suffix_length(conversation)
         system_blocks = self._format_system_with_cache(system_msgs)
+        if use_inline_later_messages:
+            converted_input: list[dict[str, Any]] = []
+            for message in rest_msgs:
+                if message.role == "system":
+                    converted_input.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                message.content if isinstance(message.content, str) else ""
+                            ),
+                            "_floating": "system",
+                        }
+                    )
+                elif message.role == "developer":
+                    converted_input.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "<context_file>\n"
+                                f"{message.content if isinstance(message.content, str) else ''}"
+                                "\n</context_file>"
+                            ),
+                            "_floating": "developer",
+                        }
+                    )
+                else:
+                    converted_input.append(message.model_dump())
+        else:
+            converted_input = [message.model_dump() for message in conversation]
         all_messages = [
             *[
                 {
@@ -3541,8 +3860,10 @@ class AnthropicProvider:
                 for message in developer_msgs
             ],
             *self._convert_messages(
-                [message.model_dump() for message in conversation],
+                converted_input,
                 emit_warnings=emit_diagnostics,
+                computer_target_type=effective_computer_type,
+                preserved_thinking=request_caps.preserved_thinking,
             ),
         ]
         observed_state = "disabled"
@@ -3610,8 +3931,45 @@ class AnthropicProvider:
                 params["model"],
             )
 
+        computer_aliases: dict[str, str] = {}
         if request.tools:
             tools = self._convert_tools_from_request(request.tools)
+            if (
+                request_caps.computer_use_platform_aware
+                and effective_computer_type is None
+                and any(
+                    tool.get("type") in _computer_toolset.LEGACY_COMPUTER_TYPES
+                    or tool.get("type") == _computer_toolset.TOOLSET_TYPE
+                    for tool in tools
+                )
+            ):
+                raise KernelInvalidRequestError(
+                    f"{effective_model} does not support any computer-use "
+                    f"tool type on this platform ({computer_platform_label}). "
+                    "Supported: the first-party Anthropic API or Google "
+                    "Cloud/Vertex AI (computer_toolset_20260801), and Amazon "
+                    "Bedrock (computer_20251124). Remove the computer tool, "
+                    "point base_url at a supported platform, or set "
+                    "computer_use_tool_type explicitly if this endpoint "
+                    "accepts a computer-use tool type despite not matching "
+                    "a recognized platform.",
+                    provider="anthropic",
+                    model=effective_model,
+                )
+            try:
+                tools, computer_aliases = _computer_toolset.translate_tools(
+                    tools, effective_computer_type
+                )
+            except _computer_toolset.UnsupportedComputerToolsetDowngradeError as e:
+                raise KernelInvalidRequestError(
+                    str(e), provider="anthropic", model=effective_model
+                ) from e
+            if computer_aliases and emit_diagnostics:
+                logger.info(
+                    "[PROVIDER] Translated legacy computer-use tool to %s for %s",
+                    _computer_toolset.TOOLSET_TYPE,
+                    effective_model,
+                )
             tools, _ = self._apply_tool_cache_control(tools)
             params["tools"] = tools
         if options.get("enable_web_search", self.enable_web_search):
@@ -3619,17 +3977,39 @@ class AnthropicProvider:
             if emit_diagnostics:
                 logger.info("[PROVIDER] Native web search tool enabled")
         if "tools" in params:
-            if options.get("tool_choice"):
-                params["tool_choice"] = options["tool_choice"]
-            elif request.tool_choice:
-                if request.tool_choice == "none":
+            # kwargs tool_choice wins over the portable request.tool_choice
+            # (existing precedence), but BOTH must go through the identical
+            # portable-string -> wire-dict mapping before the forced-choice
+            # gate below -- a kwargs string "required" is exactly as forced
+            # as request.tool_choice == "required" and must not bypass the
+            # gate just because it arrived through a different parameter.
+            raw_tool_choice = (
+                options["tool_choice"]
+                if options.get("tool_choice")
+                else request.tool_choice
+            )
+            if raw_tool_choice:
+                if raw_tool_choice == "none":
                     params["tool_choice"] = {"type": "none"}
-                elif request.tool_choice == "auto":
+                elif raw_tool_choice == "auto":
                     params["tool_choice"] = {"type": "auto"}
-                elif request.tool_choice == "required":
+                elif raw_tool_choice == "required":
                     params["tool_choice"] = {"type": "any"}
                 else:
-                    params["tool_choice"] = request.tool_choice
+                    params["tool_choice"] = raw_tool_choice
+            if "tool_choice" in params:
+                self._reject_unsupported_forced_tool_choice(
+                    params["tool_choice"],
+                    request_caps,
+                    model=effective_model,
+                )
+            if (
+                computer_aliases
+                and not self._config_bool(self.config.get("computer_batch_actions", False))
+            ):
+                choice = params.setdefault("tool_choice", {"type": "auto"})
+                if choice.get("type") != "none":
+                    choice["disable_parallel_tool_use"] = True
 
         reasoning_effort = getattr(request, "reasoning_effort", None)
         if reasoning_effort is None:
@@ -3689,6 +4069,7 @@ class AnthropicProvider:
         thinking_budget: int | None = None
         interleaved_thinking_enabled = False
         resolved_thinking_type: str | None = None
+        thinking_display_value: str | None = None
         model_ceiling = request_caps.max_output_tokens
         if thinking_enabled and not request_caps.supports_thinking:
             if emit_diagnostics:
@@ -3698,6 +4079,27 @@ class AnthropicProvider:
                     effective_model,
                 )
             thinking_enabled = False
+        if not request_caps.thinking_disableable and request_caps.supports_thinking:
+            # Opus 5.5+: thinking can never be turned off [WN]. Always run
+            # adaptive thinking, even when the caller explicitly asked to
+            # disable it or set no reasoning_effort at all (server default
+            # effort applies -- this provider sets no default, D5).
+            explicit_opt_out = (
+                options.get("extended_thinking") is False
+                if "extended_thinking" in options
+                else config_thinking is False
+            )
+            if explicit_opt_out and emit_diagnostics:
+                warn_key = ("thinking_disableable", effective_model)
+                if warn_key not in self._opus55_warned_once:
+                    self._opus55_warned_once.add(warn_key)
+                    logger.warning(
+                        "[PROVIDER] Cannot disable thinking on %s; thinking is "
+                        "always on for this model. Set reasoning_effort (e.g. "
+                        "'low') to reduce thinking instead.",
+                        effective_model,
+                    )
+            thinking_enabled = True
         if (
             emit_diagnostics
             and reasoning_effort in ("xhigh", "max")
@@ -3766,10 +4168,25 @@ class AnthropicProvider:
                         "budget_tokens": budget_tokens,
                     }
                 if request_caps.thinking_display_required:
-                    params["thinking"]["display"] = options.get(
+                    resolved_display = options.get(
                         "thinking_display",
                         self.config.get("thinking_display", "summarized"),
                     )
+                    if (
+                        resolved_display == "updates"
+                        and not request_caps.supports_progress_updates
+                    ):
+                        if emit_diagnostics:
+                            logger.warning(
+                                "[PROVIDER] thinking_display='updates' is not "
+                                "supported by %s (requires a model with "
+                                "progress-update thinking, e.g. Opus 5.5+) -- "
+                                "using 'summarized' instead",
+                                effective_model,
+                            )
+                        resolved_display = "summarized"
+                    params["thinking"]["display"] = resolved_display
+                    thinking_display_value = resolved_display
                 if request_caps.supports_sampling:
                     params["temperature"] = 1.0
                 target_tokens = min(budget_tokens + buffer_tokens, model_ceiling)
@@ -3850,10 +4267,23 @@ class AnthropicProvider:
             if "extended_thinking" in options
             else config_thinking is False
         )
+        # On a model whose thinking is never disableable (Opus 5.5+), an
+        # `extended_thinking: false` opt-out is already a no-op above --
+        # thinking runs regardless (D28/thinking_disableable handling). It
+        # must not ALSO suppress an explicit resolved reasoning_effort here:
+        # doing so would silently drop output_config.effort even though the
+        # server is thinking at full, unrequested default effort instead of
+        # the caller's/config's explicit choice. Suppression is scoped to
+        # models where the opt-out actually turns thinking off.
+        suppress_effort_for_opt_out = (
+            request_caps.thinking_disableable
+            and explicit_thinking_opt_out
+            and "effort" not in options
+        )
         if (
             request_caps.supports_output_config
             and reasoning_effort is not None
-            and not (explicit_thinking_opt_out and "effort" not in options)
+            and not suppress_effort_for_opt_out
         ):
             effort = options.get("effort", reasoning_effort)
             if effort in request_caps.supported_efforts:
@@ -3891,6 +4321,15 @@ class AnthropicProvider:
                 )
         if stop_sequences := options.get("stop_sequences"):
             params["stop_sequences"] = stop_sequences
+        # Data-residency pricing [PR$ "Data residency pricing"]: routing a
+        # request to a guaranteed-US inference region costs 1.1x standard
+        # pricing, stacking with the fast-mode 2x multiplier. This is a wire
+        # param the SDK passes straight through; the provider only needs to
+        # thread it into compute_cost() so Usage.cost_usd stays accurate
+        # (see _convert_to_chat_response's inference_geo argument).
+        inference_geo = options.get("inference_geo", self.config.get("inference_geo"))
+        if inference_geo is not None:
+            params["inference_geo"] = inference_geo
         headers = self._build_request_beta_headers(
             request_caps=request_caps,
             tools_present=bool(params.get("tools")),
@@ -3898,6 +4337,7 @@ class AnthropicProvider:
             has_task_budget=has_task_budget,
             fast_mode=fast_mode,
             tools=params.get("tools"),
+            thinking_display=thinking_display_value,
         )
         if headers:
             params["extra_headers"] = {
@@ -3905,6 +4345,89 @@ class AnthropicProvider:
                 "anthropic-beta": ",".join(headers),
             }
         self._merge_extra_request_params(params, emit_warnings=emit_diagnostics)
+
+        # --- T5: preserved-thinking prefix-mismatch recovery (D8) [PT] ---
+        # Resolve BEFORE the header-bypass check below, so a config- or
+        # history-driven drop_block setting is covered by the same "never
+        # send block_binding without its header" guarantee as a caller
+        # -supplied one.
+        if request_caps.preserved_thinking and isinstance(params.get("thinking"), dict):
+            behavior = self.config.get("thinking_prefix_mismatch_behavior")
+            if behavior not in (None, "error", "drop_block"):
+                if emit_diagnostics:
+                    logger.warning(
+                        "[PROVIDER] Ignoring invalid "
+                        "thinking_prefix_mismatch_behavior=%r (valid values: "
+                        "error, drop_block)",
+                        behavior,
+                    )
+                behavior = None
+            if behavior is None and (
+                self._thinking_drop_block
+                or any(
+                    message.role == "assistant"
+                    and isinstance(message.metadata, dict)
+                    and isinstance(
+                        message.metadata.get(_preserved_thinking.METADATA_KEY), dict
+                    )
+                    and message.metadata[_preserved_thinking.METADATA_KEY].get(
+                        _preserved_thinking.BINDING_KEY
+                    )
+                    == "drop_block"
+                    for message in request.messages
+                )
+            ):
+                behavior = "drop_block"
+            if behavior is not None and not params["thinking"].get("block_binding"):
+                # [PT]: "Pass through what you don't recognize" -- a caller
+                # -supplied block_binding (via extra_request_params, merged
+                # above) always wins; this only fills in the default.
+                params["thinking"]["block_binding"] = {
+                    "prefix_mismatch_behavior": behavior
+                }
+            # Diagnostic: loop-streaming's `ephemeral_injection_mode: "tail"`
+            # injects a message for ONE request only -- a prefix edit on a
+            # preserved-thinking model even though it never touches
+            # persisted history. Surfaced once per instance; the automatic
+            # drop_block retry (below) recovers from the resulting 400.
+            if emit_diagnostics and not self._ephemeral_prefix_warned:
+                if any(
+                    isinstance(message.metadata, dict)
+                    and message.metadata.get("ephemeral") is True
+                    for message in request.messages
+                ):
+                    self._ephemeral_prefix_warned = True
+                    logger.warning(
+                        "[PROVIDER] %s: a request-only (ephemeral) message "
+                        "injection is a prefix edit on a preserved-thinking "
+                        "model; automatic drop_block recovery will engage "
+                        "if the API rejects it, and reasoning after the "
+                        "edit will be lost.",
+                        effective_model,
+                    )
+
+        # A caller-supplied thinking.display="updates" (or thinking.block_
+        # binding) via extra_request_params bypasses the derivations above
+        # (those overrides run after headers are built, and the config
+        # -driven block_binding assignment above only fills in a default).
+        # Cover both here too: neither value may ever go out without its
+        # beta header, on ANY path that can put it on the wire.
+        final_thinking = params.get("thinking")
+        if isinstance(final_thinking, dict):
+            needed_headers: set[str] = set()
+            if final_thinking.get("display") == "updates":
+                needed_headers.add(BETA_HEADER_THINKING_DISPLAY_UPDATES)
+            if final_thinking.get("block_binding"):
+                needed_headers.add(_preserved_thinking.BETA_HEADER_THINKING_BINDING)
+            existing = params.get("extra_headers", {}).get("anthropic-beta", "")
+            existing_set = {h for h in existing.split(",") if h}
+            missing_headers = needed_headers - existing_set
+            if missing_headers:
+                existing_set |= missing_headers
+                params["extra_headers"] = {
+                    **dict(params.get("extra_headers", {})),
+                    "anthropic-beta": ",".join(sorted(existing_set)),
+                }
         if request.max_output_tokens is not None:
             params["max_tokens"] = min(request.max_output_tokens, model_ceiling)
         elif params.get("max_tokens") and params["max_tokens"] > model_ceiling:
@@ -3917,6 +4440,49 @@ class AnthropicProvider:
             thinking_enabled=thinking_enabled,
             thinking_budget=thinking_budget,
             interleaved_thinking_enabled=interleaved_thinking_enabled,
+            computer_aliases=computer_aliases,
+        )
+
+    def _reject_unsupported_forced_tool_choice(
+        self,
+        choice: Any,
+        caps: ModelCapabilities,
+        *,
+        model: str,
+    ) -> None:
+        """Raise before any HTTP request when *choice* forces a tool the
+        model rejects outright.
+
+        Opus 5.5+ (``caps.supports_forced_tool_choice is False``) returns
+        HTTP 400 for ``tool_choice`` type ``"any"`` or ``"tool"`` (forced
+        choice) -- confirmed in Anthropic's "What's new" migration guidance,
+        on both the Messages and ``count_tokens`` endpoints. A deterministic
+        400 tells the caller nothing it doesn't already know, so this is
+        raised locally and immediately, before dispatch, as a clear and
+        actionable ``KernelInvalidRequestError`` instead. Because this runs
+        inside ``_assemble_request_params``, every caller of that shared
+        assembly (Messages, ``request_budget``, ``count_tokens``) rejects the
+        same way -- see the README "Claude Opus 5.5" section.
+
+        Only a dict-shaped, already-mapped choice is gated; a caller-supplied
+        raw string is left alone (the typed mapping above always produces a
+        dict before this is called). ``extra_request_params`` is merged in
+        AFTER assembly (including this gate) and so deliberately bypasses it
+        -- the documented "user wins" escape hatch.
+        """
+        if caps.supports_forced_tool_choice or not isinstance(choice, dict):
+            return
+        if choice.get("type") not in ("any", "tool"):
+            return
+        raise KernelInvalidRequestError(
+            f"{model} does not support forced tool_choice (type="
+            f"{choice.get('type')!r}); Anthropic rejects this with HTTP 400 "
+            "on both the Messages and count_tokens endpoints. Use "
+            "tool_choice='auto' together with strict tool schemas and "
+            "prompt wording that tells the model when to use the tool, or "
+            "tool_choice='none' to disable tools for this call.",
+            provider="anthropic",
+            model=model,
         )
 
     @staticmethod
@@ -3947,7 +4513,22 @@ class AnthropicProvider:
         context_estimate: int,
         request_options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Return an exact Anthropic input decision or unavailable."""
+        """Return an exact Anthropic input decision or unavailable.
+
+        NOT purely fail-soft: ``_assemble_request_params`` performs local,
+        pre-dispatch validation (e.g. a forced ``tool_choice`` Opus 5.5+
+        rejects outright, or a computer-use tool the resolved platform/type
+        cannot represent) and RAISES ``KernelInvalidRequestError`` for those
+        cases rather than returning ``None``. This is deliberate: it gives
+        ``request_budget`` (and, by the same shared assembly, the Messages
+        and ``count_tokens`` dispatch paths) one consistent, actionable
+        rejection for a request that is invalid regardless of budget --
+        never a false "unavailable" answer that hides an error the caller
+        needs to see, and never a live ``count_tokens`` call for a request
+        that would 400 anyway. Every other unavailable case here (invalid
+        ``context_estimate``, no static/cached capabilities, a live
+        ``count_tokens`` failure) still returns ``None``.
+        """
         if (
             isinstance(context_estimate, bool)
             or not isinstance(context_estimate, int)
@@ -4028,7 +4609,17 @@ class AnthropicProvider:
         context_estimate: int,
         request_options: Mapping[str, Any] | None = None,
     ) -> dict[str, int] | None:
-        """Consume matching private server feedback to request one smaller retry."""
+        """Consume matching private server feedback to request one smaller retry.
+
+        Re-assembles the exact request that already reached the server
+        (feedback only exists because the first attempt was dispatched), so
+        the local pre-dispatch validation in ``_assemble_request_params``
+        (see ``request_budget``'s docstring) is not expected to raise here
+        in practice -- but if the model's capabilities changed between the
+        original dispatch and this recovery attempt, the same
+        ``KernelInvalidRequestError`` can still propagate rather than
+        silently returning ``None``.
+        """
         feedback = getattr(error, "_anthropic_overflow_feedback", None)
         if (
             not isinstance(feedback, _OverflowFeedback)
@@ -4131,6 +4722,11 @@ class AnthropicProvider:
         thinking_enabled = assembly.thinking_enabled
         thinking_budget = assembly.thinking_budget
         interleaved_thinking_enabled = assembly.interleaved_thinking_enabled
+        _sent_display = (
+            params.get("thinking", {}).get("display")
+            if isinstance(params.get("thinking"), dict)
+            else None
+        )
 
         # Keep only short fingerprints for a possible input-only server
         # rejection. The request reference adds an identity binding without
@@ -4292,17 +4888,20 @@ class AnthropicProvider:
                                         elif dtype == "thinking_delta":
                                             text = getattr(delta, "thinking", "") or ""
                                             if text and hooks_available:
+                                                delta_payload = {
+                                                    "request_id": request_id,
+                                                    "block_index": idx,
+                                                    "block_type": block_types.get(
+                                                        idx, "thinking"
+                                                    ),
+                                                    "sequence": seq,
+                                                    "text": text,
+                                                }
+                                                if _sent_display == "updates":
+                                                    delta_payload["progress_update"] = True
                                                 await self.coordinator.hooks.emit(
                                                     "llm:stream_block_delta",
-                                                    {
-                                                        "request_id": request_id,
-                                                        "block_index": idx,
-                                                        "block_type": block_types.get(
-                                                            idx, "thinking"
-                                                        ),
-                                                        "sequence": seq,
-                                                        "text": text,
-                                                    },
+                                                    delta_payload,
                                                 )
                                                 partial_emitted = True
                                         # signature_delta and any future delta
@@ -4806,7 +5405,42 @@ class AnthropicProvider:
                     )
 
             # Build ChatResponse first
-            chat_response = self._convert_to_chat_response(response)
+            _sent_thinking = assembly.params.get("thinking")
+            _sent_display = (
+                _sent_thinking.get("display")
+                if isinstance(_sent_thinking, dict)
+                else None
+            )
+            chat_response = self._convert_to_chat_response(
+                response,
+                computer_aliases=assembly.computer_aliases,
+                thinking_display=_sent_display,
+                inference_geo=assembly.params.get("inference_geo"),
+                preserved_thinking=request_caps.preserved_thinking,
+                emit_diagnostics=True,
+                effective_model=params["model"],
+            )
+
+            # T5 [PT]: "Count the transformations you receive back and
+            # alert on them" -- emitted here (rather than inside the
+            # synchronous _convert_to_chat_response) so it can use the
+            # coordinator's async hook bus like every other provider event.
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                _anthropic_meta = (chat_response.metadata or {}).get("anthropic") or {}
+                _transform_summary = _preserved_thinking.summarize_transformations(
+                    _anthropic_meta.get("input_transformations")
+                )
+                if _transform_summary is not None:
+                    await self.coordinator.hooks.emit(
+                        "provider:thinking_blocks_dropped",
+                        {
+                            "provider": "anthropic",
+                            "model": params["model"],
+                            "count": _transform_summary["count"],
+                            "reasons": _transform_summary["reasons"],
+                            "paths": _transform_summary["paths"],
+                        },
+                    )
 
             # Emit from canonical fields
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -4842,6 +5476,53 @@ class AnthropicProvider:
             return chat_response  # Return the already-built response
 
         except KernelLLMError as e:
+            # T5 [PT] D8: a preserved-thinking target (Opus 5.5+) rejects a
+            # replayed turn with a documented 400 when the request prefix
+            # was edited by something outside the provider's control (an
+            # ephemeral injection, context compaction, screenshot pruning,
+            # ...): "The block is bound to a different conversation. Remove
+            # the block, or set `thinking.block_binding.prefix_mismatch_
+            # behavior` to \"drop_block\"." [PT] prescribes exactly this
+            # recovery: retry once with drop_block, and keep that choice
+            # for the rest of the session (including after a restart --
+            # see the metadata.anthropic.thinking_binding marker written in
+            # _convert_to_chat_response and read back in
+            # _assemble_request_params). A tampered-signature 400 has no
+            # such sentence and is never retried this way; an explicit
+            # `thinking_prefix_mismatch_behavior: "error"` config disables
+            # the automatic retry entirely.
+            if (
+                request_caps.preserved_thinking
+                and not self._thinking_drop_block
+                and self.config.get("thinking_prefix_mismatch_behavior") != "error"
+                and _preserved_thinking.is_prefix_binding_mismatch(str(e))
+            ):
+                self._thinking_drop_block = True
+                logger.warning(
+                    "[PROVIDER] %s rejected a replayed thinking turn (prefix "
+                    "binding mismatch); retrying once with "
+                    "thinking.block_binding.prefix_mismatch_behavior="
+                    "drop_block for the rest of this session. Reasoning "
+                    "generated before the edit is lost. Likely cause: a "
+                    "system/tools/earlier-message edit outside this "
+                    "provider's control (e.g. an ephemeral injection, "
+                    "compaction, or screenshot pruning). Error: %s",
+                    effective_model,
+                    e,
+                )
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    await self.coordinator.hooks.emit(
+                        "provider:thinking_binding_retry",
+                        {
+                            "provider": "anthropic",
+                            "model": effective_model,
+                            "error": str(e),
+                        },
+                    )
+                return await self._complete_chat_request(
+                    request, retry_config=retry_config, **kwargs
+                )
+
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
@@ -4965,7 +5646,12 @@ class AnthropicProvider:
         return cleaned
 
     def _convert_messages(
-        self, messages: list[dict[str, Any]], *, emit_warnings: bool = True
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        emit_warnings: bool = True,
+        computer_target_type: str | None = None,
+        preserved_thinking: bool = False,
     ) -> list[dict[str, Any]]:
         """Convert messages to Anthropic format.
 
@@ -5002,14 +5688,63 @@ class AnthropicProvider:
                                 valid_tool_use_ids.add(block["id"])
                             elif block.get("type") == "tool_call" and block.get("id"):
                                 valid_tool_use_ids.add(block["id"])
+                # T5: a preserved-thinking exact-replay snapshot may carry
+                # tool_use ids not otherwise present on this message shape
+                # (e.g. a computer-toolset member call whose legacy
+                # Amplifier-side tool_call id differs from nothing here --
+                # kept for defense-in-depth parity with the scan above).
+                msg_metadata = msg.get("metadata")
+                if isinstance(msg_metadata, dict):
+                    wire_content = msg_metadata.get(
+                        _preserved_thinking.METADATA_KEY, {}
+                    ).get(_preserved_thinking.WIRE_CONTENT_KEY)
+                    if wire_content:
+                        valid_tool_use_ids.update(
+                            _preserved_thinking.tool_use_ids(wire_content)
+                        )
 
         anthropic_messages = []
+        wire_toolset_by_id: dict[str, str] = {}
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            msg_metadata = msg.get("metadata")
+            if not isinstance(msg_metadata, dict):
+                continue
+            wire_content = msg_metadata.get(
+                _preserved_thinking.METADATA_KEY, {}
+            ).get(_preserved_thinking.WIRE_CONTENT_KEY)
+            if not isinstance(wire_content, list):
+                continue
+            for block in wire_content:
+                if (
+                    isinstance(block, Mapping)
+                    and block.get("type") == "tool_use"
+                    and block.get("id")
+                    and block.get("toolset_name")
+                ):
+                    wire_toolset_by_id[str(block["id"])] = str(block["toolset_name"])
         i = 0
 
+        has_floating_messages = False
         while i < len(messages):
             msg = messages[i]
             role = msg.get("role")
             content = msg.get("content", "")
+
+            # T5 [PT]: a LATER system/developer message on a
+            # preserved-thinking + inline-system target arrives pre-tagged
+            # `_floating` by _assemble_request_params. Pass it through
+            # untouched (still tagged) so place_floating_messages can place
+            # it deterministically once the whole conversion is done --
+            # this is NOT the same as the "skip system messages" branch
+            # below, which handles a LEADING system message already
+            # accounted for in the top-level `system` field.
+            if msg.get("_floating") in ("system", "developer"):
+                has_floating_messages = True
+                anthropic_messages.append(dict(msg))
+                i += 1
+                continue
 
             # Skip system messages (handled separately)
             if role == "system":
@@ -5037,13 +5772,14 @@ class AnthropicProvider:
                         i += 1
                         continue
 
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": tool_msg.get("content", ""),
-                        }
-                    )
+                    tool_result = {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_msg.get("content", ""),
+                    }
+                    if tool_use_id in wire_toolset_by_id:
+                        tool_result["toolset_name"] = wire_toolset_by_id[tool_use_id]
+                    tool_results.append(tool_result)
                     i += 1
 
                 # Only add user message if we have valid tool_results
@@ -5059,6 +5795,42 @@ class AnthropicProvider:
                         f"All {skipped_count} consecutive tool_results were orphaned and skipped"
                     )
                 continue  # i already advanced in while loop
+            if role == "assistant" and preserved_thinking:
+                # T5 [PT]: this target's thinking blocks (and the whole
+                # turn) are bound to a fixed conversation prefix -- replay
+                # the exact prior wire content, append-only, instead of the
+                # lossy tool_calls/thinking_block reconstruction below
+                # (which cannot even represent an unknown block type such
+                # as `fallback`, and drops a thinking block whenever text
+                # and tool_calls are both present -- the M68 collapse).
+                msg_metadata = msg.get("metadata")
+                wire_content = None
+                if isinstance(msg_metadata, dict):
+                    wire_content = msg_metadata.get(
+                        _preserved_thinking.METADATA_KEY, {}
+                    ).get(_preserved_thinking.WIRE_CONTENT_KEY)
+                if wire_content and _preserved_thinking.snapshot_matches(wire_content, msg):
+                    anthropic_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": _preserved_thinking.replay_from_snapshot(
+                                wire_content
+                            ),
+                        }
+                    )
+                elif isinstance(content, list):
+                    anthropic_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": _preserved_thinking.replay_from_content(
+                                content, computer_target_type=computer_target_type
+                            ),
+                        }
+                    )
+                else:
+                    anthropic_messages.append({"role": "assistant", "content": content})
+                i += 1
+                continue
             if role == "assistant":
                 # Assistant messages - check for tool calls or thinking blocks
                 if "tool_calls" in msg and msg["tool_calls"]:
@@ -5106,14 +5878,22 @@ class AnthropicProvider:
 
                     # Add tool_use blocks
                     for tc in msg["tool_calls"]:
-                        content_blocks.append(
-                            {
-                                "type": "tool_use",
-                                "id": tc.get("id", ""),
-                                "name": tc.get("tool", ""),
-                                "input": tc.get("arguments", {}),
-                            }
+                        wire_name, wire_input, toolset_name = (
+                            _computer_toolset.to_wire_tool_call(
+                                tc.get("tool", ""),
+                                tc.get("arguments", {}),
+                                target_type=computer_target_type,
+                            )
                         )
+                        wire_block: dict[str, Any] = {
+                            "type": "tool_use",
+                            "id": tc.get("id", ""),
+                            "name": wire_name,
+                            "input": wire_input,
+                        }
+                        if toolset_name:
+                            wire_block["toolset_name"] = toolset_name
+                        content_blocks.append(wire_block)
 
                     anthropic_messages.append(
                         {"role": "assistant", "content": content_blocks}
@@ -5218,6 +5998,10 @@ class AnthropicProvider:
                     anthropic_messages.append({"role": "user", "content": content})
                 i += 1
 
+        if has_floating_messages:
+            anthropic_messages = _preserved_thinking.place_floating_messages(
+                anthropic_messages
+            )
         return anthropic_messages
 
     def _convert_tools_from_request(self, tools: list) -> list[dict[str, Any]]:
@@ -5565,8 +6349,17 @@ class AnthropicProvider:
             # are not permitted``), because ``_stamp_last_block`` would mark
             # that trailing thinking block. Walk past it too, to a message
             # whose last block can legally carry a cache breakpoint.
+            # T5 [PT]: a later inline `role: "system"` message (Opus 5.5+
+            # preserved-thinking append-only placement) must never be the
+            # cache_control anchor -- Anthropic rejects `cache_control` on
+            # role="system" *within* `messages` (distinct from the
+            # top-level `system` field, which already supports it via
+            # `_format_system_with_cache`). Walk past it, same as a split
+            # pair.
+            is_inline_system = msg.get("role") == "system"
             if (
                 not splits_pair
+                and not is_inline_system
                 and not self._stamps_empty_text_block(msg)
                 and not self._stamps_uncacheable_block(msg)
             ):
@@ -6083,7 +6876,17 @@ class AnthropicProvider:
                 }
             ]
 
-    def _convert_to_chat_response(self, response: Any) -> ChatResponse:
+    def _convert_to_chat_response(
+        self,
+        response: Any,
+        *,
+        computer_aliases: Mapping[str, str] | None = None,
+        thinking_display: str | None = None,
+        inference_geo: str | None = None,
+        preserved_thinking: bool = False,
+        emit_diagnostics: bool = False,
+        effective_model: str | None = None,
+    ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
         Args:
@@ -6092,11 +6895,24 @@ class AnthropicProvider:
         Returns:
             AnthropicChatResponse with content blocks and streaming-compatible fields
         """
+        from amplifier_core.message_models import RedactedThinkingBlock
         from amplifier_core.message_models import TextBlock
         from amplifier_core.message_models import ThinkingBlock
         from amplifier_core.message_models import ToolCall
         from amplifier_core.message_models import ToolCallBlock
         from amplifier_core.message_models import Usage
+
+        # [TH]: with thinking.display="updates", Opus 5.5 (or any model with
+        # ModelCapabilities.supports_progress_updates) may emit a non-empty
+        # thinking block *between* tool calls that the caller should be able
+        # to show -- a "progress update" -- as well as one sentinel value
+        # ("This part of the response was interrupted before it finished.")
+        # that is user-visible under every display mode. Every other thinking
+        # block stays internal: it is the model's private reasoning, not
+        # response content, regardless of display mode.
+        _INTERRUPTED_THINKING_TEXT = (
+            "This part of the response was interrupted before it finished."
+        )
 
         content_blocks = []
         tool_calls = []
@@ -6112,24 +6928,51 @@ class AnthropicProvider:
                 text_accumulator.append(block.text)
                 event_blocks.append(TextContent(text=block.text))
             elif block.type == "thinking":
-                content_blocks.append(
-                    ThinkingBlock(
-                        thinking=block.thinking,
-                        signature=getattr(block, "signature", None),
-                        visibility="internal",
-                    )
-                )
+                is_progress_update = (
+                    thinking_display == "updates" and bool(block.thinking)
+                ) or block.thinking == _INTERRUPTED_THINKING_TEXT
+                thinking_block_kwargs: dict[str, Any] = {
+                    "thinking": block.thinking,
+                    "signature": getattr(block, "signature", None),
+                    "visibility": "user" if is_progress_update else "internal",
+                }
+                if is_progress_update:
+                    thinking_block_kwargs["progress_update"] = True
+                content_blocks.append(ThinkingBlock(**thinking_block_kwargs))
                 event_blocks.append(ThinkingContent(text=block.thinking))
                 # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
-            elif block.type == "tool_use":
+            elif block.type == "redacted_thinking":
+                # Anthropic redacted a thinking block's content for safety
+                # reasons (e.g. it may have discussed how to circumvent its
+                # safeguards); `data` is an encrypted opaque payload that must
+                # be replayed byte-exact on any subsequent turn but has no
+                # human-readable text. Previously silently dropped, which lost
+                # a content block the core round-trip contract requires
+                # providers to preserve.
                 content_blocks.append(
-                    ToolCallBlock(id=block.id, name=block.name, input=block.input)
+                    RedactedThinkingBlock(data=block.data, visibility="internal")
+                )
+            elif block.type == "tool_use":
+                # Opus 5.5's computer_toolset_20260801 emits a tool_use per
+                # member action (name = the member, e.g. "left_click",
+                # toolset_name = "computer") instead of the legacy single
+                # name="computer" + input.action shape. Translate back to
+                # the legacy shape so every existing "computer" tool
+                # implementation keeps working unchanged.
+                call_name, call_args = _computer_toolset.to_amplifier_call(
+                    block.name,
+                    block.input,
+                    getattr(block, "toolset_name", None),
+                    computer_aliases or {},
+                )
+                content_blocks.append(
+                    ToolCallBlock(id=block.id, name=call_name, input=call_args)
                 )
                 tool_calls.append(
-                    ToolCall(id=block.id, name=block.name, arguments=block.input)
+                    ToolCall(id=block.id, name=call_name, arguments=call_args)
                 )
                 event_blocks.append(
-                    ToolCallContent(id=block.id, name=block.name, arguments=block.input)
+                    ToolCallContent(id=block.id, name=call_name, arguments=call_args)
                 )
             elif block.type == "web_search_tool_result":
                 # Handle native web search results from Anthropic
@@ -6227,11 +7070,94 @@ class AnthropicProvider:
             cache_creation_5m_input_tokens=cache_creation_5m,
             cache_creation_1h_input_tokens=cache_creation_1h,
             speed=getattr(response.usage, "speed", None),
+            inference_geo=inference_geo,
         )
         usage = usage.model_copy(update={"cost_usd": cost})
         self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
+        if (
+            emit_diagnostics
+            and response.stop_reason == "max_tokens"
+            and not text_accumulator
+            and any(block.type == "thinking" for block in response.content)
+        ):
+            warn_key = ("thinking_max_tokens", effective_model or response.model)
+            if warn_key not in self._opus55_warned_once:
+                self._opus55_warned_once.add(warn_key)
+                logger.warning(
+                    "[PROVIDER] %s stopped at max_tokens before producing answer text; "
+                    "thinking counts toward max_tokens, so raise max_tokens.",
+                    effective_model or response.model,
+                )
+
+        # `stop_details` carries structured detail behind a coarse
+        # `stop_reason` -- notably the refusal `category` (e.g.
+        # "reasoning_extraction", "bio", "cyber"), which this provider's
+        # refusal-fallback ladder (see D9 / _apply_refusal_fallback) reads
+        # back out of this same metadata namespace to decide whether a
+        # refusal is retryable at all. Additive for every model; harmless
+        # when absent.
+        response_metadata: dict[str, Any] = {}
+        stop_details_obj = getattr(response, "stop_details", None)
+        if stop_details_obj is not None:
+            if hasattr(stop_details_obj, "model_dump"):
+                stop_details_dump = stop_details_obj.model_dump(
+                    mode="json", exclude_unset=True
+                )
+            elif isinstance(stop_details_obj, dict):
+                stop_details_dump = stop_details_obj
+            else:
+                stop_details_dump = None
+            if stop_details_dump is not None:
+                response_metadata.setdefault("anthropic", {})["stop_details"] = (
+                    stop_details_dump
+                )
+
+        # T5 preserved thinking (Opus 5.5+) [PT]: the assistant turn's
+        # thinking blocks (and the whole turn) are bound to a fixed
+        # conversation prefix -- replaying a stored turn must reproduce the
+        # exact prior wire content, append-only. Store the exact server
+        # content array here so _convert_messages can replay it byte-exact
+        # on a later request, instead of reconstructing it from the lossy
+        # core content model (which cannot even represent an unknown block
+        # type such as `fallback`).
+        if preserved_thinking:
+            anthropic_meta = response_metadata.setdefault("anthropic", {})
+            anthropic_meta[_preserved_thinking.WIRE_CONTENT_KEY] = (
+                _preserved_thinking.wire_content_snapshot(response.content)
+            )
+            anthropic_meta["response_model"] = response.model
+            if self._thinking_drop_block:
+                anthropic_meta[_preserved_thinking.BINDING_KEY] = "drop_block"
+            transformations = getattr(response, "model_extra", None) or {}
+            items = (
+                transformations.get("input_transformations")
+                if isinstance(transformations, Mapping)
+                else None
+            )
+            if items:
+                anthropic_meta["input_transformations"] = items
+                summary = _preserved_thinking.summarize_transformations(items)
+                if summary is not None:
+                    warn_key = effective_model or response.model
+                    if emit_diagnostics and warn_key not in self._transformations_warned_models:
+                        self._transformations_warned_models.add(warn_key)
+                        logger.warning(
+                            "[PROVIDER] %s: the API dropped/edited %d earlier "
+                            "thinking block(s) it could not replay (reasons: "
+                            "%s) [PT: 'Count the transformations you receive "
+                            "back and alert on them'].",
+                            warn_key,
+                            summary["count"],
+                            summary["reasons"],
+                        )
+                    # The `provider:thinking_blocks_dropped` hook event is
+                    # emitted by the async caller (_complete_chat_request),
+                    # which recomputes this same summary from
+                    # metadata.anthropic.input_transformations -- this
+                    # method is synchronous and must not schedule
+                    # fire-and-forget async work.
 
         return AnthropicChatResponse(
             content=content_blocks,
@@ -6241,6 +7167,7 @@ class AnthropicProvider:
             content_blocks=event_blocks if event_blocks else None,
             text=combined_text or None,
             web_search_results=web_search_results if web_search_results else None,
+            metadata=response_metadata or None,
         )
 
     async def close(self) -> None:

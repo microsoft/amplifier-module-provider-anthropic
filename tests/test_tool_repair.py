@@ -179,6 +179,16 @@ def test_repaired_tool_ids_are_not_detected_again():
 
     asyncio.run(provider.complete(request_2))
 
+    # The same missing result is repaired again in the request body, but the
+    # already-known gap does not emit another observability event.
+    second_params = provider.client.messages.with_raw_response.create.await_args.kwargs
+    assert any(
+        block.get("type") == "tool_result"
+        and block.get("tool_use_id") == "call_abc123"
+        for message in second_params["messages"]
+        for block in (message["content"] if isinstance(message["content"], list) else [])
+    )
+
     # Should NOT emit another repair event for the same tool ID
     repair_events_2 = [
         e
@@ -326,6 +336,14 @@ def test_streaming_repaired_tool_ids_are_not_detected_again():
     request_2 = ChatRequest(messages=messages_2)
 
     asyncio.run(provider.complete(request_2))
+
+    second_params = provider.client.messages.stream.call_args.kwargs
+    assert any(
+        block.get("type") == "tool_result"
+        and block.get("tool_use_id") == "call_stream_123"
+        for message in second_params["messages"]
+        for block in (message["content"] if isinstance(message["content"], list) else [])
+    )
 
     # Should NOT emit another repair event for the same tool ID
     repair_events_2 = [

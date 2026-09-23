@@ -139,6 +139,32 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_write_per_m": Decimal("6.25"),
     },
     # ------------------------------------------------------------------
+    # Claude Opus 5.5  ($4 / $20 / $0.20 / $5.00)
+    # Launched 2026-09-22; Anthropic's new recommended default model
+    # ("start with Claude Opus 5.5 for most workloads"). Opus 5 above is
+    # not deprecated (status: Active (legacy)) so its row is left as-is.
+    # Input/output dropped from Opus 5's $5/$25 to $4/$20.
+    # cache_read is NOT the usual 10% of input on this model: Anthropic's
+    # pricing docs carry an explicit footnote that Opus 5.5 cache hits and
+    # refreshes are priced at 0.05x input ($0.20/MTok) -- every other model
+    # in this table uses the standard 0.1x multiplier. cache_write (5m TTL)
+    # is the standard 1.25x ($5.00/MTok); the 1h TTL rate ($8.00/MTok = 2x
+    # input, also confirmed published) needs no separate table entry --
+    # compute_cost() already derives 1h writes as 2x input_per_m for every
+    # model.
+    # Fast mode: supported at the standard 2x multiplier (see
+    # _FAST_ELIGIBLE_MODELS below).
+    # Source: platform.claude.com/docs/en/about-claude/pricing and
+    #         platform.claude.com/docs/en/models/opus-5-5/overview
+    #         (verified live 2026-09-22, launch day)
+    # ------------------------------------------------------------------
+    "claude-opus-5-5": {
+        "input_per_m": Decimal("4.00"),
+        "output_per_m": Decimal("20.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("5.00"),
+    },
+    # ------------------------------------------------------------------
     # Claude Fable 5  ($10 / $50 / $1.00 / $12.50)
     # Exactly 2x Opus 4.8 on every rate -- true of Fable 5 ITSELF, not of
     # the fable family: Fable 5.1 below breaks it on cache reads.
@@ -226,6 +252,7 @@ _FAST_ELIGIBLE_MODELS: set[str] = {
     "claude-opus-4-7",
     "claude-opus-4-8",
     "claude-opus-5",
+    "claude-opus-5-5",
 }
 
 
@@ -244,6 +271,7 @@ def compute_cost(
     cache_creation_5m_input_tokens: int | None = None,
     cache_creation_1h_input_tokens: int | None = None,
     speed: str | None = None,
+    inference_geo: str | None = None,
 ) -> Decimal | None:
     """Return the USD cost for an Anthropic API call as a :class:`~decimal.Decimal`.
 
@@ -283,6 +311,12 @@ def compute_cost(
     speed:
         When ``'fast'`` AND *model* is in :data:`_FAST_ELIGIBLE_MODELS` a 2x
         multiplier is applied; any other value leaves cost unchanged.
+    inference_geo:
+        Data-residency pricing region, e.g. ``"us"`` for the guaranteed-US
+        inference option (Anthropic pricing: "Data residency pricing" -- a
+        1.1x multiplier on top of standard/fast-mode pricing). Any other
+        value (including ``None``, the global default) leaves cost
+        unchanged. Stacks multiplicatively with the fast-mode 2x multiplier.
 
     Returns
     -------
@@ -349,5 +383,8 @@ def compute_cost(
 
     if speed == "fast" and model in _FAST_ELIGIBLE_MODELS:
         cost *= 2
+
+    if inference_geo == "us":
+        cost *= Decimal("1.1")
 
     return cost

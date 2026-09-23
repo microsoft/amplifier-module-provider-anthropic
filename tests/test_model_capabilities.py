@@ -453,6 +453,109 @@ class TestThinkingAlwaysOn:
         assert caps_48.min_cacheable_tokens == 1024
         assert dataclasses.replace(caps_5, min_cacheable_tokens=1024) == caps_48
 
+    def test_opus_55_capabilities_differ_from_opus_5_only_in_documented_fields(self):
+        """claude-opus-5-5 (launched 2026-09-22) shares Opus 5's base matrix
+        (context/output/effort/cache/sampling gates -- all '>=' thresholds
+        Opus 5.5 also satisfies) but Anthropic's announcement and "What's
+        new" migration page document four breaking changes from Opus 5 that
+        this provider must model as separate capability flags, NOT as an
+        identical matrix (the previous version of this test asserted
+        `caps_55 == caps_5`, which was wrong -- see corrected disposition in
+        the takeover PR body / evidence report):
+
+        1. thinking can never be disabled (thinking_disableable)
+        2. forced tool_choice any/tool -> HTTP 400 (supports_forced_tool_choice)
+        3. thinking blocks are bound to a fixed conversation prefix
+           (preserved_thinking)
+        4. computer_20251124 is rejected; computer_toolset_20260801 replaces it,
+           and the effective wire type is resolved per-platform at request
+           time rather than fixed (computer_use_tool_type,
+           computer_use_platform_aware)
+
+        Plus one additive-only beta capability: thinking.display="updates"
+        progress updates (supports_progress_updates).
+        """
+        caps_5 = AnthropicProvider._get_capabilities("claude-opus-5")
+        caps_55 = AnthropicProvider._get_capabilities("claude-opus-5-5")
+
+        # Explicit, exhaustive diff: replacing exactly these fields on caps_55
+        # with Opus 5's values must reproduce caps_5 -- any other difference
+        # (or the absence of one of these) fails this assertion loudly.
+        assert (
+            dataclasses.replace(
+                caps_55,
+                computer_use_tool_type="computer_20251124",
+                computer_use_platform_aware=False,
+                supports_forced_tool_choice=True,
+                thinking_disableable=True,
+                preserved_thinking=False,
+                supports_progress_updates=False,
+            )
+            == caps_5
+        )
+
+    def test_opus_55_capabilities_per_field(self):
+        """Direct per-field assertions for claude-opus-5-5, independent of the
+        diff-against-5 comparison above."""
+        caps_55 = AnthropicProvider._get_capabilities("claude-opus-5-5")
+
+        assert caps_55.family == "opus"
+        assert caps_55.max_output_tokens == 128000
+        assert caps_55.supports_1m is True
+        assert caps_55.min_cacheable_tokens == 512
+        assert caps_55.supported_efforts == ("low", "medium", "high", "xhigh", "max")
+        assert caps_55.supports_sampling is False
+        assert caps_55.supports_speed is True
+        assert caps_55.supports_inline_system is True
+        assert caps_55.computer_use_tool_type == "computer_toolset_20260801"
+        assert caps_55.computer_use_platform_aware is True
+        assert caps_55.supports_native_computer_use is True
+        assert caps_55.supports_forced_tool_choice is False
+        assert caps_55.thinking_disableable is False
+        assert caps_55.preserved_thinking is True
+        assert caps_55.supports_progress_updates is True
+        # thinking_always_on means something different in this codebase --
+        # "never send a thinking param at all" -- which is wrong for Opus 5.5
+        # (adaptive thinking must always be sent). See the field's docstring.
+        assert caps_55.thinking_always_on is False
+
+    def test_opus_5_capabilities_unchanged_by_the_55_gate(self):
+        """Regression guard: adding the is_55_plus gate must not change any
+        claude-opus-5 (5, 0) value."""
+        caps_5 = AnthropicProvider._get_capabilities("claude-opus-5")
+
+        assert caps_5.computer_use_tool_type == "computer_20251124"
+        assert caps_5.computer_use_platform_aware is False
+        assert caps_5.supports_forced_tool_choice is True
+        assert caps_5.thinking_disableable is True
+        assert caps_5.preserved_thinking is False
+        assert caps_5.supports_progress_updates is False
+
+    def test_opus_55_version_detected(self):
+        assert AnthropicProvider._detect_version("claude-opus-5-5", "opus") == (5, 5)
+
+    def test_every_capability_field_survives_runtime_override(self):
+        """Guard against the regression class documented at
+        _apply_runtime_capability_overrides: a field the overlay forgets to
+        forward silently resets to the dataclass default instead of the
+        model's real static value. Loop over every field so a future field
+        addition that forgets to forward it fails this test immediately."""
+        base = AnthropicProvider._get_capabilities("claude-opus-5-5")
+        runtime_info = _RuntimeModelInfo(max_input_tokens=1_000_000)
+        overridden = AnthropicProvider._apply_runtime_capability_overrides(
+            base, runtime_info
+        )
+
+        for f in dataclasses.fields(ModelCapabilities):
+            # base_context_window/supports_1m are the fields this override is
+            # explicitly meant to change from runtime_info; every other field
+            # must survive unchanged.
+            if f.name in ("base_context_window", "supports_1m"):
+                continue
+            assert getattr(overridden, f.name) == getattr(base, f.name), (
+                f"field {f.name!r} did not survive _apply_runtime_capability_overrides"
+            )
+
 
 class TestGetCapabilitiesFable5:
     """Fable 5 capability matrix."""

@@ -30,7 +30,8 @@ Provides access to Anthropic's Claude models (Claude 4 series: Sonnet, Opus, Hai
 ## Supported Models
 
 - `claude-sonnet-5` - Claude Sonnet 5 (recommended, default)
-- `claude-opus-5` - Claude Opus 5 (most capable)
+- `claude-opus-5-5` - Claude Opus 5.5 (most capable; fixed model ID, no alias; see "Claude Opus 5.5" below)
+- `claude-opus-5` - Claude Opus 5
 - `claude-haiku-4-5` - Claude Haiku 4.5 (fastest, cheapest)
 
 ## Configuration
@@ -147,6 +148,77 @@ the value actually sent, and why. That happens when:
 
 A non-integer value is ignored with a warning and the resolved default is used --
 a typo does not raise out of every request.
+
+### Claude Opus 5.5
+
+`claude-opus-5-5` is a fixed model ID with a 1M-token context window, 128K
+maximum output, and a 512-token minimum cacheable prefix. Standard pricing is
+$4/M input and $20/M output; cache reads are $0.20/M. Fast mode is $8/$40,
+and `inference_geo: us` adds the documented 1.1x data-residency multiplier.
+
+Opus 5.5 differs from Opus 5 in several request contracts:
+
+- Thinking is always on. The provider always sends adaptive thinking with
+  `thinking_display: summarized` unless configured otherwise. The server's
+  default effort is `medium`; set `reasoning_effort` explicitly when that
+  matters. `extended_thinking: false` cannot disable thinking and logs a
+  warning -- it also does **not** suppress an explicit resolved
+  `reasoning_effort` (from a request or from provider config):
+  `output_config.effort` is still sent alongside the always-on adaptive
+  thinking. Thinking consumes `max_tokens`.
+- `thinking_display: updates` opts into user-visible progress blocks. The
+  provider adds `thinking-display-updates-2026-08-18` automatically and tags
+  progress blocks/deltas with `visibility="user"` / `progress_update`.
+- Forced `tool_choice` (`required`, `any`, or a named tool) is unsupported by
+  Anthropic on this model -- confirmed for both the Messages and
+  `count_tokens` endpoints. The provider raises a local `InvalidRequestError`
+  before any HTTP request rather than sending a request Anthropic guarantees
+  will 400; both the Messages path and `request_budget`/`count_tokens` share
+  the same request assembly, so they reject identically. Use
+  `tool_choice: auto` together with strict tool schemas and prompt wording
+  that tells the model when to use the tool, or `tool_choice: none` to
+  disable tools for the call. `extra_request_params` is a deliberate
+  user-wins escape hatch and can still bypass this safety gate.
+- The computer-use wire type Opus 5.5 accepts depends on the serving
+  platform, inferred from `base_url` (or `ANTHROPIC_BASE_URL` when
+  `base_url` is unset): the first-party Anthropic/Claude API and Google
+  Cloud/Vertex AI accept only `computer_toolset_20260801`; Amazon Bedrock
+  (`bedrock-runtime.*`/`bedrock-mantle.*`) still accepts the legacy
+  `computer_20251124` type with its beta header; Microsoft Foundry,
+  "Claude Platform on AWS" (a separate AWS offering, not Bedrock), and any
+  other/unknown endpoint are undocumented and treated as unsupported. Legacy
+  `computer_20251124` declarations are translated to
+  `computer_toolset_20260801` wherever the toolset is the resolved type,
+  without the obsolete computer-use beta header. Declaring a
+  native computer tool on an unsupported platform raises a local
+  `InvalidRequestError` before dispatch rather than a deterministic 400. Set
+  `computer_use_tool_type` explicitly to override the platform's resolved
+  default (for example, a gateway fronting a different backend); an explicit
+  override always wins. Member calls are translated back to the existing
+  Amplifier `computer` tool's `action` argument. Parallel member calls are
+  disabled by default; set `computer_batch_actions: true` only when the tool
+  executes batches in order and stops after failure. Tools remain
+  responsible for `key.repeat` and screenshot resizing. Earlier Opus/Sonnet/
+  Haiku generations are unaffected by platform -- they keep their single,
+  version-gated wire type.
+- Thinking blocks are conversation-bound and must be replayed byte-exact in an
+  append-only prefix. The provider stores and replays the exact wire content,
+  preserves `input_transformations`, and adds
+  `thinking-binding-controls-2026-08-01`. On a prefix mismatch it retries once
+  with `drop_block`, records that choice for resumed history, logs a warning,
+  and emits `provider:thinking_binding_retry`; dropped blocks emit
+  `provider:thinking_blocks_dropped`. Set
+  `thinking_prefix_mismatch_behavior: error` to disable recovery. Context
+  compaction, screenshot pruning, volatile system prompts, and request-only
+  tail injections are prefix edits. Disable tools with `tool_choice: none`
+  rather than removing declarations from an existing conversation.
+- Structured `stop_details` is preserved in response metadata.
+  `reasoning_extraction` refusals are not retried by the client fallback ladder.
+  Server-side `fallbacks` passed through `extra_request_params` are exclusive
+  with that client ladder.
+
+Existing Opus 5 and earlier request shapes remain unchanged. Anthropic SDK
+1.0.0 already supports these wire shapes, so no SDK floor bump is required.
 
 ### Debug / Raw Payload Capture
 
@@ -412,6 +484,10 @@ third state in the config wizard, separate from an explicit opt-out.
 
 Anthropic provides experimental features through beta headers. Enable these features by adding the `beta_headers` configuration field.
 
+The provider derives `thinking-display-updates-2026-08-18` and
+`thinking-binding-controls-2026-08-01` automatically when their payloads need
+them. Opus 5.5 computer toolsets require no computer-use beta header.
+
 ### Configuration
 
 **Single beta header:**
@@ -437,7 +513,7 @@ providers:
 ### 1M Token Context Window
 
 1M context is **generally available, on by default, and billed at standard
-pricing** on every model that has it (Opus 5/4.8/4.7/4.6, Sonnet 5/4.6, Fable
+pricing** on every model that has it (Opus 5.5/5/4.8/4.7/4.6, Sonnet 5/4.6, Fable
 5/5.1, Mythos 5/Preview). No beta header is required, and there is no
 long-context price premium
 ([Anthropic: Context windows](https://platform.claude.com/en/docs/build-with-claude/context-windows),
@@ -471,6 +547,11 @@ House-style key reference. ✅ = wizard-visible ConfigField, ⚙️ = settings-o
 | `thinking_budget_tokens` | *(model default)* | ⚙️ | Explicit `thinking.budget_tokens`. Outranks the effort-implied budget; warns if it can't reach the wire |
 | `thinking_budget_buffer` | `8192` | ⚙️ | Headroom added to the budget when sizing `max_tokens` |
 | `thinking_type` | `adaptive` | ⚙️ | `adaptive`\|`enabled`. `adaptive` lets the model manage its own budget (and forbids `budget_tokens`); falls back to `enabled` on models without adaptive support |
+| `thinking_display` | `summarized` | ⚙️ | Thinking display mode. Opus 5.5 also supports beta `updates` progress blocks |
+| `thinking_prefix_mismatch_behavior` | *(automatic)* | ⚙️ | `error`\|`drop_block`. Default retries one prefix mismatch with `drop_block` and preserves that choice |
+| `computer_use_tool_type` | *(platform default)* | ⚙️ | Override the resolved computer wire type for gateways; Opus 5.5 resolves it from `base_url`'s platform (see "Claude Opus 5.5") |
+| `computer_batch_actions` | `false` | ⚙️ | Allow parallel computer-toolset member calls; enable only for ordered, fail-fast executors |
+| `inference_geo` | *(global)* | ⚙️ | `us` requests guaranteed-US inference and applies the 1.1x cost multiplier |
 | `enable_1m_context` | `false` | ✅ | Advertise the 1M context window (more history kept = higher cost) |
 | `cache_stable_region_ttl_1h` | *(unset)* | ✅ | 1h cache TTL for system prompt + tools. 2x write cost, fewer writes |
 | `enable_prompt_caching` | `true` | ⚙️ | Place cache breakpoints |
