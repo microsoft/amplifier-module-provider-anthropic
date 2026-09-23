@@ -138,6 +138,14 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("0.50"),
         "cache_write_per_m": Decimal("6.25"),
     },
+    # Claude Opus 5.5 ($4 / $20 / $0.20 / $5); a one-hour cache write is
+    # derived by compute_cost() as 2x input ($8/MTok).
+    "claude-opus-5-5": {
+        "input_per_m": Decimal("4.00"),
+        "output_per_m": Decimal("20.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("5.00"),
+    },
     # ------------------------------------------------------------------
     # Claude Fable 5  ($10 / $50 / $1.00 / $12.50)
     # Exactly 2x Opus 4.8 on every rate -- true of Fable 5 ITSELF, not of
@@ -226,6 +234,7 @@ _FAST_ELIGIBLE_MODELS: set[str] = {
     "claude-opus-4-7",
     "claude-opus-4-8",
     "claude-opus-5",
+    "claude-opus-5-5",
 }
 
 
