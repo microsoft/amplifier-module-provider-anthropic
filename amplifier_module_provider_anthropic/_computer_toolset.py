@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 
@@ -101,13 +101,14 @@ def translate_tools(
     tools: list[Any],
     *,
     model: str,
-    base_url: str | None,
+    base_url: str | None | Callable[[], str | None],
 ) -> tuple[list[Any], NativeComputerAdapter | None]:
     """Translate the one supported native computer declaration for Opus 5.5.
 
     Ordinary function tools and unrelated native tools are returned untouched.
     Non-first-party endpoints fail loudly instead of pretending they implement
-    Anthropic's vendor-native toolset.
+    Anthropic's vendor-native toolset. A callable resolves the endpoint only
+    after a native declaration is found.
     """
     if not is_opus_55(model):
         return list(tools), None
@@ -126,6 +127,8 @@ def translate_tools(
         if not _native_computer_type(tool):
             converted.append(raw_tool)
             continue
+        if callable(base_url):
+            base_url = base_url()
         if not is_first_party_base_url(base_url):
             raise ComputerToolsetError(
                 "Native computer-toolset declarations require Anthropic's first-party "
@@ -202,13 +205,54 @@ def native_wire_tool_use(
     block: dict[str, Any], adapter: NativeComputerAdapter | None
 ) -> dict[str, Any] | None:
     """Return an exact native wire block when persisted provenance authorizes it."""
+    has_toolset_provenance = PROVENANCE_TOOLSET in block
+    has_member_provenance = PROVENANCE_MEMBER in block
+    if has_toolset_provenance or has_member_provenance:
+        if not (has_toolset_provenance and has_member_provenance):
+            raise ComputerToolsetError(
+                "Native computer history has incomplete persisted provenance."
+            )
+        toolset_name = block[PROVENANCE_TOOLSET]
+        action = block[PROVENANCE_MEMBER]
+        if not isinstance(toolset_name, str) or not isinstance(action, str) or not action:
+            raise ComputerToolsetError(
+                "Native computer history has invalid persisted provenance."
+            )
+        if toolset_name != COMPUTER_TOOLSET_NAME:
+            raise ComputerToolsetError(
+                "Native computer history provenance does not match the native toolset."
+            )
+        if "type" in block and block["type"] not in {"tool_call", "tool_use"}:
+            raise ComputerToolsetError(
+                "Native computer history provenance belongs to an invalid block type."
+            )
+        source_input = block.get("input", block.get("arguments", {}))
+        if not isinstance(source_input, dict):
+            raise ComputerToolsetError("Native computer history has a non-mapping input.")
+        if source_input.get("action") != action:
+            raise ComputerToolsetError(
+                "Native computer history action does not match persisted provenance."
+            )
+        if adapter is not None and toolset_name != adapter.toolset_name:
+            raise ComputerToolsetError(
+                "Native computer history provenance does not match the current toolset."
+            )
+        if adapter is not None:
+            current_alias = block.get("name", block.get("tool"))
+            if current_alias != adapter.alias:
+                raise ComputerToolsetError(
+                    "Native computer history alias does not match persisted provenance."
+                )
+        tagged = True
+    else:
+        tagged = False
     if adapter is None:
         return None
-    tagged = block.get(PROVENANCE_TOOLSET) == adapter.toolset_name
     if not tagged and block.get("type") not in {"tool_call", "tool_use"}:
         return None
     legacy_matching_alias = (
-        PROVENANCE_TOOLSET not in block and block.get("name", block.get("tool")) == adapter.alias
+        not has_toolset_provenance
+        and block.get("name", block.get("tool")) == adapter.alias
     )
     if not (tagged or legacy_matching_alias):
         return None
@@ -217,16 +261,7 @@ def native_wire_tool_use(
         raise ComputerToolsetError("Native computer history has a non-mapping input.")
     current_action = source_input.get("action")
     if tagged:
-        current_alias = block.get("name", block.get("tool"))
-        if current_alias != adapter.alias:
-            raise ComputerToolsetError(
-                "Native computer history alias does not match the current declared alias."
-            )
         action = block.get(PROVENANCE_MEMBER)
-        if current_action != action:
-            raise ComputerToolsetError(
-                "Native computer history action does not match persisted provenance."
-            )
     else:
         action = current_action
     if not isinstance(action, str) or not action:

@@ -1534,6 +1534,10 @@ class AnthropicProvider:
             )
         return self._client
 
+    def _effective_base_url(self) -> str:
+        """Return the SDK-resolved endpoint without making an API request."""
+        return str(self.client.base_url)
+
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
         return ProviderInfo(
@@ -3557,7 +3561,7 @@ class AnthropicProvider:
             request_tools, native_computer_adapter = translate_tools(
                 request.tools or [],
                 model=effective_model,
-                base_url=self._base_url,
+                base_url=self._effective_base_url,
             )
         except ComputerToolsetError as exc:
             raise KernelInvalidRequestError(

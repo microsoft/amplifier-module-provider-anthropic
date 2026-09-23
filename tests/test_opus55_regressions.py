@@ -253,6 +253,69 @@ def test_opus55_rejects_native_computer_at_custom_endpoint() -> None:
         )
 
 
+def test_opus55_rejects_native_computer_at_environment_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.example.test")
+    provider = _provider()
+
+    assert provider._base_url is None
+    assert str(provider.client.base_url) == "https://gateway.example.test"
+    with pytest.raises(KernelInvalidRequestError, match="first-party"):
+        provider._assemble_request_params(
+            _request(tools=[_native_computer()]),
+            request_options={"model": MODEL},
+            request_caps=provider._get_capabilities(MODEL),
+        )
+
+
+def test_opus55_accepts_native_computer_at_sdk_default_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    provider = _provider()
+
+    assert str(provider.client.base_url) == "https://api.anthropic.com"
+    assembly = provider._assemble_request_params(
+        _request(tools=[_native_computer()]),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    )
+
+    assert assembly is not None
+    assert assembly.params["tools"][0]["type"] == "computer_toolset_20260801"
+
+
+def test_opus55_configured_first_party_endpoint_overrides_environment_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.example.test")
+    provider = _provider(base_url="https://api.anthropic.com")
+
+    assert provider._base_url == "https://api.anthropic.com"
+    assert str(provider.client.base_url) == "https://api.anthropic.com"
+    assembly = provider._assemble_request_params(
+        _request(tools=[_native_computer()]),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    )
+
+    assert assembly is not None
+    assert assembly.params["tools"][0]["type"] == "computer_toolset_20260801"
+
+
+@pytest.mark.parametrize("base_url", ["   ", "http://localhost:8080"])
+def test_opus55_rejects_native_computer_at_invalid_or_local_endpoint(base_url: str) -> None:
+    provider = _provider(base_url=base_url)
+
+    with pytest.raises(KernelInvalidRequestError, match="first-party"):
+        provider._assemble_request_params(
+            _request(tools=[_native_computer()]),
+            request_options={"model": MODEL},
+            request_caps=provider._get_capabilities(MODEL),
+        )
+
+
 def test_opus55_keeps_plain_function_named_computer() -> None:
     params = _assemble(_request(tools=[_function_tool("computer")]))
     assert params["tools"][0]["name"] == "computer"
@@ -528,6 +591,69 @@ def test_opus55_replay_of_matching_tagged_json_still_works_without_mutation() ->
         }
     ]
     assert persisted == original
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        {
+            "_anthropic_computer_toolset_name": "wrong_toolset",
+            "_anthropic_computer_member_name": "left_click",
+        },
+        {"_anthropic_computer_member_name": "left_click"},
+        {"_anthropic_computer_toolset_name": "computer"},
+        {
+            "_anthropic_computer_toolset_name": 1,
+            "_anthropic_computer_member_name": "left_click",
+        },
+        {
+            "_anthropic_computer_toolset_name": "computer",
+            "_anthropic_computer_member_name": "left_click",
+            "_block_type": "text",
+        },
+    ],
+)
+def test_opus55_replay_rejects_incomplete_or_inconsistent_provenance(
+    provenance: dict[str, Any],
+) -> None:
+    provider = _provider()
+    block_type = provenance.get("_block_type", "tool_call")
+    persisted_provenance = {
+        key: value for key, value in provenance.items() if key != "_block_type"
+    }
+    block = {
+        "type": block_type,
+        "id": "toolu_native",
+        "name": "desktop",
+        "input": {"action": "left_click", "x": 10},
+        **persisted_provenance,
+    }
+    adapter = provider._assemble_request_params(
+        _request(tools=[_native_computer(name="desktop")]),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    ).native_computer_adapter
+
+    with pytest.raises(KernelInvalidRequestError, match="provenance"):
+        provider._convert_messages(
+            [{"role": "assistant", "content": [block]}],
+            native_computer_adapter=adapter,
+        )
+
+
+def test_opus55_fallback_rejects_inconsistent_native_provenance() -> None:
+    provider = _provider(model=PREVIOUS_OPUS_MODEL)
+    block = {
+        "type": "tool_call",
+        "id": "toolu_native",
+        "name": "desktop",
+        "input": {"action": "left_click", "x": 10},
+        "_anthropic_computer_toolset_name": "wrong_toolset",
+        "_anthropic_computer_member_name": "left_click",
+    }
+
+    with pytest.raises(KernelInvalidRequestError, match="provenance"):
+        provider._convert_messages([{"role": "assistant", "content": [block]}])
 
 
 def test_opus55_real_sdk_mock_transport_serializes_native_toolset() -> None:
