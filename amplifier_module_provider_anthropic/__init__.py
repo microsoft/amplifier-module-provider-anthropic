@@ -669,7 +669,7 @@ class ModelCapabilities:
         False  # True = thinking is always active; NEVER send thinking:{type:disabled}
     )
     requires_adaptive_thinking: bool = (
-        False  # True = the model always requires thinking:{type:adaptive}, even for an opt-out
+        False  # True = provider deliberately sends accepted thinking:{type:adaptive}, even for an opt-out
     )
     supports_forced_tool_choice: bool = (
         True  # False = only portable auto/none tool choice is supported
@@ -2061,9 +2061,9 @@ class AnthropicProvider:
                 default_thinking_budget=64000 if is_46_plus else 32000,
                 # Opus 5.5 is a distinct API contract: thinking remains
                 # mandatory and adaptive, so `extended_thinking: false` cannot
-                # disable it.  Unlike Fable/Mythos it still requires the
-                # adaptive thinking parameter, hence this is intentionally not
-                # `thinking_always_on`.
+                # disable it.  Unlike Fable/Mythos the provider deliberately
+                # sends the accepted adaptive-thinking form, hence this is
+                # intentionally not `thinking_always_on`.
                 requires_adaptive_thinking=is_55,
                 supports_forced_tool_choice=not is_55,
                 supports_native_computer_use=computer_use_tool_type is not None,
@@ -3791,8 +3791,9 @@ class AnthropicProvider:
                 )
             ) and emit_diagnostics:
                 logger.warning(
-                    "[PROVIDER] claude-opus-5-5 requires adaptive thinking; "
-                    "extended_thinking=false cannot disable model thinking."
+                    "[PROVIDER] %s uses adaptive thinking; "
+                    "extended_thinking=false cannot disable model thinking.",
+                    effective_model,
                 )
             thinking_enabled = True
         if (
@@ -3865,11 +3866,6 @@ class AnthropicProvider:
                         "type": thinking_type,
                         "budget_tokens": budget_tokens,
                     }
-                if request_caps.thinking_display_required:
-                    params["thinking"]["display"] = options.get(
-                        "thinking_display",
-                        self.config.get("thinking_display", "summarized"),
-                    )
                 if request_caps.supports_sampling:
                     params["temperature"] = 1.0
                 target_tokens = min(budget_tokens + buffer_tokens, model_ceiling)
@@ -3890,6 +3886,13 @@ class AnthropicProvider:
                         params["max_tokens"],
                         interleaved_thinking_enabled,
                     )
+            if request_caps.thinking_display_required and isinstance(
+                params.get("thinking"), dict
+            ):
+                params["thinking"]["display"] = options.get(
+                    "thinking_display",
+                    self.config.get("thinking_display", "summarized"),
+                )
 
         # An explicit budget must never be silently ignored.  This shared guard
         # runs for dispatch only; a pure preflight is intentionally log-free.
@@ -3907,7 +3910,7 @@ class AnthropicProvider:
             if sent_budget != requested_budget:
                 if request_caps.requires_adaptive_thinking:
                     reason = (
-                        f"{params['model']} requires adaptive thinking; the API "
+                        f"{effective_model} uses adaptive thinking; the API "
                         "forbids budget_tokens in that mode and this provider "
                         "preserves the configured output ceiling"
                     )
@@ -5105,11 +5108,16 @@ class AnthropicProvider:
         # First pass: collect all valid tool_use_ids from assistant messages
         valid_tool_use_ids: set[str] = set()
         for msg in messages:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg.get("tool_calls", []):
-                    tc_id = tc.get("id") or tc.get("tool_call_id")
-                    if tc_id:
-                        valid_tool_use_ids.add(tc_id)
+            if msg.get("role") == "assistant":
+                legacy_tool_calls = msg.get("tool_calls") or []
+                if isinstance(legacy_tool_calls, list):
+                    for raw_call in legacy_tool_calls:
+                        call = self._content_block_mapping(raw_call)
+                        if call is None:
+                            continue
+                        tool_id = call.get("id") or call.get("tool_call_id")
+                        if isinstance(tool_id, str) and tool_id:
+                            valid_tool_use_ids.add(tool_id)
             # ALSO scan content blocks for tool_use/tool_call entries.
             # On session resume, synthetic tool results are injected by complete() before
             # _convert_messages() runs. If the content blocks contain tool_use IDs that
@@ -5218,14 +5226,27 @@ class AnthropicProvider:
                                 )
                             canonical_tool_ids.add(cleaned["id"])
                             canonical_tools[cleaned["id"]] = cleaned
+                    legacy_thinking = self._content_block_mapping(
+                        msg.get("thinking_block")
+                    )
+                    if (
+                        legacy_thinking is not None
+                        and not any(
+                            block.get("type") in {"thinking", "redacted_thinking"}
+                            for block in content_blocks
+                        )
+                    ):
+                        # Older persisted turns kept their sole thinking block
+                        # separately. It precedes the structured transcript.
+                        content_blocks.insert(
+                            0, self._clean_content_block(legacy_thinking)
+                        )
                 else:
                     legacy_thinking = self._content_block_mapping(
                         msg.get("thinking_block")
                     )
                     if legacy_thinking is not None:
                         content_blocks.append(self._clean_content_block(legacy_thinking))
-                    if content is not None:
-                        content_blocks.append({"type": "text", "text": content})
 
                 legacy_tool_ids: set[str] = set()
                 legacy_tool_calls = msg.get("tool_calls") or []
@@ -5285,6 +5306,15 @@ class AnthropicProvider:
                             "name": tool_name,
                             "input": call.get("input", call.get("arguments", {})),
                         }
+                    )
+
+                if not structured_content and content_blocks and content not in (None, ""):
+                    # Preserve the old scalar-content shape for an ordinary
+                    # assistant turn. When compatibility blocks were rebuilt,
+                    # text belongs after legacy thinking and before tool uses.
+                    legacy_thinking_count = 1 if legacy_thinking is not None else 0
+                    content_blocks.insert(
+                        legacy_thinking_count, {"type": "text", "text": content}
                     )
 
                 if structured_content or content_blocks:
