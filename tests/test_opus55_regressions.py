@@ -627,6 +627,27 @@ def test_pydantic_structured_tool_calls_authorize_tool_results() -> None:
     ]
 
 
+@pytest.mark.parametrize("content", ["visible", [{"type": "text", "text": "visible"}]])
+def test_empty_legacy_thinking_field_does_not_create_empty_block(content: Any) -> None:
+    wire = _provider()._convert_messages(
+        [{"role": "assistant", "content": content, "thinking_block": {}}]
+    )
+    assert wire[0]["content"] in ("visible", [{"type": "text", "text": "visible"}])
+
+
+@pytest.mark.parametrize("content", ["visible", [TextBlock(text="visible")]])
+def test_refusal_strip_clears_legacy_thinking_without_mutating_history(content: Any) -> None:
+    thinking = {"type": "thinking", "thinking": "private", "signature": "original"}
+    request = ChatRequest(
+        messages=[Message(role="assistant", content=content, thinking_block=thinking)]
+    )
+    stripped = AnthropicProvider._strip_thinking_blocks(request)
+    assert "thinking_block" not in stripped.messages[0].model_dump()
+    assert request.messages[0].model_dump()["thinking_block"] == thinking
+    wire = _provider()._convert_messages([stripped.messages[0].model_dump()])
+    assert wire[0]["content"] in ("visible", [{"type": "text", "text": "visible"}])
+
+
 def test_pydantic_legacy_tool_calls_authorize_tool_results() -> None:
     provider = _provider()
     wire = provider._convert_messages(

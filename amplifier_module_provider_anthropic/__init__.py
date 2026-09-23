@@ -2629,13 +2629,18 @@ class AnthropicProvider:
         """
         stripped = request.model_copy(deep=True)
         for message in stripped.messages:
-            if message.role != "assistant" or not isinstance(message.content, list):
+            if message.role != "assistant":
                 continue
-            message.content = [
-                block
-                for block in message.content
-                if getattr(block, "type", None) not in ("thinking", "redacted_thinking")
-            ]
+            # Clear the legacy compatibility field as well, or history
+            # conversion can restore thinking removed from canonical content.
+            if hasattr(message, "thinking_block"):
+                delattr(message, "thinking_block")
+            if isinstance(message.content, list):
+                message.content = [
+                    block
+                    for block in message.content
+                    if getattr(block, "type", None) not in ("thinking", "redacted_thinking")
+                ]
         return stripped
 
     @staticmethod
@@ -5230,7 +5235,7 @@ class AnthropicProvider:
                         msg.get("thinking_block")
                     )
                     if (
-                        legacy_thinking is not None
+                        legacy_thinking
                         and not any(
                             block.get("type") in {"thinking", "redacted_thinking"}
                             for block in content_blocks
@@ -5245,7 +5250,7 @@ class AnthropicProvider:
                     legacy_thinking = self._content_block_mapping(
                         msg.get("thinking_block")
                     )
-                    if legacy_thinking is not None:
+                    if legacy_thinking:
                         content_blocks.append(self._clean_content_block(legacy_thinking))
 
                 legacy_tool_ids: set[str] = set()
@@ -5312,7 +5317,7 @@ class AnthropicProvider:
                     # Preserve the old scalar-content shape for an ordinary
                     # assistant turn. When compatibility blocks were rebuilt,
                     # text belongs after legacy thinking and before tool uses.
-                    legacy_thinking_count = 1 if legacy_thinking is not None else 0
+                    legacy_thinking_count = 1 if legacy_thinking else 0
                     content_blocks.insert(
                         legacy_thinking_count, {"type": "text", "text": content}
                     )
