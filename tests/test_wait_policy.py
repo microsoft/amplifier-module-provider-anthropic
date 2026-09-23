@@ -217,3 +217,18 @@ async def test_actual_sdk_request_disables_hidden_read_deadline(streaming):
         assert "timeout" not in json.loads(seen[0].content)
     finally:
         await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("override", [None, 30])
+async def test_explicit_extra_request_timeout_is_preserved(streaming, override):
+    provider, request, entered, release, _, call = setup_call(
+        streaming, {"extra_request_params": {"timeout": override}}
+    )
+    task = asyncio.create_task(provider.complete(request))
+    await entered.wait()
+    release.set()
+    await task
+    assert "timeout" in call.call_args.kwargs
+    assert call.call_args.kwargs["timeout"] == override

@@ -4159,6 +4159,9 @@ class AnthropicProvider:
                 if isinstance(_metadata, dict) and _metadata.get("stream") is False:
                     _use_streaming = False
 
+                # SDK-only policy stays out of the assembled generation payload.
+                # Explicit transport overrides in extra_request_params win.
+                sdk_params = {"timeout": self._sdk_timeout, **params}
                 if _use_streaming:
                     # ----- Streaming path with per-block event emission --------
                     # We iterate the SDK's event stream rather than calling
@@ -4203,9 +4206,7 @@ class AnthropicProvider:
                     )
                     try:
                         async with asyncio.timeout(self.timeout):
-                            async with self.client.messages.stream(
-                                **params, timeout=self._sdk_timeout
-                            ) as stream:
+                            async with self.client.messages.stream(**sdk_params) as stream:
                                 async for event in stream:
                                     sdk_stream_started = True
                                     etype = type(event).__name__
@@ -4335,9 +4336,7 @@ class AnthropicProvider:
                     # deadlines and its max_tokens-based non-streaming estimate,
                     # including when a client is supplied by the host.
                     raw_response = await asyncio.wait_for(
-                        self.client.messages.with_raw_response.create(
-                            **params, timeout=self._sdk_timeout
-                        ),
+                        self.client.messages.with_raw_response.create(**sdk_params),
                         timeout=self.timeout,
                     )
                     response = await raw_response.parse()
