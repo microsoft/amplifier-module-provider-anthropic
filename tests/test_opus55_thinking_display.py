@@ -175,7 +175,7 @@ class TestOpus55ProgressUpdateVisibility:
         assert thinking_blocks[0].visibility == "internal"
 
     def test_interrupted_sentinel_is_user_visible_even_under_summarized(self):
-        provider = _make_provider(thinking_display="updates")
+        provider = _make_provider(thinking_display="summarized")
         interrupted = "This part of the response was interrupted before it finished."
         response = DummyResponse(
             content=[_thinking_block(interrupted)], model=provider.default_model
@@ -187,6 +187,19 @@ class TestOpus55ProgressUpdateVisibility:
         )
         thinking_blocks = [b for b in result.content if isinstance(b, ThinkingBlock)]
         assert thinking_blocks[0].visibility == "user"
+
+    def test_max_tokens_without_answer_text_warns(self, caplog):
+        provider = _make_provider()
+        response = DummyResponse(
+            content=[_thinking_block("Still reasoning")], model=provider.default_model
+        )
+        response.stop_reason = "max_tokens"
+        _run(
+            provider,
+            ChatRequest(messages=[Message(role="user", content="hi")]),
+            response=response,
+        )
+        assert "thinking counts toward max_tokens" in caplog.text
 
 
 class TestOpus55RedactedThinking:

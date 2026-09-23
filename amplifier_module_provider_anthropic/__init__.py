@@ -68,6 +68,7 @@ from anthropic._exceptions import (
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 from . import _computer_toolset
+from . import _preserved_thinking
 from ._cost import compute_cost
 
 # Params the Messages API still accepts on the wire but the SDK does not expose
@@ -918,11 +919,15 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "thinking_display",
         "task_budget_tokens",
         "speed",
+        "inference_geo",
         # --- deferred: read in _build_web_search_tool ---
         "web_search_max_uses",
         "web_search_user_location",
         # --- deferred: read in _assemble_request_params (Opus 5.5 computer toolset) ---
         "computer_use_tool_type",
+        "computer_batch_actions",
+        # --- deferred: read in _assemble_request_params (Opus 5.5 preserved thinking) ---
+        "thinking_prefix_mismatch_behavior",
     }
 )
 
@@ -1521,6 +1526,18 @@ class AnthropicProvider:
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
         self._add_cost = add_cost or (lambda cost: None)
+
+        # T5 preserved-thinking (Opus 5.5+) state -- see _preserved_thinking.
+        # _thinking_drop_block: this session has switched to
+        # thinking.block_binding.prefix_mismatch_behavior="drop_block" after
+        # a prefix-binding rejection (D8); kept for the rest of the process
+        # lifetime of this provider instance. A NEW instance resumes the
+        # same setting via metadata.anthropic.thinking_binding on stored
+        # assistant messages (see _assemble_request_params), so this does
+        # not need to be persisted separately.
+        self._thinking_drop_block: bool = False
+        self._ephemeral_prefix_warned: bool = False
+        self._transformations_warned_models: set[str] = set()
 
     @property
     def client(self) -> AsyncAnthropic:
@@ -2549,6 +2566,13 @@ class AnthropicProvider:
             headers.append(BETA_HEADER_FAST_MODE)
         if thinking_display == "updates":
             headers.append(BETA_HEADER_THINKING_DISPLAY_UPDATES)
+        if request_caps.preserved_thinking:
+            # [PT]: this header is required to receive `input_transformations`
+            # on the response, and `thinking.block_binding` is rejected
+            # ("Extra inputs are not permitted") without it. Opus 5.5+
+            # always needs it since every request on that model is subject
+            # to the prefix-binding check.
+            headers.append(_preserved_thinking.BETA_HEADER_THINKING_BINDING)
         return self._dedupe_headers(headers)
 
     @staticmethod
@@ -2737,7 +2761,17 @@ class AnthropicProvider:
         """
         stripped = request.model_copy(deep=True)
         for message in stripped.messages:
-            if message.role != "assistant" or not isinstance(message.content, list):
+            if message.role != "assistant":
+                continue
+            # T5 [PT]: stripping the DISPLAYED thinking blocks but leaving a
+            # preserved-thinking exact-replay snapshot in metadata untouched
+            # would bring the just-stripped blocks right back on the very
+            # next preserved-thinking turn (e.g. a Fable refusal falling
+            # back to an Opus 5.5 turn already in history). Strip both.
+            message.metadata = _preserved_thinking.strip_thinking_from_metadata(
+                message.metadata
+            )
+            if not isinstance(message.content, list):
                 continue
             message.content = [
                 block
@@ -3135,8 +3169,18 @@ class AnthropicProvider:
         a corresponding tool result message. Returns missing pairs WITH their
         source message index so they can be inserted in the correct position.
 
-        Excludes tool call IDs that have already been repaired with synthetic
-        results to prevent infinite detection loops.
+        This is deliberately idempotent: an ID already repaired on a prior
+        call is reported again every time its tool_use has no matching
+        result in THIS request's messages -- a preserved-thinking target
+        (Opus 5.5+) replays a stored assistant turn byte-exact, and a
+        synthetic tool_result injected by ``complete()`` is only added to
+        this one request's (mutated in place) ``request.messages``, not
+        persisted back into the caller's message store, so the very next
+        request would again lack the result unless it is re-inserted every
+        time. ``self._repaired_tool_ids`` (see ``complete()``) exists only
+        to suppress the repeated WARNING log / ``provider:tool_sequence_repaired``
+        event for an ID once it is known to be a pre-existing gap, not to
+        exclude it from repair.
 
         Returns:
             List of (msg_index, call_id, tool_name, tool_arguments) tuples for unpaired calls.
@@ -3158,11 +3202,13 @@ class AnthropicProvider:
             ):
                 tool_results.add(msg.tool_call_id)
 
-        # Exclude IDs that have already been repaired to prevent infinite loops
+        # T5: no longer excludes self._repaired_tool_ids -- see the
+        # idempotence note in this method's docstring. That set now only
+        # suppresses the repeated WARNING log / repair event in complete().
         return [
             (msg_idx, call_id, name, args)
             for call_id, (msg_idx, name, args) in tool_calls.items()
-            if call_id not in tool_results and call_id not in self._repaired_tool_ids
+            if call_id not in tool_results
         ]
 
     def _create_synthetic_result(self, call_id: str, tool_name: str) -> Message:
@@ -3203,6 +3249,16 @@ class AnthropicProvider:
         a different model.
         """
         if getattr(response, "finish_reason", None) != "refusal":
+            return response
+        if "fallbacks" in self.extra_request_params:
+            # Anthropic requires applications to choose either server-side
+            # fallback or a client retry ladder, never both. A server-side
+            # fallback response already carries the model/cost attribution of
+            # the model that actually answered, so do not issue another call.
+            logger.info(
+                "[PROVIDER] Server-side fallbacks are configured; skipping the "
+                "client refusal fallback ladder"
+            )
             return response
 
         stop_details = (
@@ -3257,11 +3313,22 @@ class AnthropicProvider:
         missing = self._find_missing_tool_results(request.messages)
 
         if missing:
-            logger.warning(
-                f"[PROVIDER] Anthropic: Detected {len(missing)} missing tool result(s). "
-                f"Injecting synthetic errors. This indicates a bug in context management. "
-                f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
-            )
+            # T5: repair is now idempotent (see _find_missing_tool_results'
+            # docstring) -- the SAME id can legitimately reappear on every
+            # call for a preserved-thinking target, since the synthetic
+            # result is never persisted back into the caller's message
+            # store. Only a genuinely NEW id is worth a WARNING / event;
+            # logging/emitting every request for an already-known gap would
+            # be noise, not a bug report.
+            new_ids = [
+                call_id for _, call_id, _, _ in missing if call_id not in self._repaired_tool_ids
+            ]
+            if new_ids:
+                logger.warning(
+                    f"[PROVIDER] Anthropic: Detected {len(missing)} missing tool result(s). "
+                    f"Injecting synthetic errors. This indicates a bug in context management. "
+                    f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
+                )
 
             # Group missing results by source assistant message index
             # We need to insert synthetic results IMMEDIATELY after each assistant message
@@ -3278,7 +3345,7 @@ class AnthropicProvider:
                 synthetics = []
                 for call_id, tool_name in by_msg_idx[msg_idx]:
                     synthetics.append(self._create_synthetic_result(call_id, tool_name))
-                    # Track this ID so we don't detect it as missing again in future iterations
+                    # Track this ID so a REPEAT detection doesn't re-log/re-emit.
                     self._repaired_tool_ids.add(call_id)
 
                 # Insert all synthetic results immediately after the assistant message
@@ -3286,16 +3353,17 @@ class AnthropicProvider:
                 for i, synthetic in enumerate(synthetics):
                     request.messages.insert(insert_pos + i, synthetic)
 
-            # Emit observability event
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
+            # Emit observability event -- only for newly-discovered ids.
+            if new_ids and self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     "provider:tool_sequence_repaired",
                     {
                         "provider": self.name,
-                        "repair_count": len(missing),
+                        "repair_count": len(new_ids),
                         "repairs": [
                             {"tool_call_id": call_id, "tool_name": tool_name}
                             for _, call_id, tool_name, _ in missing
+                            if call_id in new_ids
                         ],
                     },
                 )
@@ -3696,15 +3764,73 @@ class AnthropicProvider:
                     config_computer_type,
                     _computer_toolset.TOOLSET_TYPE,
                 )
-        system_msgs = [message for message in request.messages if message.role == "system"]
-        developer_msgs = [message for message in request.messages if message.role == "developer"]
+        # T5 [PT: "Leave a role: \"system\" message where the caller put
+        # it"]: on a preserved-thinking target, only the LEADING run of
+        # system/developer messages (before the first user/assistant/tool
+        # message) gets today's treatment -- joined into the top-level
+        # `system` field, or hoisted to the front as context_file user
+        # messages. A LATER system/developer message is instead placed
+        # inline, append-only, at (a deterministic approximation of) its
+        # original position -- rebuilding the top-level `system` field or
+        # hoisting it to the front on every request would edit an already
+        # -sent prefix and trigger the prefix-binding check. Every other
+        # model keeps the exact prior behavior (every system/developer
+        # message, wherever it appears, is collected and hoisted).
+        use_inline_later_messages = (
+            request_caps.preserved_thinking and request_caps.supports_inline_system
+        )
+        if use_inline_later_messages:
+            first_conv_idx = next(
+                (
+                    idx
+                    for idx, message in enumerate(request.messages)
+                    if message.role in ("user", "assistant", "tool")
+                ),
+                len(request.messages),
+            )
+            leading_msgs = request.messages[:first_conv_idx]
+            rest_msgs = request.messages[first_conv_idx:]
+        else:
+            leading_msgs = request.messages
+            rest_msgs = []
+        system_msgs = [message for message in leading_msgs if message.role == "system"]
+        developer_msgs = [message for message in leading_msgs if message.role == "developer"]
         conversation = [
             message
-            for message in request.messages
+            for message in (leading_msgs if not use_inline_later_messages else rest_msgs)
             if message.role in ("user", "assistant", "tool")
         ]
         unstable_suffix_len, has_ephemeral_signal = self._unstable_suffix_length(conversation)
         system_blocks = self._format_system_with_cache(system_msgs)
+        if use_inline_later_messages:
+            converted_input: list[dict[str, Any]] = []
+            for message in rest_msgs:
+                if message.role == "system":
+                    converted_input.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                message.content if isinstance(message.content, str) else ""
+                            ),
+                            "_floating": "system",
+                        }
+                    )
+                elif message.role == "developer":
+                    converted_input.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "<context_file>\n"
+                                f"{message.content if isinstance(message.content, str) else ''}"
+                                "\n</context_file>"
+                            ),
+                            "_floating": "developer",
+                        }
+                    )
+                else:
+                    converted_input.append(message.model_dump())
+        else:
+            converted_input = [message.model_dump() for message in conversation]
         all_messages = [
             *[
                 {
@@ -3718,9 +3844,10 @@ class AnthropicProvider:
                 for message in developer_msgs
             ],
             *self._convert_messages(
-                [message.model_dump() for message in conversation],
+                converted_input,
                 emit_warnings=emit_diagnostics,
                 computer_target_type=effective_computer_type,
+                preserved_thinking=request_caps.preserved_thinking,
             ),
         ]
         observed_state = "disabled"
@@ -3829,6 +3956,13 @@ class AnthropicProvider:
                     )
                 )
                 degradation = degradation or choice_degradation
+            if (
+                computer_aliases
+                and not self._config_bool(self.config.get("computer_batch_actions", False))
+            ):
+                choice = params.setdefault("tool_choice", {"type": "auto"})
+                if choice.get("type") != "none":
+                    choice["disable_parallel_tool_use"] = True
 
         reasoning_effort = getattr(request, "reasoning_effort", None)
         if reasoning_effort is None:
@@ -4151,16 +4285,85 @@ class AnthropicProvider:
                 "anthropic-beta": ",".join(headers),
             }
         self._merge_extra_request_params(params, emit_warnings=emit_diagnostics)
-        # A caller-supplied thinking.display="updates" via extra_request_params
-        # bypasses the derivation above (that override runs after headers are
-        # built). Cover it here too: `updates` must never go out without its
+
+        # --- T5: preserved-thinking prefix-mismatch recovery (D8) [PT] ---
+        # Resolve BEFORE the header-bypass check below, so a config- or
+        # history-driven drop_block setting is covered by the same "never
+        # send block_binding without its header" guarantee as a caller
+        # -supplied one.
+        if request_caps.preserved_thinking and isinstance(params.get("thinking"), dict):
+            behavior = self.config.get("thinking_prefix_mismatch_behavior")
+            if behavior not in (None, "error", "drop_block"):
+                if emit_diagnostics:
+                    logger.warning(
+                        "[PROVIDER] Ignoring invalid "
+                        "thinking_prefix_mismatch_behavior=%r (valid values: "
+                        "error, drop_block)",
+                        behavior,
+                    )
+                behavior = None
+            if behavior is None and (
+                self._thinking_drop_block
+                or any(
+                    message.role == "assistant"
+                    and isinstance(message.metadata, dict)
+                    and isinstance(
+                        message.metadata.get(_preserved_thinking.METADATA_KEY), dict
+                    )
+                    and message.metadata[_preserved_thinking.METADATA_KEY].get(
+                        _preserved_thinking.BINDING_KEY
+                    )
+                    == "drop_block"
+                    for message in request.messages
+                )
+            ):
+                behavior = "drop_block"
+            if behavior is not None and not params["thinking"].get("block_binding"):
+                # [PT]: "Pass through what you don't recognize" -- a caller
+                # -supplied block_binding (via extra_request_params, merged
+                # above) always wins; this only fills in the default.
+                params["thinking"]["block_binding"] = {
+                    "prefix_mismatch_behavior": behavior
+                }
+            # Diagnostic: loop-streaming's `ephemeral_injection_mode: "tail"`
+            # injects a message for ONE request only -- a prefix edit on a
+            # preserved-thinking model even though it never touches
+            # persisted history. Surfaced once per instance; the automatic
+            # drop_block retry (below) recovers from the resulting 400.
+            if emit_diagnostics and not self._ephemeral_prefix_warned:
+                if any(
+                    isinstance(message.metadata, dict)
+                    and message.metadata.get("ephemeral") is True
+                    for message in request.messages
+                ):
+                    self._ephemeral_prefix_warned = True
+                    logger.warning(
+                        "[PROVIDER] %s: a request-only (ephemeral) message "
+                        "injection is a prefix edit on a preserved-thinking "
+                        "model; automatic drop_block recovery will engage "
+                        "if the API rejects it, and reasoning after the "
+                        "edit will be lost.",
+                        effective_model,
+                    )
+
+        # A caller-supplied thinking.display="updates" (or thinking.block_
+        # binding) via extra_request_params bypasses the derivations above
+        # (those overrides run after headers are built, and the config
+        # -driven block_binding assignment above only fills in a default).
+        # Cover both here too: neither value may ever go out without its
         # beta header, on ANY path that can put it on the wire.
         final_thinking = params.get("thinking")
-        if isinstance(final_thinking, dict) and final_thinking.get("display") == "updates":
+        if isinstance(final_thinking, dict):
+            needed_headers: set[str] = set()
+            if final_thinking.get("display") == "updates":
+                needed_headers.add(BETA_HEADER_THINKING_DISPLAY_UPDATES)
+            if final_thinking.get("block_binding"):
+                needed_headers.add(_preserved_thinking.BETA_HEADER_THINKING_BINDING)
             existing = params.get("extra_headers", {}).get("anthropic-beta", "")
             existing_set = {h for h in existing.split(",") if h}
-            if BETA_HEADER_THINKING_DISPLAY_UPDATES not in existing_set:
-                existing_set.add(BETA_HEADER_THINKING_DISPLAY_UPDATES)
+            missing_headers = needed_headers - existing_set
+            if missing_headers:
+                existing_set |= missing_headers
                 params["extra_headers"] = {
                     **dict(params.get("extra_headers", {})),
                     "anthropic-beta": ",".join(sorted(existing_set)),
@@ -4447,6 +4650,11 @@ class AnthropicProvider:
         thinking_enabled = assembly.thinking_enabled
         thinking_budget = assembly.thinking_budget
         interleaved_thinking_enabled = assembly.interleaved_thinking_enabled
+        _sent_display = (
+            params.get("thinking", {}).get("display")
+            if isinstance(params.get("thinking"), dict)
+            else None
+        )
 
         # Keep only short fingerprints for a possible input-only server
         # rejection. The request reference adds an identity binding without
@@ -4608,17 +4816,20 @@ class AnthropicProvider:
                                         elif dtype == "thinking_delta":
                                             text = getattr(delta, "thinking", "") or ""
                                             if text and hooks_available:
+                                                delta_payload = {
+                                                    "request_id": request_id,
+                                                    "block_index": idx,
+                                                    "block_type": block_types.get(
+                                                        idx, "thinking"
+                                                    ),
+                                                    "sequence": seq,
+                                                    "text": text,
+                                                }
+                                                if _sent_display == "updates":
+                                                    delta_payload["progress_update"] = True
                                                 await self.coordinator.hooks.emit(
                                                     "llm:stream_block_delta",
-                                                    {
-                                                        "request_id": request_id,
-                                                        "block_index": idx,
-                                                        "block_type": block_types.get(
-                                                            idx, "thinking"
-                                                        ),
-                                                        "sequence": seq,
-                                                        "text": text,
-                                                    },
+                                                    delta_payload,
                                                 )
                                                 partial_emitted = True
                                         # signature_delta and any future delta
@@ -5133,9 +5344,33 @@ class AnthropicProvider:
                 computer_aliases=assembly.computer_aliases,
                 thinking_display=_sent_display,
                 inference_geo=assembly.params.get("inference_geo"),
+                preserved_thinking=request_caps.preserved_thinking,
+                emit_diagnostics=True,
+                effective_model=params["model"],
             )
             if assembly.degradation is not None:
                 chat_response.degradation = assembly.degradation
+
+            # T5 [PT]: "Count the transformations you receive back and
+            # alert on them" -- emitted here (rather than inside the
+            # synchronous _convert_to_chat_response) so it can use the
+            # coordinator's async hook bus like every other provider event.
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                _anthropic_meta = (chat_response.metadata or {}).get("anthropic") or {}
+                _transform_summary = _preserved_thinking.summarize_transformations(
+                    _anthropic_meta.get("input_transformations")
+                )
+                if _transform_summary is not None:
+                    await self.coordinator.hooks.emit(
+                        "provider:thinking_blocks_dropped",
+                        {
+                            "provider": "anthropic",
+                            "model": params["model"],
+                            "count": _transform_summary["count"],
+                            "reasons": _transform_summary["reasons"],
+                            "paths": _transform_summary["paths"],
+                        },
+                    )
 
             # Emit from canonical fields
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -5171,6 +5406,53 @@ class AnthropicProvider:
             return chat_response  # Return the already-built response
 
         except KernelLLMError as e:
+            # T5 [PT] D8: a preserved-thinking target (Opus 5.5+) rejects a
+            # replayed turn with a documented 400 when the request prefix
+            # was edited by something outside the provider's control (an
+            # ephemeral injection, context compaction, screenshot pruning,
+            # ...): "The block is bound to a different conversation. Remove
+            # the block, or set `thinking.block_binding.prefix_mismatch_
+            # behavior` to \"drop_block\"." [PT] prescribes exactly this
+            # recovery: retry once with drop_block, and keep that choice
+            # for the rest of the session (including after a restart --
+            # see the metadata.anthropic.thinking_binding marker written in
+            # _convert_to_chat_response and read back in
+            # _assemble_request_params). A tampered-signature 400 has no
+            # such sentence and is never retried this way; an explicit
+            # `thinking_prefix_mismatch_behavior: "error"` config disables
+            # the automatic retry entirely.
+            if (
+                request_caps.preserved_thinking
+                and not self._thinking_drop_block
+                and self.config.get("thinking_prefix_mismatch_behavior") != "error"
+                and _preserved_thinking.is_prefix_binding_mismatch(str(e))
+            ):
+                self._thinking_drop_block = True
+                logger.warning(
+                    "[PROVIDER] %s rejected a replayed thinking turn (prefix "
+                    "binding mismatch); retrying once with "
+                    "thinking.block_binding.prefix_mismatch_behavior="
+                    "drop_block for the rest of this session. Reasoning "
+                    "generated before the edit is lost. Likely cause: a "
+                    "system/tools/earlier-message edit outside this "
+                    "provider's control (e.g. an ephemeral injection, "
+                    "compaction, or screenshot pruning). Error: %s",
+                    effective_model,
+                    e,
+                )
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    await self.coordinator.hooks.emit(
+                        "provider:thinking_binding_retry",
+                        {
+                            "provider": "anthropic",
+                            "model": effective_model,
+                            "error": str(e),
+                        },
+                    )
+                return await self._complete_chat_request(
+                    request, retry_config=retry_config, **kwargs
+                )
+
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
@@ -5299,6 +5581,7 @@ class AnthropicProvider:
         *,
         emit_warnings: bool = True,
         computer_target_type: str | None = None,
+        preserved_thinking: bool = False,
     ) -> list[dict[str, Any]]:
         """Convert messages to Anthropic format.
 
@@ -5335,14 +5618,63 @@ class AnthropicProvider:
                                 valid_tool_use_ids.add(block["id"])
                             elif block.get("type") == "tool_call" and block.get("id"):
                                 valid_tool_use_ids.add(block["id"])
+                # T5: a preserved-thinking exact-replay snapshot may carry
+                # tool_use ids not otherwise present on this message shape
+                # (e.g. a computer-toolset member call whose legacy
+                # Amplifier-side tool_call id differs from nothing here --
+                # kept for defense-in-depth parity with the scan above).
+                msg_metadata = msg.get("metadata")
+                if isinstance(msg_metadata, dict):
+                    wire_content = msg_metadata.get(
+                        _preserved_thinking.METADATA_KEY, {}
+                    ).get(_preserved_thinking.WIRE_CONTENT_KEY)
+                    if wire_content:
+                        valid_tool_use_ids.update(
+                            _preserved_thinking.tool_use_ids(wire_content)
+                        )
 
         anthropic_messages = []
+        wire_toolset_by_id: dict[str, str] = {}
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            msg_metadata = msg.get("metadata")
+            if not isinstance(msg_metadata, dict):
+                continue
+            wire_content = msg_metadata.get(
+                _preserved_thinking.METADATA_KEY, {}
+            ).get(_preserved_thinking.WIRE_CONTENT_KEY)
+            if not isinstance(wire_content, list):
+                continue
+            for block in wire_content:
+                if (
+                    isinstance(block, Mapping)
+                    and block.get("type") == "tool_use"
+                    and block.get("id")
+                    and block.get("toolset_name")
+                ):
+                    wire_toolset_by_id[str(block["id"])] = str(block["toolset_name"])
         i = 0
 
+        has_floating_messages = False
         while i < len(messages):
             msg = messages[i]
             role = msg.get("role")
             content = msg.get("content", "")
+
+            # T5 [PT]: a LATER system/developer message on a
+            # preserved-thinking + inline-system target arrives pre-tagged
+            # `_floating` by _assemble_request_params. Pass it through
+            # untouched (still tagged) so place_floating_messages can place
+            # it deterministically once the whole conversion is done --
+            # this is NOT the same as the "skip system messages" branch
+            # below, which handles a LEADING system message already
+            # accounted for in the top-level `system` field.
+            if msg.get("_floating") in ("system", "developer"):
+                has_floating_messages = True
+                anthropic_messages.append(dict(msg))
+                i += 1
+                continue
 
             # Skip system messages (handled separately)
             if role == "system":
@@ -5370,13 +5702,14 @@ class AnthropicProvider:
                         i += 1
                         continue
 
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": tool_msg.get("content", ""),
-                        }
-                    )
+                    tool_result = {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_msg.get("content", ""),
+                    }
+                    if tool_use_id in wire_toolset_by_id:
+                        tool_result["toolset_name"] = wire_toolset_by_id[tool_use_id]
+                    tool_results.append(tool_result)
                     i += 1
 
                 # Only add user message if we have valid tool_results
@@ -5392,6 +5725,42 @@ class AnthropicProvider:
                         f"All {skipped_count} consecutive tool_results were orphaned and skipped"
                     )
                 continue  # i already advanced in while loop
+            if role == "assistant" and preserved_thinking:
+                # T5 [PT]: this target's thinking blocks (and the whole
+                # turn) are bound to a fixed conversation prefix -- replay
+                # the exact prior wire content, append-only, instead of the
+                # lossy tool_calls/thinking_block reconstruction below
+                # (which cannot even represent an unknown block type such
+                # as `fallback`, and drops a thinking block whenever text
+                # and tool_calls are both present -- the M68 collapse).
+                msg_metadata = msg.get("metadata")
+                wire_content = None
+                if isinstance(msg_metadata, dict):
+                    wire_content = msg_metadata.get(
+                        _preserved_thinking.METADATA_KEY, {}
+                    ).get(_preserved_thinking.WIRE_CONTENT_KEY)
+                if wire_content and _preserved_thinking.snapshot_matches(wire_content, msg):
+                    anthropic_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": _preserved_thinking.replay_from_snapshot(
+                                wire_content
+                            ),
+                        }
+                    )
+                elif isinstance(content, list):
+                    anthropic_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": _preserved_thinking.replay_from_content(
+                                content, computer_target_type=computer_target_type
+                            ),
+                        }
+                    )
+                else:
+                    anthropic_messages.append({"role": "assistant", "content": content})
+                i += 1
+                continue
             if role == "assistant":
                 # Assistant messages - check for tool calls or thinking blocks
                 if "tool_calls" in msg and msg["tool_calls"]:
@@ -5559,6 +5928,10 @@ class AnthropicProvider:
                     anthropic_messages.append({"role": "user", "content": content})
                 i += 1
 
+        if has_floating_messages:
+            anthropic_messages = _preserved_thinking.place_floating_messages(
+                anthropic_messages
+            )
         return anthropic_messages
 
     def _convert_tools_from_request(self, tools: list) -> list[dict[str, Any]]:
@@ -5906,8 +6279,17 @@ class AnthropicProvider:
             # are not permitted``), because ``_stamp_last_block`` would mark
             # that trailing thinking block. Walk past it too, to a message
             # whose last block can legally carry a cache breakpoint.
+            # T5 [PT]: a later inline `role: "system"` message (Opus 5.5+
+            # preserved-thinking append-only placement) must never be the
+            # cache_control anchor -- Anthropic rejects `cache_control` on
+            # role="system" *within* `messages` (distinct from the
+            # top-level `system` field, which already supports it via
+            # `_format_system_with_cache`). Walk past it, same as a split
+            # pair.
+            is_inline_system = msg.get("role") == "system"
             if (
                 not splits_pair
+                and not is_inline_system
                 and not self._stamps_empty_text_block(msg)
                 and not self._stamps_uncacheable_block(msg)
             ):
@@ -6431,6 +6813,9 @@ class AnthropicProvider:
         computer_aliases: Mapping[str, str] | None = None,
         thinking_display: str | None = None,
         inference_geo: str | None = None,
+        preserved_thinking: bool = False,
+        emit_diagnostics: bool = False,
+        effective_model: str | None = None,
     ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
@@ -6473,9 +6858,9 @@ class AnthropicProvider:
                 text_accumulator.append(block.text)
                 event_blocks.append(TextContent(text=block.text))
             elif block.type == "thinking":
-                is_progress_update = thinking_display == "updates" and (
-                    bool(block.thinking) or block.thinking == _INTERRUPTED_THINKING_TEXT
-                )
+                is_progress_update = (
+                    thinking_display == "updates" and bool(block.thinking)
+                ) or block.thinking == _INTERRUPTED_THINKING_TEXT
                 thinking_block_kwargs: dict[str, Any] = {
                     "thinking": block.thinking,
                     "signature": getattr(block, "signature", None),
@@ -6621,6 +7006,20 @@ class AnthropicProvider:
         self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
+        if (
+            emit_diagnostics
+            and response.stop_reason == "max_tokens"
+            and not text_accumulator
+            and any(block.type == "thinking" for block in response.content)
+        ):
+            warn_key = ("thinking_max_tokens", effective_model or response.model)
+            if warn_key not in self._opus55_warned_once:
+                self._opus55_warned_once.add(warn_key)
+                logger.warning(
+                    "[PROVIDER] %s stopped at max_tokens before producing answer text; "
+                    "thinking counts toward max_tokens, so raise max_tokens.",
+                    effective_model or response.model,
+                )
 
         # `stop_details` carries structured detail behind a coarse
         # `stop_reason` -- notably the refusal `category` (e.g.
@@ -6644,6 +7043,51 @@ class AnthropicProvider:
                 response_metadata.setdefault("anthropic", {})["stop_details"] = (
                     stop_details_dump
                 )
+
+        # T5 preserved thinking (Opus 5.5+) [PT]: the assistant turn's
+        # thinking blocks (and the whole turn) are bound to a fixed
+        # conversation prefix -- replaying a stored turn must reproduce the
+        # exact prior wire content, append-only. Store the exact server
+        # content array here so _convert_messages can replay it byte-exact
+        # on a later request, instead of reconstructing it from the lossy
+        # core content model (which cannot even represent an unknown block
+        # type such as `fallback`).
+        if preserved_thinking:
+            anthropic_meta = response_metadata.setdefault("anthropic", {})
+            anthropic_meta[_preserved_thinking.WIRE_CONTENT_KEY] = (
+                _preserved_thinking.wire_content_snapshot(response.content)
+            )
+            anthropic_meta["response_model"] = response.model
+            if self._thinking_drop_block:
+                anthropic_meta[_preserved_thinking.BINDING_KEY] = "drop_block"
+            transformations = getattr(response, "model_extra", None) or {}
+            items = (
+                transformations.get("input_transformations")
+                if isinstance(transformations, Mapping)
+                else None
+            )
+            if items:
+                anthropic_meta["input_transformations"] = items
+                summary = _preserved_thinking.summarize_transformations(items)
+                if summary is not None:
+                    warn_key = effective_model or response.model
+                    if emit_diagnostics and warn_key not in self._transformations_warned_models:
+                        self._transformations_warned_models.add(warn_key)
+                        logger.warning(
+                            "[PROVIDER] %s: the API dropped/edited %d earlier "
+                            "thinking block(s) it could not replay (reasons: "
+                            "%s) [PT: 'Count the transformations you receive "
+                            "back and alert on them'].",
+                            warn_key,
+                            summary["count"],
+                            summary["reasons"],
+                        )
+                    # The `provider:thinking_blocks_dropped` hook event is
+                    # emitted by the async caller (_complete_chat_request),
+                    # which recomputes this same summary from
+                    # metadata.anthropic.input_transformations -- this
+                    # method is synchronous and must not schedule
+                    # fire-and-forget async work.
 
         return AnthropicChatResponse(
             content=content_blocks,

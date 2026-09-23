@@ -192,6 +192,25 @@ def test_other_refusal_category_still_retries():
     assert provider._complete_chat_request.await_count == 2
 
 
+def test_server_side_fallback_is_exclusive_with_client_ladder():
+    provider = _make_provider(
+        "claude-opus-5-5",
+        extra_request_params={"fallbacks": "default"},
+    )
+    request = _request_with_refused_turn()
+    refusal_response = ChatResponse(
+        content=[TextBlock(text="")],
+        finish_reason="refusal",
+        metadata={"anthropic": {"stop_details": {"type": "refusal", "category": "cyber"}}},
+    )
+    provider._complete_chat_request = AsyncMock(return_value=refusal_response)
+
+    result = asyncio.run(provider.complete(request))
+
+    assert result is refusal_response
+    assert provider._complete_chat_request.await_count == 1
+
+
 # ---------------------------------------------------------------------------
 # (c) _refusal_fallback_target returns None when disabled
 # ---------------------------------------------------------------------------

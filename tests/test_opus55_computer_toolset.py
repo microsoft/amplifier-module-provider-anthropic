@@ -108,6 +108,15 @@ class TestOpus55ComputerToolsetIntegration:
         beta = (params.get("extra_headers") or {}).get("anthropic-beta", "")
         assert "computer-use-2025-11-24" not in beta
         assert "computer_20251124" not in str(params["tools"])
+        assert params["tool_choice"] == {
+            "type": "auto",
+            "disable_parallel_tool_use": True,
+        }
+
+    def test_batch_actions_opt_in_does_not_force_serial_calls(self):
+        provider = _make_provider(computer_batch_actions=True)
+        params, _ = _run(provider, _computer_tool_request())
+        assert "tool_choice" not in params
 
     def test_response_member_call_translated_to_legacy_shape(self):
         provider = _make_provider()
