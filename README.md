@@ -477,7 +477,7 @@ House-style key reference. ✅ = wizard-visible ConfigField, ⚙️ = settings-o
 | `cache_infer_stability_from_history` | `true` | ⚙️ | Measure the regenerated-per-request tail by comparing consecutive requests, when `Message.metadata` is not populated. Used as a floor with the declared value, never a replacement. `false` = strict metadata-only |
 | `max_tokens` | *(model ceiling)* | ⚙️ | Output token cap |
 | `temperature` | `0.7` | ⚙️ | Ignored by non-sampling models (Sonnet 5, Opus 4.7+) |
-| `timeout` | `600.0` | ⚙️ | API timeout, seconds |
+| `timeout` | `null` | ⚙️ | Optional request deadline, seconds; default waits for completion |
 | `close_timeout` | `5.0` | ⚙️ | Hard bound on closing the HTTP client at session teardown, seconds. `httpx`'s `aclose()` has no deadline of its own and blocks forever on a half-closed (CLOSE-WAIT) connection; on timeout the client is abandoned with a WARNING and the socket is reclaimed at process exit |
 | `priority` | `100` | ⚙️ | Provider selection priority (lower wins) |
 | `raw` | `false` | ⚙️ | Include full request/response payloads in `llm:request`/`llm:response` events |
@@ -590,3 +590,7 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+### Waiting for model work
+
+Completion and streaming requests have no elapsed-time or read-idle deadline by default. They wait for completion, explicit cancellation, or a provider/transport error. Set `timeout` (seconds) to opt into a request deadline; `null` leaves model work unbounded. Connection and pool acquisition remain bounded to 5 seconds, and existing `close_timeout` cleanup limits are unchanged.
