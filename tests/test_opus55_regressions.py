@@ -259,6 +259,80 @@ def test_opus55_keeps_plain_function_named_computer() -> None:
     assert "type" not in params["tools"][0]
 
 
+@pytest.mark.parametrize(
+    "model",
+    [MODEL, PREVIOUS_OPUS_MODEL, "claude-sonnet-5"],
+)
+def test_multiple_ordinary_function_calls_stay_unchanged_without_native_adapter(
+    model: str,
+) -> None:
+    """A missing adapter must not turn ordinary calls into native-computer calls."""
+    provider = _provider(default_model=model)
+    response = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="tool_use",
+                id="toolu_computer",
+                name="computer",
+                input={"target": "window"},
+            ),
+            SimpleNamespace(
+                type="tool_use",
+                id="toolu_other",
+                name="lookup",
+                input={"query": "current"},
+            ),
+        ],
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        stop_reason="tool_use",
+        model=model,
+    )
+
+    converted = provider._convert_to_chat_response(response)
+
+    assert [(call.name, call.input) for call in converted.content] == [
+        ("computer", {"target": "window"}),
+        ("lookup", {"query": "current"}),
+    ]
+
+
+def test_opus55_multiple_plain_function_tools_remain_plain_on_the_wire() -> None:
+    params = _assemble(
+        _request(tools=[_function_tool("computer"), _function_tool("lookup")])
+    )
+
+    assert [tool["name"] for tool in params["tools"]] == ["computer", "lookup"]
+    assert all("type" not in tool for tool in params["tools"])
+    assert "tool_choice" not in params
+
+
+def test_opus55_rejects_unknown_future_native_computer_type() -> None:
+    future_native = _native_computer(tool_type="computer_20990101")
+
+    with pytest.raises(KernelInvalidRequestError, match="Unsupported native computer"):
+        _assemble(_request(tools=[future_native]))
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    ["computer_20241022", "computer_20250124", "computer_20251124"],
+)
+def test_opus55_adapts_each_documented_legacy_computer_type(tool_type: str) -> None:
+    params = _assemble(_request(tools=[_native_computer(tool_type=tool_type)]))
+
+    assert params["tools"][0]["type"] == "computer_toolset_20260801"
+
+
+def test_dotted_opus55_alias_does_not_enable_native_computer_adapter() -> None:
+    dotted_model = "claude-opus-5.5-20260901"
+    params = _assemble(
+        _request(model=dotted_model, tools=[_native_computer()]),
+        model=dotted_model,
+    )
+
+    assert params["tools"][0]["type"] == "computer_20251124"
+
+
 def test_opus55_response_dispatch_and_history_are_request_scoped() -> None:
     provider = _provider()
     assembly = provider._assemble_request_params(
@@ -353,8 +427,9 @@ def test_opus55_rejects_multiple_or_colliding_native_actions() -> None:
         stop_reason="tool_use",
         model=MODEL,
     )
-    with pytest.raises(KernelInvalidRequestError, match="multiple action"):
+    with pytest.raises(KernelInvalidRequestError, match="multiple action") as exc_info:
         provider._convert_to_chat_response(multiple, native_computer_adapter=adapter)
+    assert exc_info.value.retryable is False
 
     collision = SimpleNamespace(
         content=[
@@ -372,6 +447,87 @@ def test_opus55_rejects_multiple_or_colliding_native_actions() -> None:
     )
     with pytest.raises(KernelInvalidRequestError, match="reserved key"):
         provider._convert_to_chat_response(collision, native_computer_adapter=adapter)
+
+
+@pytest.mark.parametrize(
+    ("edited_block", "match"),
+    [
+        (
+            {
+                "type": "tool_call",
+                "id": "toolu_native",
+                "name": "desktop",
+                "input": {"action": "right_click", "x": 10},
+                "_anthropic_computer_toolset_name": "computer",
+                "_anthropic_computer_member_name": "left_click",
+            },
+            "action does not match",
+        ),
+        (
+            {
+                "type": "tool_call",
+                "id": "toolu_native",
+                "name": "other_function",
+                "input": {"action": "left_click", "x": 10},
+                "_anthropic_computer_toolset_name": "computer",
+                "_anthropic_computer_member_name": "left_click",
+            },
+            "alias does not match",
+        ),
+    ],
+)
+def test_opus55_replay_rejects_tagged_provenance_that_disagrees_with_current_block(
+    edited_block: dict[str, Any], match: str
+) -> None:
+    provider = _provider()
+    original = json.loads(json.dumps(edited_block))
+    adapter = provider._assemble_request_params(
+        _request(tools=[_native_computer(name="desktop")]),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    ).native_computer_adapter
+
+    with pytest.raises(KernelInvalidRequestError, match=match):
+        provider._convert_messages(
+            [{"role": "assistant", "content": [edited_block]}],
+            native_computer_adapter=adapter,
+        )
+
+    assert edited_block == original
+
+
+def test_opus55_replay_of_matching_tagged_json_still_works_without_mutation() -> None:
+    provider = _provider()
+    persisted = {
+        "type": "tool_call",
+        "id": "toolu_native",
+        "name": "desktop",
+        "input": {"action": "left_click", "x": 10},
+        "_anthropic_computer_toolset_name": "computer",
+        "_anthropic_computer_member_name": "left_click",
+    }
+    original = json.loads(json.dumps(persisted))
+    adapter = provider._assemble_request_params(
+        _request(tools=[_native_computer(name="desktop")]),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    ).native_computer_adapter
+
+    wire = provider._convert_messages(
+        [{"role": "assistant", "content": [persisted]}],
+        native_computer_adapter=adapter,
+    )
+
+    assert wire[0]["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_native",
+            "toolset_name": "computer",
+            "name": "left_click",
+            "input": {"x": 10},
+        }
+    ]
+    assert persisted == original
 
 
 def test_opus55_real_sdk_mock_transport_serializes_native_toolset() -> None:

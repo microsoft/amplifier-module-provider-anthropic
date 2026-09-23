@@ -40,19 +40,22 @@ Opus 5.5 supports normal text, vision, function tools, streaming, effort, and
 prompt-cost tracking. Its thinking is always adaptive: an unset effort uses the
 vendor's `medium` effort, and `extended_thinking: false` cannot disable model
 thinking (the provider warns and preserves any selected effort and output cap).
-On Anthropic's first-party endpoint, Opus 5.5 adapts one explicit native
-computer declaration (legacy `computer_*` or
+Only on Anthropic's first-party endpoint, Opus 5.5 adapts one explicit native
+computer declaration (the documented legacy `computer_20241022`,
+`computer_20250124`, or `computer_20251124`, or
 `computer_toolset_20260801`) to `computer_toolset_20260801`. The adapter
 preserves the ToolSpec name as the executor dispatch alias and maps the native
 action member into `input.action`; ordinary function tools, including one named
-`computer`, and prior native-computer model behavior are unchanged. Native
-computer actions are single-action responses: the request uses
-`tool_choice: auto` with `disable_parallel_tool_use: true`; forced/named choice
+`computer`, remain ordinary function tools. The actual request assembly guards
+this first-party-only boundary: custom/proxy endpoints fail locally rather than
+claiming vendor-native toolset support. This adapter is not a claim that the new
+toolset is fully equivalent to prior native-computer contracts. Native computer
+actions are single-action responses: the request uses `tool_choice: auto` with
+the **request-wide** `disable_parallel_tool_use: true`; forced/named choice
 remains unsupported on Opus 5.5. `key.repeat` is passed through when the model
-emits it, but an executor must independently support repeat for it to take
-effect. Custom/proxy endpoints fail locally rather than claiming vendor-native
-toolset support. Provider-derived headers do not add a legacy computer-use beta
-for the new toolset; an explicitly configured beta header is retained. As elsewhere in this provider, expert
+emits it, but takes effect only with an updated executor that supports repeat.
+Provider-derived headers do not add a legacy computer-use beta for the new
+toolset; an explicitly configured beta header is retained. As elsewhere in this provider, expert
 `extra_request_params.tool_choice` is an explicit wire-level override and wins
 over this derived default. This does not change the default model.
 

@@ -684,13 +684,13 @@ class ModelCapabilities:
     supports_forced_tool_choice: bool = (
         True  # False = only portable auto/none tool choice is supported
     )
-    supports_native_computer_use: bool = False  # True = model accepts a "computer_*" native tool type (see computer_use_tool_type)
+    supports_native_computer_use: bool = False  # True = model accepts the selected native computer tool type (see computer_use_tool_type)
     computer_use_tool_type: str | None = (
-        None  # Which "computer_*" wire type this model accepts -- Anthropic's versioned
+        None  # Which native computer wire type this model accepts. The legacy
         # computer-use tool has three incompatible generations (computer_20241022,
-        # computer_20250124, computer_20251124) and a model paired with the wrong one
-        # is rejected outright (HTTP 400), unlike OpenAI's single bare "computer" type.
-        # None means this model does not support the tool at all.
+        # computer_20250124, computer_20251124); Opus 5.5 instead uses its distinct
+        # computer_toolset_20260801 contract. A model paired with the wrong type is
+        # rejected outright (HTTP 400). None means this model does not support it.
     )
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
     min_cacheable_tokens: int = (
@@ -1899,16 +1899,17 @@ class AnthropicProvider:
         * **Sonnet 4.5+** — 1M context, extended thinking, 64K output
         * **Haiku 4.5+** — fast inference, extended thinking, no adaptive, no 1M
 
-        Computer-use wire type (``computer_use_tool_type``) — live-probed against
-        api.anthropic.com 2026-08-03, see per-family comments below for the full
-        evidence table:
+        Legacy computer-use wire types were live-probed against api.anthropic.com
+        2026-08-03; Opus 5.5's separate toolset is the provider adapter contract:
 
         * **Opus 4.1-4.5** / **Sonnet/Haiku 4.5** — ``computer_20250124``
         * **Opus/Sonnet 4.6+** (incl. Opus/Sonnet 5) — ``computer_20251124``
+        * **Opus 5.5** — ``computer_toolset_20260801`` through the request-local,
+          first-party-only adapter
         * Everything else (below the verified floor, or an unreachable/unverified
           model such as Fable) — unsupported (``None``)
 
-        These two generations are NOT interchangeable: pairing a model with the
+        The legacy generations are NOT interchangeable: pairing a model with the
         wrong one returns HTTP 400, not a graceful fallback.
 
         When the version cannot be parsed from the model ID we assume the
@@ -2016,11 +2017,10 @@ class AnthropicProvider:
             # Below 4.1 is unverified: the only pre-4.1 opus model (claude-opus-4-20250514)
             # is retired (HTTP 404) in this workspace, so it could not be probed either way.
             if is_55:
-                # This module deliberately does not claim support for a native
-                # computer-toolset on Opus 5.5 yet.  That is a provider
-                # support boundary, not a statement about other Anthropic
-                # products or endpoints.
-                computer_use_tool_type = None
+                # This is an adapter capability rather than legacy
+                # computer-use support: actual declaration translation remains
+                # restricted to the first-party endpoint in translate_tools().
+                computer_use_tool_type = "computer_toolset_20260801"
             elif is_46_plus:
                 computer_use_tool_type = "computer_20251124"
             elif version_known and (major, minor) >= (4, 1):
@@ -6329,13 +6329,17 @@ class AnthropicProvider:
         ] = []
         text_accumulator: list[str] = []
 
-        native_blocks = [
-            block
-            for block in response.content
-            if getattr(block, "type", None) == "tool_use"
-            and getattr(block, "toolset_name", None)
-            == getattr(native_computer_adapter, "toolset_name", None)
-        ]
+        native_blocks = (
+            [
+                block
+                for block in response.content
+                if getattr(block, "type", None) == "tool_use"
+                and getattr(block, "toolset_name", None)
+                == native_computer_adapter.toolset_name
+            ]
+            if native_computer_adapter is not None
+            else []
+        )
         if len(native_blocks) > 1:
             raise KernelInvalidRequestError(
                 "Opus 5.5 native computer toolset returned multiple action members; "

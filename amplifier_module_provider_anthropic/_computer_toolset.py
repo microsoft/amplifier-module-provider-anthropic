@@ -18,6 +18,14 @@ COMPUTER_TOOLSET_TYPE = "computer_toolset_20260801"
 COMPUTER_TOOLSET_NAME = "computer"
 PROVENANCE_TOOLSET = "_anthropic_computer_toolset_name"
 PROVENANCE_MEMBER = "_anthropic_computer_member_name"
+_LEGACY_COMPUTER_TYPES = frozenset(
+    {
+        "computer_20241022",
+        "computer_20250124",
+        "computer_20251124",
+    }
+)
+_SUPPORTED_COMPUTER_TYPES = _LEGACY_COMPUTER_TYPES | frozenset({COMPUTER_TOOLSET_TYPE})
 
 
 class ComputerToolsetError(ValueError):
@@ -33,10 +41,10 @@ class NativeComputerAdapter:
 
 
 def is_opus_55(model: str) -> bool:
-    """Recognize only the shipped Opus 5.5 model-id spellings."""
+    """Recognize only canonical hyphenated Opus 5.5 model IDs."""
     return bool(
         re.fullmatch(
-            r"claude-opus-5(?:-5|\.5)(?:-\d{8})?",
+            r"claude-opus-5-5(?:-\d{8})?",
             model.lower(),
         )
     )
@@ -81,10 +89,12 @@ def _tool_mapping(tool: Any) -> dict[str, Any]:
 
 
 def _native_computer_type(tool: dict[str, Any]) -> bool:
+    return tool.get("type") in _SUPPORTED_COMPUTER_TYPES
+
+
+def _unknown_computer_type(tool: dict[str, Any]) -> bool:
     tool_type = tool.get("type")
-    return tool_type == COMPUTER_TOOLSET_TYPE or (
-        isinstance(tool_type, str) and tool_type.startswith("computer_")
-    )
+    return isinstance(tool_type, str) and tool_type.startswith("computer_")
 
 
 def translate_tools(
@@ -106,6 +116,13 @@ def translate_tools(
     adapter: NativeComputerAdapter | None = None
     for raw_tool in tools:
         tool = _tool_mapping(raw_tool)
+        if _unknown_computer_type(tool) and not _native_computer_type(tool):
+            raise ComputerToolsetError(
+                f"Unsupported native computer declaration type {tool['type']!r} for "
+                "Opus 5.5; supported types are computer_20241022, "
+                "computer_20250124, computer_20251124, and "
+                "computer_toolset_20260801."
+            )
         if not _native_computer_type(tool):
             converted.append(raw_tool)
             continue
@@ -198,7 +215,20 @@ def native_wire_tool_use(
     source_input = block.get("input", block.get("arguments", {}))
     if not isinstance(source_input, dict):
         raise ComputerToolsetError("Native computer history has a non-mapping input.")
-    action = block.get(PROVENANCE_MEMBER) if tagged else source_input.get("action")
+    current_action = source_input.get("action")
+    if tagged:
+        current_alias = block.get("name", block.get("tool"))
+        if current_alias != adapter.alias:
+            raise ComputerToolsetError(
+                "Native computer history alias does not match the current declared alias."
+            )
+        action = block.get(PROVENANCE_MEMBER)
+        if current_action != action:
+            raise ComputerToolsetError(
+                "Native computer history action does not match persisted provenance."
+            )
+    else:
+        action = current_action
     if not isinstance(action, str) or not action:
         raise ComputerToolsetError("Native computer history has no action member.")
     native_input = dict(source_input)
