@@ -151,6 +151,48 @@ def test_non_refusal_response_returned_untouched_no_fallback_call():
 
 
 # ---------------------------------------------------------------------------
+# (a2) [MG]: a "reasoning_extraction" refusal is never retried on a fallback
+# model -- it is about the prompt, not the model, and Anthropic documents
+# that server-side fallback also excludes this category.
+# ---------------------------------------------------------------------------
+def test_reasoning_extraction_refusal_is_not_retried():
+    provider = _make_provider("claude-opus-5-5")
+    request = _request_with_refused_turn()
+
+    refusal_response = ChatResponse(
+        content=[TextBlock(text="")],
+        finish_reason="refusal",
+        metadata={"anthropic": {"stop_details": {"type": "refusal", "category": "reasoning_extraction"}}},
+    )
+    provider._complete_chat_request = AsyncMock(return_value=refusal_response)
+
+    result = asyncio.run(provider.complete(request))
+
+    assert result is refusal_response
+    assert provider._complete_chat_request.await_count == 1
+
+
+def test_other_refusal_category_still_retries():
+    provider = _make_provider("claude-opus-5-5")
+    request = _request_with_refused_turn()
+
+    refusal_response = ChatResponse(
+        content=[TextBlock(text="")],
+        finish_reason="refusal",
+        metadata={"anthropic": {"stop_details": {"type": "refusal", "category": "cyber"}}},
+    )
+    fallback_response = _response("end_turn", text="fallback answer")
+    provider._complete_chat_request = AsyncMock(
+        side_effect=[refusal_response, fallback_response]
+    )
+
+    result = asyncio.run(provider.complete(request))
+
+    assert result is fallback_response
+    assert provider._complete_chat_request.await_count == 2
+
+
+# ---------------------------------------------------------------------------
 # (c) _refusal_fallback_target returns None when disabled
 # ---------------------------------------------------------------------------
 def test_refusal_fallback_target_none_when_disabled():

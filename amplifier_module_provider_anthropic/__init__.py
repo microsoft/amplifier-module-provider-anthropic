@@ -3156,6 +3156,28 @@ class AnthropicProvider:
         if getattr(response, "finish_reason", None) != "refusal":
             return response
 
+        stop_details = (
+            (response.metadata or {}).get("anthropic", {}).get("stop_details")
+            if getattr(response, "metadata", None)
+            else None
+        )
+        if (
+            isinstance(stop_details, dict)
+            and stop_details.get("category") == "reasoning_extraction"
+        ):
+            # [MG]: server-side fallback "doesn't retry requests declined
+            # with reasoning_extraction" -- Anthropic's own guidance for this
+            # refusal category. It is about the *prompt* asking the model to
+            # reveal its internal reasoning, not a model-quality issue a
+            # different/weaker model would resolve, so the client fallback
+            # ladder does not apply here either.
+            logger.info(
+                "[PROVIDER] %s refused with stop_details.category="
+                "'reasoning_extraction' -- not retrying on a fallback model",
+                effective_model,
+            )
+            return response
+
         fallback_model = self._refusal_fallback_target(effective_model)
         if fallback_model is None:
             return response
@@ -6539,6 +6561,29 @@ class AnthropicProvider:
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
+        # `stop_details` carries structured detail behind a coarse
+        # `stop_reason` -- notably the refusal `category` (e.g.
+        # "reasoning_extraction", "bio", "cyber"), which this provider's
+        # refusal-fallback ladder (see D9 / _apply_refusal_fallback) reads
+        # back out of this same metadata namespace to decide whether a
+        # refusal is retryable at all. Additive for every model; harmless
+        # when absent.
+        response_metadata: dict[str, Any] = {}
+        stop_details_obj = getattr(response, "stop_details", None)
+        if stop_details_obj is not None:
+            if hasattr(stop_details_obj, "model_dump"):
+                stop_details_dump = stop_details_obj.model_dump(
+                    mode="json", exclude_unset=True
+                )
+            elif isinstance(stop_details_obj, dict):
+                stop_details_dump = stop_details_obj
+            else:
+                stop_details_dump = None
+            if stop_details_dump is not None:
+                response_metadata.setdefault("anthropic", {})["stop_details"] = (
+                    stop_details_dump
+                )
+
         return AnthropicChatResponse(
             content=content_blocks,
             tool_calls=tool_calls if tool_calls else None,
@@ -6547,6 +6592,7 @@ class AnthropicProvider:
             content_blocks=event_blocks if event_blocks else None,
             text=combined_text or None,
             web_search_results=web_search_results if web_search_results else None,
+            metadata=response_metadata or None,
         )
 
     async def close(self) -> None:
