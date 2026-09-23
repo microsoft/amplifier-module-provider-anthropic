@@ -4484,6 +4484,7 @@ class AnthropicProvider:
             provider="anthropic",
             model=model,
         )
+
     @staticmethod
     def _count_tokens_params(params: Mapping[str, Any]) -> dict[str, Any]:
         """Project assembled dispatch params to the count endpoint's schema."""
