@@ -712,3 +712,59 @@ def test_convert_without_ttl_split_object_preserves_legacy_cost():
     assert result.usage.cost_usd == Decimal("3.75"), (
         f"Expected Decimal('3.75') (legacy behavior), got {result.usage.cost_usd!r}"
     )
+
+
+def test_opus_55_inference_geo_us_multiplier():
+    """Data-residency pricing: inference_geo="us" is a 1.1x multiplier."""
+    standard = compute_cost(
+        "claude-opus-5-5", input_tokens=1_000_000, output_tokens=1_000_000
+    )
+    us = compute_cost(
+        "claude-opus-5-5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        inference_geo="us",
+    )
+    assert us == standard * Decimal("1.1")
+    assert us == Decimal("26.40")
+
+
+def test_inference_geo_us_stacks_with_fast_mode():
+    fast_only = compute_cost(
+        "claude-opus-5-5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        speed="fast",
+    )
+    fast_and_us = compute_cost(
+        "claude-opus-5-5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        speed="fast",
+        inference_geo="us",
+    )
+    assert fast_and_us == fast_only * Decimal("1.1")
+
+
+def test_inference_geo_unset_or_other_value_unchanged():
+    baseline = compute_cost(
+        "claude-opus-5-5", input_tokens=1_000_000, output_tokens=1_000_000
+    )
+    assert (
+        compute_cost(
+            "claude-opus-5-5",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            inference_geo=None,
+        )
+        == baseline
+    )
+    assert (
+        compute_cost(
+            "claude-opus-5-5",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            inference_geo="global",
+        )
+        == baseline
+    )

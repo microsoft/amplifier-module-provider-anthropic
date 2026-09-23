@@ -271,6 +271,7 @@ def compute_cost(
     cache_creation_5m_input_tokens: int | None = None,
     cache_creation_1h_input_tokens: int | None = None,
     speed: str | None = None,
+    inference_geo: str | None = None,
 ) -> Decimal | None:
     """Return the USD cost for an Anthropic API call as a :class:`~decimal.Decimal`.
 
@@ -310,6 +311,12 @@ def compute_cost(
     speed:
         When ``'fast'`` AND *model* is in :data:`_FAST_ELIGIBLE_MODELS` a 2x
         multiplier is applied; any other value leaves cost unchanged.
+    inference_geo:
+        Data-residency pricing region, e.g. ``"us"`` for the guaranteed-US
+        inference option (Anthropic pricing: "Data residency pricing" -- a
+        1.1x multiplier on top of standard/fast-mode pricing). Any other
+        value (including ``None``, the global default) leaves cost
+        unchanged. Stacks multiplicatively with the fast-mode 2x multiplier.
 
     Returns
     -------
@@ -376,5 +383,8 @@ def compute_cost(
 
     if speed == "fast" and model in _FAST_ELIGIBLE_MODELS:
         cost *= 2
+
+    if inference_geo == "us":
+        cost *= Decimal("1.1")
 
     return cost

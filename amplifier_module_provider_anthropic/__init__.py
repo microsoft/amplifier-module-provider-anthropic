@@ -726,6 +726,21 @@ class _RuntimeModelInfo:
     max_tokens: int | None = None
     supports_thinking: bool | None = None
     supports_adaptive_thinking: bool | None = None
+    # capabilities.thinking.types.enabled.supported -- manual ("enabled")
+    # thinking mode, distinct from adaptive above. Only used to NARROW the
+    # static value (never to widen it): Anthropic's own sample Models API
+    # response reports enabled.supported=true for claude-opus-5, which
+    # contradicts this provider's live-verified static value for that model
+    # (see D10/M59) -- so a runtime "true" is not trusted to turn a
+    # statically-False capability on, only a runtime "false" is trusted to
+    # turn a statically-True one off.
+    supports_manual_thinking: bool | None = None
+    # The subset of reasoning_effort levels capabilities.effort.<level>.supported
+    # reports true for, when the Models API response carries an `effort` key
+    # at all. None means the response had no effort capability data (leave
+    # the static list alone); an empty tuple means the response had the key
+    # but no level came back supported.
+    supported_efforts: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -2306,7 +2321,25 @@ class AnthropicProvider:
             supports_adaptive_thinking=cls._capability_supported(
                 model_info, "capabilities", "thinking", "types", "adaptive"
             ),
+            supports_manual_thinking=cls._capability_supported(
+                model_info, "capabilities", "thinking", "types", "enabled"
+            ),
+            supported_efforts=cls._extract_supported_efforts(model_info),
         )
+
+    @classmethod
+    def _extract_supported_efforts(cls, model_info: Any) -> tuple[str, ...] | None:
+        """Models API `capabilities.effort.<level>.supported` -> the subset
+        of levels reported true, or None when the response carries no
+        `effort` key at all (nothing to narrow against)."""
+        effort_node = cls._resolve_model_info_value(model_info, "capabilities", "effort")
+        if effort_node is None:
+            return None
+        supported: list[str] = []
+        for level in ("low", "medium", "high", "xhigh", "max"):
+            if cls._capability_supported(model_info, "capabilities", "effort", level):
+                supported.append(level)
+        return tuple(supported)
 
     @classmethod
     def _apply_runtime_capability_overrides(
@@ -2347,6 +2380,22 @@ class AnthropicProvider:
         if supports_thinking and default_thinking_budget <= 0:
             default_thinking_budget = 32000
 
+        # Narrow-only overlays (D10 / T7): a runtime "false" can turn a
+        # statically-True capability off; a runtime "true" never turns a
+        # statically-False one on, because Anthropic's own sample Models API
+        # payloads are demonstrably not reliable in the "true" direction
+        # (see the field comment on _RuntimeModelInfo.supports_manual_thinking).
+        supports_manual_thinking = base_caps.supports_manual_thinking
+        if runtime_info.supports_manual_thinking is False:
+            supports_manual_thinking = False
+
+        supported_efforts = base_caps.supported_efforts
+        if runtime_info.supported_efforts is not None:
+            supported_efforts = tuple(
+                e for e in base_caps.supported_efforts
+                if e in runtime_info.supported_efforts
+            )
+
         return ModelCapabilities(
             family=base_caps.family,
             max_output_tokens=runtime_info.max_tokens or base_caps.max_output_tokens,
@@ -2354,12 +2403,12 @@ class AnthropicProvider:
             supports_1m=supports_1m,
             supports_thinking=supports_thinking,
             supports_adaptive_thinking=supports_adaptive_thinking,
-            supports_manual_thinking=base_caps.supports_manual_thinking,
+            supports_manual_thinking=supports_manual_thinking,
             supports_output_config=base_caps.supports_output_config,
             supports_task_budget=base_caps.supports_task_budget,
             supports_sampling=base_caps.supports_sampling,
             thinking_display_required=base_caps.thinking_display_required,
-            supported_efforts=base_caps.supported_efforts,
+            supported_efforts=supported_efforts,
             supports_speed=base_caps.supports_speed,
             supports_inline_system=base_caps.supports_inline_system,
             thinking_always_on=base_caps.thinking_always_on,
@@ -4078,6 +4127,15 @@ class AnthropicProvider:
                 )
         if stop_sequences := options.get("stop_sequences"):
             params["stop_sequences"] = stop_sequences
+        # Data-residency pricing [PR$ "Data residency pricing"]: routing a
+        # request to a guaranteed-US inference region costs 1.1x standard
+        # pricing, stacking with the fast-mode 2x multiplier. This is a wire
+        # param the SDK passes straight through; the provider only needs to
+        # thread it into compute_cost() so Usage.cost_usd stays accurate
+        # (see _convert_to_chat_response's inference_geo argument).
+        inference_geo = options.get("inference_geo", self.config.get("inference_geo"))
+        if inference_geo is not None:
+            params["inference_geo"] = inference_geo
         headers = self._build_request_beta_headers(
             request_caps=request_caps,
             tools_present=bool(params.get("tools")),
@@ -5074,6 +5132,7 @@ class AnthropicProvider:
                 response,
                 computer_aliases=assembly.computer_aliases,
                 thinking_display=_sent_display,
+                inference_geo=assembly.params.get("inference_geo"),
             )
             if assembly.degradation is not None:
                 chat_response.degradation = assembly.degradation
@@ -6371,6 +6430,7 @@ class AnthropicProvider:
         *,
         computer_aliases: Mapping[str, str] | None = None,
         thinking_display: str | None = None,
+        inference_geo: str | None = None,
     ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
@@ -6555,6 +6615,7 @@ class AnthropicProvider:
             cache_creation_5m_input_tokens=cache_creation_5m,
             cache_creation_1h_input_tokens=cache_creation_1h,
             speed=getattr(response.usage, "speed", None),
+            inference_geo=inference_geo,
         )
         usage = usage.model_copy(update={"cost_usd": cost})
         self._add_cost(cost)
