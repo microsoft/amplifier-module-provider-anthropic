@@ -17,7 +17,12 @@ def test_readme_documents_opus55_migration_and_config():
         "inference_geo",
         "provider:thinking_binding_retry",
         "provider:thinking_blocks_dropped",
-        "ChatResponse.degradation",
+        "InvalidRequestError",
+        "bedrock-runtime",
+        "bedrock-mantle",
+        "Microsoft Foundry",
+        "Claude Platform on AWS",
+        "ANTHROPIC_BASE_URL",
         "reasoning_extraction",
     ):
         assert required in readme

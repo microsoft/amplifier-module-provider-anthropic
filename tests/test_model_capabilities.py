@@ -467,8 +467,10 @@ class TestThinkingAlwaysOn:
         2. forced tool_choice any/tool -> HTTP 400 (supports_forced_tool_choice)
         3. thinking blocks are bound to a fixed conversation prefix
            (preserved_thinking)
-        4. computer_20251124 is rejected; computer_toolset_20260801 replaces it
-           (computer_use_tool_type)
+        4. computer_20251124 is rejected; computer_toolset_20260801 replaces it,
+           and the effective wire type is resolved per-platform at request
+           time rather than fixed (computer_use_tool_type,
+           computer_use_platform_aware)
 
         Plus one additive-only beta capability: thinking.display="updates"
         progress updates (supports_progress_updates).
@@ -483,6 +485,7 @@ class TestThinkingAlwaysOn:
             dataclasses.replace(
                 caps_55,
                 computer_use_tool_type="computer_20251124",
+                computer_use_platform_aware=False,
                 supports_forced_tool_choice=True,
                 thinking_disableable=True,
                 preserved_thinking=False,
@@ -505,6 +508,7 @@ class TestThinkingAlwaysOn:
         assert caps_55.supports_speed is True
         assert caps_55.supports_inline_system is True
         assert caps_55.computer_use_tool_type == "computer_toolset_20260801"
+        assert caps_55.computer_use_platform_aware is True
         assert caps_55.supports_native_computer_use is True
         assert caps_55.supports_forced_tool_choice is False
         assert caps_55.thinking_disableable is False
@@ -521,6 +525,7 @@ class TestThinkingAlwaysOn:
         caps_5 = AnthropicProvider._get_capabilities("claude-opus-5")
 
         assert caps_5.computer_use_tool_type == "computer_20251124"
+        assert caps_5.computer_use_platform_aware is False
         assert caps_5.supports_forced_tool_choice is True
         assert caps_5.thinking_disableable is True
         assert caps_5.preserved_thinking is False

@@ -54,7 +54,6 @@ from amplifier_core.utils import redact_secrets
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
-from amplifier_core.message_models import Degradation
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolCall
 from anthropic import APIStatusError as AnthropicAPIStatusError
@@ -537,7 +536,6 @@ class _RequestAssembly:
     thinking_enabled: bool
     thinking_budget: int | None
     interleaved_thinking_enabled: bool
-    degradation: Degradation | None = None
     computer_aliases: dict[str, str] = field(default_factory=dict)
 
 
@@ -687,6 +685,13 @@ class ModelCapabilities:
         # is rejected outright (HTTP 400), unlike OpenAI's single bare "computer" type.
         # None means this model does not support the tool at all.
     )
+    computer_use_platform_aware: bool = (
+        False  # True = computer_use_tool_type above is only the first-party
+        # default; the effective wire type must instead be resolved per the
+        # request's base_url platform (see
+        # _computer_toolset.resolve_platform_computer_type). Opus 5.5+ only
+        # -- earlier generations use one wire type regardless of platform.
+    )
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
     min_cacheable_tokens: int = (
         1024  # Below this, the API silently skips caching (no error) --
@@ -697,8 +702,8 @@ class ModelCapabilities:
     supports_forced_tool_choice: bool = (
         True  # False = tool_choice type "any"/"tool" (forced choice) is REJECTED
         # with HTTP 400 on both the Messages and count_tokens endpoints
-        # (Opus 5.5+). The provider must downgrade to {"type": "auto"} and
-        # surface a ChatResponse.degradation rather than let the request fail.
+        # (Opus 5.5+). The provider raises a local KernelInvalidRequestError
+        # before dispatch instead of sending the doomed request.
     )
     thinking_disableable: bool = (
         True  # False = thinking can never be turned off; the model always runs
@@ -1350,7 +1355,6 @@ class AnthropicProvider:
             )
         self.extra_request_params: dict[str, Any] = dict(_extra)
         self._extra_params_warned_keys: set[str] = set()
-        self._tool_choice_downgrade_warned = set()
         self._opus55_warned_once: set[tuple[str, str]] = set()
 
         # Use streaming API by default to support large context windows (Anthropic requires streaming
@@ -2150,6 +2154,7 @@ class AnthropicProvider:
                 thinking_disableable=not is_55_plus,
                 preserved_thinking=is_55_plus,
                 supports_progress_updates=is_55_plus,
+                computer_use_platform_aware=is_55_plus,
                 # Non-monotonic by design -- 4.6->4096, 4.7->2048, 4.8->1024,
                 # 5->512 -- verified against
                 # platform.claude.com/en/docs/build-with-claude/prompt-caching,
@@ -2450,6 +2455,7 @@ class AnthropicProvider:
             thinking_disableable=base_caps.thinking_disableable,
             preserved_thinking=base_caps.preserved_thinking,
             supports_progress_updates=base_caps.supports_progress_updates,
+            computer_use_platform_aware=base_caps.computer_use_platform_aware,
         )
 
     async def _get_runtime_model_info(self, model_id: str) -> _RuntimeModelInfo | None:
@@ -3749,6 +3755,16 @@ class AnthropicProvider:
         # still takes computer_20251124); an invalid value is ignored with a
         # warning rather than silently breaking every computer-use request.
         effective_computer_type = request_caps.computer_use_tool_type
+        computer_platform_label: str | None = None
+        if request_caps.computer_use_platform_aware:
+            # Opus 5.5+: the static family default above is only correct on
+            # the first-party API. Resolve the actual wire type from the
+            # request's base_url platform instead -- see
+            # _computer_toolset.classify_platform.
+            raw_base_url = self._base_url or os.environ.get("ANTHROPIC_BASE_URL")
+            effective_computer_type, computer_platform_label = (
+                _computer_toolset.resolve_platform_computer_type(raw_base_url)
+            )
         config_computer_type = self.config.get("computer_use_tool_type")
         if config_computer_type is not None:
             if config_computer_type in (
@@ -3918,9 +3934,36 @@ class AnthropicProvider:
         computer_aliases: dict[str, str] = {}
         if request.tools:
             tools = self._convert_tools_from_request(request.tools)
-            tools, computer_aliases = _computer_toolset.translate_tools(
-                tools, effective_computer_type
-            )
+            if (
+                request_caps.computer_use_platform_aware
+                and effective_computer_type is None
+                and any(
+                    tool.get("type") in _computer_toolset.LEGACY_COMPUTER_TYPES
+                    or tool.get("type") == _computer_toolset.TOOLSET_TYPE
+                    for tool in tools
+                )
+            ):
+                raise KernelInvalidRequestError(
+                    f"{effective_model} does not support any computer-use "
+                    f"tool type on this platform ({computer_platform_label}). "
+                    "Supported: the first-party Anthropic API or Google "
+                    "Cloud/Vertex AI (computer_toolset_20260801), and Amazon "
+                    "Bedrock (computer_20251124). Remove the computer tool, "
+                    "point base_url at a supported platform, or set "
+                    "computer_use_tool_type explicitly if this endpoint "
+                    "accepts a computer-use tool type despite not matching "
+                    "a recognized platform.",
+                    provider="anthropic",
+                    model=effective_model,
+                )
+            try:
+                tools, computer_aliases = _computer_toolset.translate_tools(
+                    tools, effective_computer_type
+                )
+            except _computer_toolset.UnsupportedComputerToolsetDowngradeError as e:
+                raise KernelInvalidRequestError(
+                    str(e), provider="anthropic", model=effective_model
+                ) from e
             if computer_aliases and emit_diagnostics:
                 logger.info(
                     "[PROVIDER] Translated legacy computer-use tool to %s for %s",
@@ -3933,29 +3976,33 @@ class AnthropicProvider:
             params.setdefault("tools", []).insert(0, self._build_web_search_tool(options))
             if emit_diagnostics:
                 logger.info("[PROVIDER] Native web search tool enabled")
-        degradation: Degradation | None = None
         if "tools" in params:
-            if options.get("tool_choice"):
-                params["tool_choice"] = options["tool_choice"]
-            elif request.tool_choice:
-                if request.tool_choice == "none":
+            # kwargs tool_choice wins over the portable request.tool_choice
+            # (existing precedence), but BOTH must go through the identical
+            # portable-string -> wire-dict mapping before the forced-choice
+            # gate below -- a kwargs string "required" is exactly as forced
+            # as request.tool_choice == "required" and must not bypass the
+            # gate just because it arrived through a different parameter.
+            raw_tool_choice = (
+                options["tool_choice"]
+                if options.get("tool_choice")
+                else request.tool_choice
+            )
+            if raw_tool_choice:
+                if raw_tool_choice == "none":
                     params["tool_choice"] = {"type": "none"}
-                elif request.tool_choice == "auto":
+                elif raw_tool_choice == "auto":
                     params["tool_choice"] = {"type": "auto"}
-                elif request.tool_choice == "required":
+                elif raw_tool_choice == "required":
                     params["tool_choice"] = {"type": "any"}
                 else:
-                    params["tool_choice"] = request.tool_choice
+                    params["tool_choice"] = raw_tool_choice
             if "tool_choice" in params:
-                params["tool_choice"], choice_degradation = (
-                    self._gate_forced_tool_choice(
-                        params["tool_choice"],
-                        request_caps,
-                        model=effective_model,
-                        emit_diagnostics=emit_diagnostics,
-                    )
+                self._reject_unsupported_forced_tool_choice(
+                    params["tool_choice"],
+                    request_caps,
+                    model=effective_model,
                 )
-                degradation = degradation or choice_degradation
             if (
                 computer_aliases
                 and not self._config_bool(self.config.get("computer_batch_actions", False))
@@ -4220,10 +4267,23 @@ class AnthropicProvider:
             if "extended_thinking" in options
             else config_thinking is False
         )
+        # On a model whose thinking is never disableable (Opus 5.5+), an
+        # `extended_thinking: false` opt-out is already a no-op above --
+        # thinking runs regardless (D28/thinking_disableable handling). It
+        # must not ALSO suppress an explicit resolved reasoning_effort here:
+        # doing so would silently drop output_config.effort even though the
+        # server is thinking at full, unrequested default effort instead of
+        # the caller's/config's explicit choice. Suppression is scoped to
+        # models where the opt-out actually turns thinking off.
+        suppress_effort_for_opt_out = (
+            request_caps.thinking_disableable
+            and explicit_thinking_opt_out
+            and "effort" not in options
+        )
         if (
             request_caps.supports_output_config
             and reasoning_effort is not None
-            and not (explicit_thinking_opt_out and "effort" not in options)
+            and not suppress_effort_for_opt_out
         ):
             effort = options.get("effort", reasoning_effort)
             if effort in request_caps.supported_efforts:
@@ -4380,64 +4440,50 @@ class AnthropicProvider:
             thinking_enabled=thinking_enabled,
             thinking_budget=thinking_budget,
             interleaved_thinking_enabled=interleaved_thinking_enabled,
-            degradation=degradation,
             computer_aliases=computer_aliases,
         )
 
-    def _gate_forced_tool_choice(
+    def _reject_unsupported_forced_tool_choice(
         self,
         choice: Any,
         caps: ModelCapabilities,
         *,
         model: str,
-        emit_diagnostics: bool = False,
-    ) -> tuple[Any, Degradation | None]:
-        """Downgrade a forced ``tool_choice`` the model rejects outright.
+    ) -> None:
+        """Raise before any HTTP request when *choice* forces a tool the
+        model rejects outright.
 
         Opus 5.5+ (``caps.supports_forced_tool_choice is False``) returns
         HTTP 400 for ``tool_choice`` type ``"any"`` or ``"tool"`` (forced
-        choice) -- confirmed in Anthropic's "What's new" migration guidance.
-        A deterministic 400 is useless to callers, so the forced choice is
-        downgraded to ``{"type": "auto"}`` (preserving
-        ``disable_parallel_tool_use`` when present) and reported via
-        ``ChatResponse.degradation``. This is weaker than Anthropic's
-        suggested replacement (strict tools + prompt wording), which the
-        provider cannot apply without editing the request prefix -- see the
-        README "Claude Opus 5.5" section.
+        choice) -- confirmed in Anthropic's "What's new" migration guidance,
+        on both the Messages and ``count_tokens`` endpoints. A deterministic
+        400 tells the caller nothing it doesn't already know, so this is
+        raised locally and immediately, before dispatch, as a clear and
+        actionable ``KernelInvalidRequestError`` instead. Because this runs
+        inside ``_assemble_request_params``, every caller of that shared
+        assembly (Messages, ``request_budget``, ``count_tokens``) rejects the
+        same way -- see the README "Claude Opus 5.5" section.
 
         Only a dict-shaped, already-mapped choice is gated; a caller-supplied
         raw string is left alone (the typed mapping above always produces a
-        dict before this is called).
+        dict before this is called). ``extra_request_params`` is merged in
+        AFTER assembly (including this gate) and so deliberately bypasses it
+        -- the documented "user wins" escape hatch.
         """
         if caps.supports_forced_tool_choice or not isinstance(choice, dict):
-            return choice, None
+            return
         if choice.get("type") not in ("any", "tool"):
-            return choice, None
-        new_choice: dict[str, Any] = {"type": "auto"}
-        if (disable_parallel := choice.get("disable_parallel_tool_use")) is not None:
-            new_choice["disable_parallel_tool_use"] = disable_parallel
-        if emit_diagnostics:
-            warn_key = (model, str(choice.get("type")))
-            if warn_key not in self._tool_choice_downgrade_warned:
-                self._tool_choice_downgrade_warned.add(warn_key)
-                logger.warning(
-                    "[PROVIDER] %s rejects forced tool_choice (type=%r) with HTTP "
-                    "400; downgrading to {'type': 'auto'}. Use strict tool "
-                    "schemas and prompt wording to steer tool use instead.",
-                    model,
-                    choice.get("type"),
-                )
-        degradation = Degradation(
-            requested=f"tool_choice={json.dumps(choice, sort_keys=True)}",
-            actual=f"tool_choice={json.dumps(new_choice, sort_keys=True)}",
-            reason=(
-                f"{model} rejects forced tool_choice (type any/tool) with HTTP "
-                "400; downgraded to auto. Use strict tool schemas and prompt "
-                "wording to steer tool use."
-            ),
+            return
+        raise KernelInvalidRequestError(
+            f"{model} does not support forced tool_choice (type="
+            f"{choice.get('type')!r}); Anthropic rejects this with HTTP 400 "
+            "on both the Messages and count_tokens endpoints. Use "
+            "tool_choice='auto' together with strict tool schemas and "
+            "prompt wording that tells the model when to use the tool, or "
+            "tool_choice='none' to disable tools for this call.",
+            provider="anthropic",
+            model=model,
         )
-        return new_choice, degradation
-
     @staticmethod
     def _count_tokens_params(params: Mapping[str, Any]) -> dict[str, Any]:
         """Project assembled dispatch params to the count endpoint's schema."""
@@ -4466,7 +4512,22 @@ class AnthropicProvider:
         context_estimate: int,
         request_options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Return an exact Anthropic input decision or unavailable."""
+        """Return an exact Anthropic input decision or unavailable.
+
+        NOT purely fail-soft: ``_assemble_request_params`` performs local,
+        pre-dispatch validation (e.g. a forced ``tool_choice`` Opus 5.5+
+        rejects outright, or a computer-use tool the resolved platform/type
+        cannot represent) and RAISES ``KernelInvalidRequestError`` for those
+        cases rather than returning ``None``. This is deliberate: it gives
+        ``request_budget`` (and, by the same shared assembly, the Messages
+        and ``count_tokens`` dispatch paths) one consistent, actionable
+        rejection for a request that is invalid regardless of budget --
+        never a false "unavailable" answer that hides an error the caller
+        needs to see, and never a live ``count_tokens`` call for a request
+        that would 400 anyway. Every other unavailable case here (invalid
+        ``context_estimate``, no static/cached capabilities, a live
+        ``count_tokens`` failure) still returns ``None``.
+        """
         if (
             isinstance(context_estimate, bool)
             or not isinstance(context_estimate, int)
@@ -4547,7 +4608,17 @@ class AnthropicProvider:
         context_estimate: int,
         request_options: Mapping[str, Any] | None = None,
     ) -> dict[str, int] | None:
-        """Consume matching private server feedback to request one smaller retry."""
+        """Consume matching private server feedback to request one smaller retry.
+
+        Re-assembles the exact request that already reached the server
+        (feedback only exists because the first attempt was dispatched), so
+        the local pre-dispatch validation in ``_assemble_request_params``
+        (see ``request_budget``'s docstring) is not expected to raise here
+        in practice -- but if the model's capabilities changed between the
+        original dispatch and this recovery attempt, the same
+        ``KernelInvalidRequestError`` can still propagate rather than
+        silently returning ``None``.
+        """
         feedback = getattr(error, "_anthropic_overflow_feedback", None)
         if (
             not isinstance(feedback, _OverflowFeedback)
@@ -5348,8 +5419,6 @@ class AnthropicProvider:
                 emit_diagnostics=True,
                 effective_model=params["model"],
             )
-            if assembly.degradation is not None:
-                chat_response.degradation = assembly.degradation
 
             # T5 [PT]: "Count the transformations you receive back and
             # alert on them" -- emitted here (rather than inside the

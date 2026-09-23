@@ -161,24 +161,46 @@ Opus 5.5 differs from Opus 5 in several request contracts:
 - Thinking is always on. The provider always sends adaptive thinking with
   `thinking_display: summarized` unless configured otherwise. The server's
   default effort is `medium`; set `reasoning_effort` explicitly when that
-  matters. `extended_thinking: false` cannot disable thinking and logs a warning.
-  Thinking consumes `max_tokens`.
+  matters. `extended_thinking: false` cannot disable thinking and logs a
+  warning -- it also does **not** suppress an explicit resolved
+  `reasoning_effort` (from a request or from provider config):
+  `output_config.effort` is still sent alongside the always-on adaptive
+  thinking. Thinking consumes `max_tokens`.
 - `thinking_display: updates` opts into user-visible progress blocks. The
   provider adds `thinking-display-updates-2026-08-18` automatically and tags
   progress blocks/deltas with `visibility="user"` / `progress_update`.
 - Forced `tool_choice` (`required`, `any`, or a named tool) is unsupported by
-  Anthropic. The provider downgrades it to `auto` on both message and token-count
-  paths and reports a `ChatResponse.degradation`. This is weaker than strict
-  tools plus prompt wording. `extra_request_params` is a deliberate user-wins
-  escape hatch and can bypass this safety gate.
-- Legacy `computer_20251124` declarations are translated to
-  `computer_toolset_20260801` on supported Anthropic endpoints, without the
-  obsolete computer-use beta header. Member calls are translated back to the
-  existing Amplifier `computer` tool's `action` argument. Parallel member calls
-  are disabled by default; set `computer_batch_actions: true` only when the
-  tool executes batches in order and stops after failure. Tools remain
-  responsible for `key.repeat` and screenshot resizing. A Bedrock-compatible
-  gateway can opt back into `computer_20251124` with `computer_use_tool_type`.
+  Anthropic on this model -- confirmed for both the Messages and
+  `count_tokens` endpoints. The provider raises a local `InvalidRequestError`
+  before any HTTP request rather than sending a request Anthropic guarantees
+  will 400; both the Messages path and `request_budget`/`count_tokens` share
+  the same request assembly, so they reject identically. Use
+  `tool_choice: auto` together with strict tool schemas and prompt wording
+  that tells the model when to use the tool, or `tool_choice: none` to
+  disable tools for the call. `extra_request_params` is a deliberate
+  user-wins escape hatch and can still bypass this safety gate.
+- The computer-use wire type Opus 5.5 accepts depends on the serving
+  platform, inferred from `base_url` (or `ANTHROPIC_BASE_URL` when
+  `base_url` is unset): the first-party Anthropic/Claude API and Google
+  Cloud/Vertex AI accept only `computer_toolset_20260801`; Amazon Bedrock
+  (`bedrock-runtime.*`/`bedrock-mantle.*`) still accepts the legacy
+  `computer_20251124` type with its beta header; Microsoft Foundry,
+  "Claude Platform on AWS" (a separate AWS offering, not Bedrock), and any
+  other/unknown endpoint are undocumented and treated as unsupported. Legacy
+  `computer_20251124` declarations are translated to
+  `computer_toolset_20260801` wherever the toolset is the resolved type,
+  without the obsolete computer-use beta header. Declaring a
+  native computer tool on an unsupported platform raises a local
+  `InvalidRequestError` before dispatch rather than a deterministic 400. Set
+  `computer_use_tool_type` explicitly to override the platform's resolved
+  default (for example, a gateway fronting a different backend); an explicit
+  override always wins. Member calls are translated back to the existing
+  Amplifier `computer` tool's `action` argument. Parallel member calls are
+  disabled by default; set `computer_batch_actions: true` only when the tool
+  executes batches in order and stops after failure. Tools remain
+  responsible for `key.repeat` and screenshot resizing. Earlier Opus/Sonnet/
+  Haiku generations are unaffected by platform -- they keep their single,
+  version-gated wire type.
 - Thinking blocks are conversation-bound and must be replayed byte-exact in an
   append-only prefix. The provider stores and replays the exact wire content,
   preserves `input_transformations`, and adds
@@ -527,7 +549,7 @@ House-style key reference. ✅ = wizard-visible ConfigField, ⚙️ = settings-o
 | `thinking_type` | `adaptive` | ⚙️ | `adaptive`\|`enabled`. `adaptive` lets the model manage its own budget (and forbids `budget_tokens`); falls back to `enabled` on models without adaptive support |
 | `thinking_display` | `summarized` | ⚙️ | Thinking display mode. Opus 5.5 also supports beta `updates` progress blocks |
 | `thinking_prefix_mismatch_behavior` | *(automatic)* | ⚙️ | `error`\|`drop_block`. Default retries one prefix mismatch with `drop_block` and preserves that choice |
-| `computer_use_tool_type` | *(model default)* | ⚙️ | Override computer wire type for gateways; Opus 5.5 normally uses `computer_toolset_20260801` |
+| `computer_use_tool_type` | *(platform default)* | ⚙️ | Override the resolved computer wire type for gateways; Opus 5.5 resolves it from `base_url`'s platform (see "Claude Opus 5.5") |
 | `computer_batch_actions` | `false` | ⚙️ | Allow parallel computer-toolset member calls; enable only for ordered, fail-fast executors |
 | `inference_geo` | *(global)* | ⚙️ | `us` requests guaranteed-US inference and applies the 1.1x cost multiplier |
 | `enable_1m_context` | `false` | ✅ | Advertise the 1M context window (more history kept = higher cost) |
