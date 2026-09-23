@@ -890,6 +890,43 @@ def test_opus55_real_sdk_mock_transport_receives_serialized_safe_request() -> No
     assert captured[0]["max_tokens"] == 123
 
 
+@pytest.mark.parametrize("name_key", ["name", "tool"])
+@pytest.mark.parametrize("id_key", ["id", "tool_call_id"])
+def test_native_legacy_separate_calls_gain_matching_result_tags(
+    name_key: str, id_key: str
+) -> None:
+    from amplifier_module_provider_anthropic._computer_toolset import NativeComputerAdapter
+
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                id_key: "legacy_call",
+                name_key: "computer",
+                "arguments": {"action": "left_click", "coordinate": [2, 3]},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "legacy_call", "content": "ok"},
+    ]
+    original = json.loads(json.dumps(history))
+    wire = _provider()._convert_messages(
+        history, native_computer_adapter=NativeComputerAdapter(alias="computer")
+    )
+    assert wire[0]["content"] == [{
+        "type": "tool_use", "id": "legacy_call", "toolset_name": "computer",
+        "name": "left_click", "input": {"coordinate": [2, 3]},
+    }]
+    assert wire[1]["content"][0]["tool_use_id"] == "legacy_call"
+    assert wire[1]["content"][0]["toolset_name"] == "computer"
+    assert history == original
+    # Without an actual native declaration, this remains an ordinary function.
+    generic = _provider()._convert_messages(history)
+    assert generic[0]["content"][0]["name"] == "computer"
+    assert "toolset_name" not in generic[0]["content"][0]
+    assert "toolset_name" not in generic[1]["content"][0]
+
+
 def test_opus55_costs_and_fast_multiplier_are_exact() -> None:
     assert compute_cost(
         MODEL,

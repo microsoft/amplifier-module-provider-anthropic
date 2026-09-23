@@ -248,7 +248,9 @@ def native_wire_tool_use(
         tagged = False
     if adapter is None:
         return None
-    if not tagged and block.get("type") not in {"tool_call", "tool_use"}:
+    # Legacy separate tool_calls have no content-block discriminator.
+    # Only a matching native declaration below authorizes their translation.
+    if not tagged and block.get("type") not in {None, "tool_call", "tool_use"}:
         return None
     legacy_matching_alias = (
         not has_toolset_provenance
@@ -271,7 +273,7 @@ def native_wire_tool_use(
         native_input.pop("action")
     return {
         "type": "tool_use",
-        "id": block.get("id", ""),
+        "id": block.get("id") or block.get("tool_call_id", ""),
         "toolset_name": adapter.toolset_name,
         "name": action,
         "input": native_input,
