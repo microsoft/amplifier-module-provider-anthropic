@@ -147,6 +147,33 @@ def test_unknown_model_returns_none():
 
 
 # ---------------------------------------------------------------------------
+# Haiku 3.5 is keyed by its served model id
+# ---------------------------------------------------------------------------
+def test_haiku_35_real_model_id_is_priced():
+    """The id the API actually returns must resolve to the Haiku 3.5 rates."""
+    result = compute_cost("claude-3-5-haiku-20241022", input_tokens=1_000_000)
+    assert result == Decimal("0.80")
+
+
+def test_haiku_35_output_and_cache_rates():
+    assert compute_cost(
+        "claude-3-5-haiku-20241022", output_tokens=1_000_000
+    ) == Decimal("4.00")
+    assert compute_cost(
+        "claude-3-5-haiku-20241022", cache_read_input_tokens=1_000_000
+    ) == Decimal("0.08")
+    assert compute_cost(
+        "claude-3-5-haiku-20241022", cache_creation_input_tokens=1_000_000
+    ) == Decimal("1.00")
+
+
+def test_former_haiku_35_key_was_never_a_served_model_id():
+    """No model was served as claude-haiku-3-5-20250929, so it must not price."""
+    result = compute_cost("claude-haiku-3-5-20250929", input_tokens=1_000_000)
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
 # (g) None != Decimal('0'): unknown is distinct from free
 # ---------------------------------------------------------------------------
 def test_unknown_distinct_from_zero():
