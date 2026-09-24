@@ -17,10 +17,9 @@ guard because each is fixed by a different half of the change.
      which refuses any non-streaming call whose `max_tokens` exceeds 21,333 --
      and `self.max_tokens` defaults to the model's full output ceiling.
 
-Setting the client timeout does NOT disarm (2) on its own: with the default
-`timeout` of 600.0 the resulting Timeout is value-equal to the SDK's own
-DEFAULT_TIMEOUT, so that comparison stays true. `is_given(timeout)` is checked
-first, which is why the non-streaming call passes `timeout=` per request.
+Healthy model work is unbounded by default; explicit caller limits still apply.
+A timeout object must reach both client and request, retaining short connection
+and pool acquisition bounds while disabling read deadlines by default.
 
 No test here makes a network call.
 """
@@ -74,10 +73,11 @@ class TestClientTimeoutWiring:
         provider = _make_provider(timeout=3000.0)
         assert provider.client.timeout.connect == 5.0
 
-    def test_default_timeout_is_ten_minutes(self):
+    def test_default_timeout_waits_for_model_completion(self):
         provider = _make_provider()
-        assert provider.timeout == 600.0
-        assert provider.client.timeout.read == 600.0
+        assert provider.timeout is None
+        assert provider.client.timeout.read is None
+        assert provider.client.timeout.pool == 5.0
 
 
 class TestNonStreamingRequestTimeout:
@@ -101,28 +101,17 @@ class TestNonStreamingRequestTimeout:
     def test_request_carries_an_explicit_timeout(self):
         provider = _make_provider(timeout=1234.0)
         kwargs = self._run_non_streaming(provider)
-        assert kwargs.get("timeout") == 1234.0, (
+        assert kwargs["timeout"].read == 1234.0, (
             "Without an explicit per-request timeout the SDK estimates the "
             "request duration from max_tokens and refuses the call."
         )
 
     def test_default_config_still_carries_a_timeout(self):
-        """The default is where the client-level timeout alone is not enough.
-
-        `timeout=600.0` builds a Timeout value-equal to DEFAULT_TIMEOUT, so the
-        guard's client-timeout comparison stays true and only the per-request
-        timeout disarms it. This is the common configuration, so it is the case
-        most worth pinning.
-        """
         provider = _make_provider()
-        assert provider.client.timeout == DEFAULT_TIMEOUT, (
-            "Precondition for this test: the default config is value-equal to "
-            "DEFAULT_TIMEOUT. If the SDK's default changes this assertion is "
-            "the signal to re-check whether the per-request timeout is still "
-            "load-bearing."
-        )
         kwargs = self._run_non_streaming(provider)
-        assert kwargs.get("timeout") == 600.0
+        assert kwargs["timeout"].read is None
+        assert kwargs["timeout"].connect == 5.0
+        assert kwargs["timeout"].pool == 5.0
 
     def test_large_max_tokens_is_not_refused(self):
         """The reported failure: default max_tokens is above the SDK's cutoff."""

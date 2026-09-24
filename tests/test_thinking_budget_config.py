@@ -329,54 +329,46 @@ _DEFAULT_PATH_BASELINE: dict[str, dict[str, Any]] = {
         "model": "claude-haiku-4-5-20251001",
         "temperature": 1.0,
         "thinking": {"budget_tokens": 32000, "type": "enabled"},
-        "timeout": 600.0,
     },
     "haiku-effort-low": {
         "max_tokens": 64000,
         "model": "claude-haiku-4-5-20251001",
         "temperature": 1.0,
         "thinking": {"budget_tokens": 4096, "type": "enabled"},
-        "timeout": 600.0,
     },
     "haiku-effort-medium": {
         "max_tokens": 64000,
         "model": "claude-haiku-4-5-20251001",
         "temperature": 1.0,
         "thinking": {"budget_tokens": 32000, "type": "enabled"},
-        "timeout": 600.0,
     },
     "haiku-effort-xhigh": {
         "max_tokens": 64000,
         "model": "claude-haiku-4-5-20251001",
         "temperature": 1.0,
         "thinking": {"budget_tokens": 32000, "type": "enabled"},
-        "timeout": 600.0,
     },
     "haiku-no-effort": {
         "max_tokens": 64000,
         "model": "claude-haiku-4-5-20251001",
         "temperature": 0.7,
-        "timeout": 600.0,
     },
     "sonnet-effort-high": {
         "max_tokens": 64000,
         "model": "claude-sonnet-4-5-20250929",
         "temperature": 1.0,
         "thinking": {"budget_tokens": 32000, "type": "enabled"},
-        "timeout": 600.0,
     },
     "sonnet-effort-low": {
         "max_tokens": 64000,
         "model": "claude-sonnet-4-5-20250929",
         "temperature": 1.0,
         "thinking": {"budget_tokens": 4096, "type": "enabled"},
-        "timeout": 600.0,
     },
     "sonnet-no-effort": {
         "max_tokens": 64000,
         "model": "claude-sonnet-4-5-20250929",
         "temperature": 0.7,
-        "timeout": 600.0,
     },
 }
 
@@ -402,6 +394,8 @@ class TestDefaultPathByteIdentity:
         provider = _make_provider(model)
         params = _run(provider, reasoning_effort=effort)
         params.pop("messages", None)
+        # Transport options are not sent in the JSON generation body.
+        params.pop("timeout", None)
 
         expected = _DEFAULT_PATH_BASELINE[cell]
         assert json.dumps(params, sort_keys=True) == json.dumps(
