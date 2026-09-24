@@ -67,6 +67,16 @@ from anthropic._exceptions import (
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 from ._cost import compute_cost
+from ._computer_toolset import (
+    COMPUTER_TOOLSET_NAME,
+    PROVENANCE_MEMBER,
+    PROVENANCE_TOOLSET,
+    ComputerToolsetError,
+    NativeComputerAdapter,
+    is_opus_55,
+    native_wire_tool_use,
+    translate_tools,
+)
 
 # Params the Messages API still accepts on the wire but the SDK does not expose
 # as typed keyword arguments.
@@ -400,7 +410,7 @@ _STATIC_FALLBACK_MODELS: dict[str, str] = {
 _STATIC_BUDGET_MODEL_VERSIONS: dict[str, frozenset[tuple[int, int]]] = {
     "fable": frozenset({(5, 0), (5, 1)}),
     "mythos": frozenset({(5, 0), (5, 1)}),
-    "opus": frozenset({(4, 5), (4, 6), (4, 7), (4, 8), (5, 0)}),
+    "opus": frozenset({(4, 5), (4, 6), (4, 7), (4, 8), (5, 0), (5, 5)}),
     "sonnet": frozenset({(4, 5), (4, 6), (5, 0)}),
     "haiku": frozenset({(4, 5)}),
 }
@@ -528,6 +538,7 @@ class _RequestAssembly:
     thinking_enabled: bool
     thinking_budget: int | None
     interleaved_thinking_enabled: bool
+    native_computer_adapter: NativeComputerAdapter | None
 
 
 @dataclass
@@ -668,13 +679,19 @@ class ModelCapabilities:
     thinking_always_on: bool = (
         False  # True = thinking is always active; NEVER send thinking:{type:disabled}
     )
-    supports_native_computer_use: bool = False  # True = model accepts a "computer_*" native tool type (see computer_use_tool_type)
+    requires_adaptive_thinking: bool = (
+        False  # True = provider deliberately sends accepted thinking:{type:adaptive}, even for an opt-out
+    )
+    supports_forced_tool_choice: bool = (
+        True  # False = only portable auto/none tool choice is supported
+    )
+    supports_native_computer_use: bool = False  # True = model accepts the selected native computer tool type (see computer_use_tool_type)
     computer_use_tool_type: str | None = (
-        None  # Which "computer_*" wire type this model accepts -- Anthropic's versioned
+        None  # Which native computer wire type this model accepts. The legacy
         # computer-use tool has three incompatible generations (computer_20241022,
-        # computer_20250124, computer_20251124) and a model paired with the wrong one
-        # is rejected outright (HTTP 400), unlike OpenAI's single bare "computer" type.
-        # None means this model does not support the tool at all.
+        # computer_20250124, computer_20251124); Opus 5.5 instead uses its distinct
+        # computer_toolset_20260801 contract. A model paired with the wrong type is
+        # rejected outright (HTTP 400). None means this model does not support it.
     )
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
     min_cacheable_tokens: int = (
@@ -1518,6 +1535,10 @@ class AnthropicProvider:
             )
         return self._client
 
+    def _effective_base_url(self) -> str:
+        """Return the SDK-resolved endpoint without making an API request."""
+        return str(self.client.base_url)
+
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
         return ProviderInfo(
@@ -1883,16 +1904,17 @@ class AnthropicProvider:
         * **Sonnet 4.5+** — 1M context, extended thinking, 64K output
         * **Haiku 4.5+** — fast inference, extended thinking, no adaptive, no 1M
 
-        Computer-use wire type (``computer_use_tool_type``) — live-probed against
-        api.anthropic.com 2026-08-03, see per-family comments below for the full
-        evidence table:
+        Legacy computer-use wire types were live-probed against api.anthropic.com
+        2026-08-03; Opus 5.5's separate toolset is the provider adapter contract:
 
         * **Opus 4.1-4.5** / **Sonnet/Haiku 4.5** — ``computer_20250124``
         * **Opus/Sonnet 4.6+** (incl. Opus/Sonnet 5) — ``computer_20251124``
+        * **Opus 5.5** — ``computer_toolset_20260801`` through the request-local,
+          first-party-only adapter
         * Everything else (below the verified floor, or an unreachable/unverified
           model such as Fable) — unsupported (``None``)
 
-        These two generations are NOT interchangeable: pairing a model with the
+        The legacy generations are NOT interchangeable: pairing a model with the
         wrong one returns HTTP 400, not a graceful fallback.
 
         When the version cannot be parsed from the model ID we assume the
@@ -1983,6 +2005,8 @@ class AnthropicProvider:
             is_47_plus = not version_known or (major, minor) >= (4, 7)
             is_48_plus = not version_known or (major, minor) >= (4, 8)
             is_5_plus = not version_known or (major, minor) >= (5, 0)
+            is_55 = (major, minor) == (5, 5)
+            native_55_supported = is_opus_55(model_id)
             # Computer-use wire type, live-probed against api.anthropic.com
             # 2026-08-03 (bare {"type": ..., "name": "computer", "display_width_px":
             # 1024, "display_height_px": 768} declarations, matching anthropic-beta
@@ -1998,7 +2022,17 @@ class AnthropicProvider:
             #     supersedes rather than extends the older one)
             # Below 4.1 is unverified: the only pre-4.1 opus model (claude-opus-4-20250514)
             # is retired (HTTP 404) in this workspace, so it could not be probed either way.
-            if is_46_plus:
+            if native_55_supported:
+                # This is an adapter capability rather than legacy
+                # computer-use support: actual declaration translation remains
+                # restricted to the first-party endpoint in translate_tools().
+                computer_use_tool_type = "computer_toolset_20260801"
+            elif is_55:
+                # _detect_version still recognizes 5.5 for the independently
+                # verified thinking/output contract, but native computer needs
+                # a model spelling this provider has actually verified.
+                computer_use_tool_type = None
+            elif is_46_plus:
                 computer_use_tool_type = "computer_20251124"
             elif version_known and (major, minor) >= (4, 1):
                 computer_use_tool_type = "computer_20250124"
@@ -2046,6 +2080,13 @@ class AnthropicProvider:
                 supports_speed=is_48_plus,
                 supports_inline_system=is_48_plus,
                 default_thinking_budget=64000 if is_46_plus else 32000,
+                # Opus 5.5 is a distinct API contract: thinking remains
+                # mandatory and adaptive, so `extended_thinking: false` cannot
+                # disable it.  Unlike Fable/Mythos the provider deliberately
+                # sends the accepted adaptive-thinking form, hence this is
+                # intentionally not `thinking_always_on`.
+                requires_adaptive_thinking=is_55,
+                supports_forced_tool_choice=not is_55,
                 supports_native_computer_use=computer_use_tool_type is not None,
                 computer_use_tool_type=computer_use_tool_type,
                 # Non-monotonic by design -- 4.6->4096, 4.7->2048, 4.8->1024,
@@ -2285,6 +2326,7 @@ class AnthropicProvider:
             supports_thinking=supports_thinking,
             supports_adaptive_thinking=supports_adaptive_thinking,
             supports_manual_thinking=base_caps.supports_manual_thinking,
+            manual_thinking_deprecated=base_caps.manual_thinking_deprecated,
             supports_output_config=base_caps.supports_output_config,
             supports_task_budget=base_caps.supports_task_budget,
             supports_sampling=base_caps.supports_sampling,
@@ -2293,6 +2335,8 @@ class AnthropicProvider:
             supports_speed=base_caps.supports_speed,
             supports_inline_system=base_caps.supports_inline_system,
             thinking_always_on=base_caps.thinking_always_on,
+            requires_adaptive_thinking=base_caps.requires_adaptive_thinking,
+            supports_forced_tool_choice=base_caps.supports_forced_tool_choice,
             default_thinking_budget=default_thinking_budget,
             # Not derived from the Models API — Anthropic's model metadata carries
             # no computer-use signal, so the family/version-gated static value is
@@ -2304,6 +2348,7 @@ class AnthropicProvider:
             supports_native_computer_use=base_caps.supports_native_computer_use,
             computer_use_tool_type=base_caps.computer_use_tool_type,
             capability_tags=tuple(capability_tags),
+            min_cacheable_tokens=base_caps.min_cacheable_tokens,
         )
 
     async def _get_runtime_model_info(self, model_id: str) -> _RuntimeModelInfo | None:
@@ -2605,13 +2650,18 @@ class AnthropicProvider:
         """
         stripped = request.model_copy(deep=True)
         for message in stripped.messages:
-            if message.role != "assistant" or not isinstance(message.content, list):
+            if message.role != "assistant":
                 continue
-            message.content = [
-                block
-                for block in message.content
-                if getattr(block, "type", None) not in ("thinking", "redacted_thinking")
-            ]
+            # Clear the legacy compatibility field as well, or history
+            # conversion can restore thinking removed from canonical content.
+            if hasattr(message, "thinking_block"):
+                delattr(message, "thinking_block")
+            if isinstance(message.content, list):
+                message.content = [
+                    block
+                    for block in message.content
+                    if getattr(block, "type", None) not in ("thinking", "redacted_thinking")
+                ]
         return stripped
 
     @staticmethod
@@ -3514,6 +3564,19 @@ class AnthropicProvider:
         effective_model = options.get("model", self.default_model)
         if not isinstance(effective_model, str):
             return None
+        try:
+            request_tools, native_computer_adapter = translate_tools(
+                request.tools or [],
+                model=effective_model,
+                base_url=self._effective_base_url,
+            )
+        except ComputerToolsetError as exc:
+            raise KernelInvalidRequestError(
+                str(exc),
+                provider="anthropic",
+                model=effective_model,
+                status_code=400,
+            ) from exc
         staged_prefix_state = (
             OrderedDict(self._prefix_fingerprints)
             if prefix_state is None
@@ -3543,6 +3606,7 @@ class AnthropicProvider:
             *self._convert_messages(
                 [message.model_dump() for message in conversation],
                 emit_warnings=emit_diagnostics,
+                native_computer_adapter=native_computer_adapter,
             ),
         ]
         observed_state = "disabled"
@@ -3610,8 +3674,64 @@ class AnthropicProvider:
                 params["model"],
             )
 
-        if request.tools:
-            tools = self._convert_tools_from_request(request.tools)
+        choice = (
+            options["tool_choice"]
+            if options.get("tool_choice") is not None
+            else request.tool_choice
+        )
+        normalized_tool_choice: dict[str, Any] | None = None
+        if choice is not None:
+            if isinstance(choice, str):
+                normalized_choices = {
+                    "none": {"type": "none"},
+                    "auto": {"type": "auto"},
+                    "required": {"type": "any"},
+                }
+                if choice not in normalized_choices:
+                    raise KernelInvalidRequestError(
+                        f"Unsupported tool_choice {choice!r}; use 'none', 'auto', "
+                        "'required', or an Anthropic wire dictionary.",
+                        provider="anthropic",
+                        model=effective_model,
+                        status_code=400,
+                    )
+                normalized_tool_choice = normalized_choices[choice]
+            elif isinstance(choice, dict):
+                normalized_tool_choice = dict(choice)
+            else:
+                raise KernelInvalidRequestError(
+                    f"Unsupported tool_choice type {type(choice).__name__}.",
+                    provider="anthropic",
+                    model=effective_model,
+                    status_code=400,
+                )
+            if (
+                not request_caps.supports_forced_tool_choice
+                and normalized_tool_choice.get("type") in {"any", "tool"}
+            ):
+                raise KernelInvalidRequestError(
+                    "claude-opus-5-5 supports only tool_choice 'auto' or "
+                    "'none'; required/any and named tool choice are unavailable.",
+                    provider="anthropic",
+                    model=effective_model,
+                    status_code=400,
+                )
+            if (
+                native_computer_adapter is not None
+                and normalized_tool_choice.get("type") == "auto"
+            ):
+                # Copy above keeps caller-owned tool_choice dictionaries intact.
+                # A native computer response is one executor action, so make
+                # that request-wide restriction explicit on the wire.
+                normalized_tool_choice["disable_parallel_tool_use"] = True
+        elif native_computer_adapter is not None:
+            normalized_tool_choice = {
+                "type": "auto",
+                "disable_parallel_tool_use": True,
+            }
+
+        if request_tools:
+            tools = self._convert_tools_from_request(request_tools)
             tools, _ = self._apply_tool_cache_control(tools)
             params["tools"] = tools
         if options.get("enable_web_search", self.enable_web_search):
@@ -3619,17 +3739,8 @@ class AnthropicProvider:
             if emit_diagnostics:
                 logger.info("[PROVIDER] Native web search tool enabled")
         if "tools" in params:
-            if options.get("tool_choice"):
-                params["tool_choice"] = options["tool_choice"]
-            elif request.tool_choice:
-                if request.tool_choice == "none":
-                    params["tool_choice"] = {"type": "none"}
-                elif request.tool_choice == "auto":
-                    params["tool_choice"] = {"type": "auto"}
-                elif request.tool_choice == "required":
-                    params["tool_choice"] = {"type": "any"}
-                else:
-                    params["tool_choice"] = request.tool_choice
+            if normalized_tool_choice is not None:
+                params["tool_choice"] = normalized_tool_choice
 
         reasoning_effort = getattr(request, "reasoning_effort", None)
         if reasoning_effort is None:
@@ -3698,6 +3809,20 @@ class AnthropicProvider:
                     effective_model,
                 )
             thinking_enabled = False
+        if request_caps.requires_adaptive_thinking:
+            if (
+                (options.get("extended_thinking") is False)
+                or (
+                    "extended_thinking" not in options
+                    and config_thinking is False
+                )
+            ) and emit_diagnostics:
+                logger.warning(
+                    "[PROVIDER] %s uses adaptive thinking; "
+                    "extended_thinking=false cannot disable model thinking.",
+                    effective_model,
+                )
+            thinking_enabled = True
         if (
             emit_diagnostics
             and reasoning_effort in ("xhigh", "max")
@@ -3713,7 +3838,10 @@ class AnthropicProvider:
                 request_caps.supported_efforts,
             )
         if thinking_enabled:
-            if request_caps.thinking_always_on:
+            if request_caps.requires_adaptive_thinking:
+                params["thinking"] = {"type": "adaptive"}
+                resolved_thinking_type = "adaptive"
+            elif request_caps.thinking_always_on:
                 resolved_thinking_type = "adaptive"
             else:
                 effort_thinking_type: str | None = None
@@ -3765,11 +3893,6 @@ class AnthropicProvider:
                         "type": thinking_type,
                         "budget_tokens": budget_tokens,
                     }
-                if request_caps.thinking_display_required:
-                    params["thinking"]["display"] = options.get(
-                        "thinking_display",
-                        self.config.get("thinking_display", "summarized"),
-                    )
                 if request_caps.supports_sampling:
                     params["temperature"] = 1.0
                 target_tokens = min(budget_tokens + buffer_tokens, model_ceiling)
@@ -3790,6 +3913,13 @@ class AnthropicProvider:
                         params["max_tokens"],
                         interleaved_thinking_enabled,
                     )
+            if request_caps.thinking_display_required and isinstance(
+                params.get("thinking"), dict
+            ):
+                params["thinking"]["display"] = options.get(
+                    "thinking_display",
+                    self.config.get("thinking_display", "summarized"),
+                )
 
         # An explicit budget must never be silently ignored.  This shared guard
         # runs for dispatch only; a pure preflight is intentionally log-free.
@@ -3805,7 +3935,13 @@ class AnthropicProvider:
                 else None
             )
             if sent_budget != requested_budget:
-                if not thinking_enabled and not request_caps.supports_thinking:
+                if request_caps.requires_adaptive_thinking:
+                    reason = (
+                        f"{effective_model} uses adaptive thinking; the API "
+                        "forbids budget_tokens in that mode and this provider "
+                        "preserves the configured output ceiling"
+                    )
+                elif not thinking_enabled and not request_caps.supports_thinking:
                     reason = (
                         f"model {params['model']} does not support extended "
                         "thinking, so no thinking budget is sent at all"
@@ -3850,12 +3986,17 @@ class AnthropicProvider:
             if "extended_thinking" in options
             else config_thinking is False
         )
+        requested_output_effort = options.get("effort", reasoning_effort)
         if (
             request_caps.supports_output_config
-            and reasoning_effort is not None
-            and not (explicit_thinking_opt_out and "effort" not in options)
+            and requested_output_effort is not None
+            and not (
+                explicit_thinking_opt_out
+                and "effort" not in options
+                and not request_caps.requires_adaptive_thinking
+            )
         ):
-            effort = options.get("effort", reasoning_effort)
+            effort = requested_output_effort
             if effort in request_caps.supported_efforts:
                 params["output_config"] = {"effort": effort}
             elif emit_diagnostics:
@@ -3917,6 +4058,7 @@ class AnthropicProvider:
             thinking_enabled=thinking_enabled,
             thinking_budget=thinking_budget,
             interleaved_thinking_enabled=interleaved_thinking_enabled,
+            native_computer_adapter=native_computer_adapter,
         )
 
     @staticmethod
@@ -4262,6 +4404,15 @@ class AnthropicProvider:
                                                 name = getattr(block, "name", None)
                                                 if name:
                                                     payload["name"] = name
+                                                toolset_name = getattr(
+                                                    block, "toolset_name", None
+                                                )
+                                                if toolset_name:
+                                                    # Display metadata only:
+                                                    # execution waits for the
+                                                    # request-local final-response
+                                                    # conversion below.
+                                                    payload["toolset_name"] = toolset_name
                                             await self.coordinator.hooks.emit(
                                                 "llm:stream_block_start",
                                                 payload,
@@ -4806,7 +4957,9 @@ class AnthropicProvider:
                     )
 
             # Build ChatResponse first
-            chat_response = self._convert_to_chat_response(response)
+            chat_response = self._convert_to_chat_response(
+                response, native_computer_adapter=assembly.native_computer_adapter
+            )
 
             # Emit from canonical fields
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -4935,13 +5088,15 @@ class AnthropicProvider:
             if "signature" in block:
                 cleaned["signature"] = block["signature"]
             return cleaned
-        if block_type == "tool_use":
+        if block_type in {"tool_use", "tool_call"}:
             return {
                 "type": "tool_use",
                 "id": block.get("id", ""),
-                "name": block.get("name", ""),
-                "input": block.get("input", {}),
+                "name": block.get("name", block.get("tool", "")),
+                "input": block.get("input", block.get("arguments", {})),
             }
+        if block_type == "redacted_thinking":
+            return {"type": "redacted_thinking", "data": block.get("data", "")}
         if block_type == "tool_result":
             return {
                 "type": "tool_result",
@@ -4964,8 +5119,22 @@ class AnthropicProvider:
         cleaned.pop("visibility", None)
         return cleaned
 
+    @staticmethod
+    def _content_block_mapping(block: Any) -> dict[str, Any] | None:
+        """Return a copied persisted block without changing caller-owned data."""
+        if isinstance(block, dict):
+            return dict(block)
+        if hasattr(block, "model_dump"):
+            dumped = block.model_dump()
+            return dict(dumped) if isinstance(dumped, dict) else None
+        return None
+
     def _convert_messages(
-        self, messages: list[dict[str, Any]], *, emit_warnings: bool = True
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        emit_warnings: bool = True,
+        native_computer_adapter: NativeComputerAdapter | None = None,
     ) -> list[dict[str, Any]]:
         """Convert messages to Anthropic format.
 
@@ -4982,11 +5151,16 @@ class AnthropicProvider:
         # First pass: collect all valid tool_use_ids from assistant messages
         valid_tool_use_ids: set[str] = set()
         for msg in messages:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg.get("tool_calls", []):
-                    tc_id = tc.get("id") or tc.get("tool_call_id")
-                    if tc_id:
-                        valid_tool_use_ids.add(tc_id)
+            if msg.get("role") == "assistant":
+                legacy_tool_calls = msg.get("tool_calls") or []
+                if isinstance(legacy_tool_calls, list):
+                    for raw_call in legacy_tool_calls:
+                        call = self._content_block_mapping(raw_call)
+                        if call is None:
+                            continue
+                        tool_id = call.get("id") or call.get("tool_call_id")
+                        if isinstance(tool_id, str) and tool_id:
+                            valid_tool_use_ids.add(tool_id)
             # ALSO scan content blocks for tool_use/tool_call entries.
             # On session resume, synthetic tool results are injected by complete() before
             # _convert_messages() runs. If the content blocks contain tool_use IDs that
@@ -4996,14 +5170,17 @@ class AnthropicProvider:
             if msg.get("role") == "assistant":
                 content = msg.get("content")
                 if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict):
-                            if block.get("type") == "tool_use" and block.get("id"):
-                                valid_tool_use_ids.add(block["id"])
-                            elif block.get("type") == "tool_call" and block.get("id"):
-                                valid_tool_use_ids.add(block["id"])
+                    for raw_block in content:
+                        block = self._content_block_mapping(raw_block)
+                        if (
+                            block is not None
+                            and block.get("type") in {"tool_use", "tool_call"}
+                            and block.get("id")
+                        ):
+                            valid_tool_use_ids.add(block["id"])
 
         anthropic_messages = []
+        native_tool_use_ids: dict[str, str] = {}
         i = 0
 
         while i < len(messages):
@@ -5037,13 +5214,15 @@ class AnthropicProvider:
                         i += 1
                         continue
 
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": tool_msg.get("content", ""),
-                        }
-                    )
+                    result = {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_msg.get("content", ""),
+                    }
+                    toolset_name = native_tool_use_ids.get(tool_use_id)
+                    if toolset_name:
+                        result["toolset_name"] = toolset_name
+                    tool_results.append(result)
                     i += 1
 
                 # Only add user message if we have valid tool_results
@@ -5060,112 +5239,170 @@ class AnthropicProvider:
                     )
                 continue  # i already advanced in while loop
             if role == "assistant":
-                # Assistant messages - check for tool calls or thinking blocks
-                if "tool_calls" in msg and msg["tool_calls"]:
-                    # Assistant message with tool calls
-                    content_blocks = []
-
-                    # CRITICAL: Check for thinking block and add it FIRST
-                    has_thinking = "thinking_block" in msg and msg["thinking_block"]
-                    if has_thinking:
-                        # Clean thinking block (remove visibility field not accepted by API)
-                        cleaned_thinking = self._clean_content_block(
-                            msg["thinking_block"]
-                        )
-                        content_blocks.append(cleaned_thinking)
-
-                    # Add text content if present, BUT skip when we have thinking + tool_calls
-                    # When all three are present (thinking + text + tool_use), the text was generated
-                    # but not shown to user yet (tool calls execute first). Including it in history
-                    # misleads the model into thinking it already communicated that info.
-                    if content and not has_thinking:
-                        if isinstance(content, list):
-                            # Content is a list of blocks - extract text blocks only
-                            for block in content:
-                                if (
-                                    isinstance(block, dict)
-                                    and block.get("type") == "text"
-                                ):
-                                    content_blocks.append(
-                                        {"type": "text", "text": block.get("text", "")}
-                                    )
-                                elif (
-                                    not isinstance(block, dict)
-                                    and hasattr(block, "type")
-                                    and block.type == "text"
-                                ):
-                                    content_blocks.append(
-                                        {
-                                            "type": "text",
-                                            "text": getattr(block, "text", ""),
-                                        }
-                                    )
-                        else:
-                            # Content is a simple string
-                            content_blocks.append({"type": "text", "text": content})
-
-                    # Add tool_use blocks
-                    for tc in msg["tool_calls"]:
-                        content_blocks.append(
-                            {
-                                "type": "tool_use",
-                                "id": tc.get("id", ""),
-                                "name": tc.get("tool", ""),
-                                "input": tc.get("arguments", {}),
-                            }
-                        )
-
-                    anthropic_messages.append(
-                        {"role": "assistant", "content": content_blocks}
+                # Structured content is the canonical persisted transcript. Do
+                # not rebuild it from lossy compatibility fields: a resumed
+                # tool turn can contain repeated thinking, redacted-thinking,
+                # text, and tools in an intentional order.
+                structured_content = isinstance(content, list)
+                content_blocks: list[dict[str, Any]] = []
+                canonical_tool_ids: set[str] = set()
+                canonical_tools: dict[str, dict[str, Any]] = {}
+                if structured_content:
+                    for raw_block in content:
+                        block = self._content_block_mapping(raw_block)
+                        if block is None:
+                            if emit_warnings:
+                                logger.warning(
+                                    "Skipping malformed assistant content block of type %s",
+                                    type(raw_block).__name__,
+                                )
+                            continue
+                        try:
+                            cleaned = native_wire_tool_use(
+                                block, native_computer_adapter
+                            ) or self._clean_content_block(block)
+                        except ComputerToolsetError as exc:
+                            raise KernelInvalidRequestError(
+                                str(exc), provider="anthropic", status_code=400
+                            ) from exc
+                        content_blocks.append(cleaned)
+                        if (
+                            cleaned.get("type") == "tool_use"
+                            and isinstance(cleaned.get("id"), str)
+                            and cleaned["id"]
+                        ):
+                            if cleaned["id"] in canonical_tool_ids and emit_warnings:
+                                logger.warning(
+                                    "Ambiguous duplicate canonical assistant tool call "
+                                    "id=%s; preserving the persisted sequence.",
+                                    cleaned["id"],
+                                )
+                            canonical_tool_ids.add(cleaned["id"])
+                            canonical_tools[cleaned["id"]] = cleaned
+                            if cleaned.get("toolset_name") == COMPUTER_TOOLSET_NAME:
+                                native_tool_use_ids[cleaned["id"]] = COMPUTER_TOOLSET_NAME
+                    legacy_thinking = self._content_block_mapping(
+                        msg.get("thinking_block")
                     )
-                elif "thinking_block" in msg and msg["thinking_block"]:
-                    # Assistant message with thinking block
-                    # Clean thinking block (remove visibility field not accepted by API)
-                    cleaned_thinking = self._clean_content_block(msg["thinking_block"])
-                    content_blocks = [cleaned_thinking]
-                    if content:
-                        if isinstance(content, list):
-                            # Content is a list of blocks - extract text blocks only
-                            for block in content:
-                                if (
-                                    isinstance(block, dict)
-                                    and block.get("type") == "text"
-                                ):
-                                    content_blocks.append(
-                                        {"type": "text", "text": block.get("text", "")}
+                    if (
+                        legacy_thinking
+                        and not any(
+                            block.get("type") in {"thinking", "redacted_thinking"}
+                            for block in content_blocks
+                        )
+                    ):
+                        # Older persisted turns kept their sole thinking block
+                        # separately. It precedes the structured transcript.
+                        content_blocks.insert(
+                            0, self._clean_content_block(legacy_thinking)
+                        )
+                else:
+                    legacy_thinking = self._content_block_mapping(
+                        msg.get("thinking_block")
+                    )
+                    if legacy_thinking:
+                        content_blocks.append(self._clean_content_block(legacy_thinking))
+
+                legacy_tool_ids: set[str] = set()
+                legacy_tool_calls = msg.get("tool_calls") or []
+                if not isinstance(legacy_tool_calls, list):
+                    if emit_warnings:
+                        logger.warning(
+                            "Skipping malformed assistant tool_calls value of type %s",
+                            type(legacy_tool_calls).__name__,
+                        )
+                    legacy_tool_calls = []
+                for raw_call in legacy_tool_calls:
+                    call = self._content_block_mapping(raw_call)
+                    if call is None:
+                        if emit_warnings:
+                            logger.warning(
+                                "Skipping malformed assistant tool call of type %s",
+                                type(raw_call).__name__,
+                            )
+                        continue
+                    tool_id = call.get("id") or call.get("tool_call_id")
+                    tool_name = call.get("name") or call.get("tool")
+                    if not isinstance(tool_id, str) or not tool_id or not isinstance(
+                        tool_name, str
+                    ) or not tool_name:
+                        if emit_warnings:
+                            logger.warning(
+                                "Skipping malformed assistant tool call without id/name"
+                            )
+                        continue
+                    if tool_id in canonical_tool_ids:
+                        # Current structured blocks win over stale duplicate
+                        # legacy fields for the same call ID.
+                        if emit_warnings:
+                            try:
+                                normalized_legacy = native_wire_tool_use(
+                                    call, native_computer_adapter
+                                )
+                            except ComputerToolsetError:
+                                # A malformed stale mirror cannot invalidate
+                                # the canonical block that already won this ID.
+                                normalized_legacy = None
+                                logger.warning(
+                                    "Conflicting legacy assistant tool call id=%s; "
+                                    "preserving canonical structured block.",
+                                    tool_id,
+                                )
+                            else:
+                                normalized_legacy = normalized_legacy or {
+                                    "type": "tool_use",
+                                    "id": tool_id,
+                                    "name": tool_name,
+                                    "input": call.get(
+                                        "input", call.get("arguments", {})
+                                    ),
+                                }
+                                if canonical_tools[tool_id] != normalized_legacy:
+                                    logger.warning(
+                                        "Conflicting legacy assistant tool call id=%s; "
+                                        "preserving canonical structured block.",
+                                        tool_id,
                                     )
-                                elif (
-                                    not isinstance(block, dict)
-                                    and hasattr(block, "type")
-                                    and block.type == "text"
-                                ):
-                                    content_blocks.append(
-                                        {
-                                            "type": "text",
-                                            "text": getattr(block, "text", ""),
-                                        }
-                                    )
-                        else:
-                            # Content is a simple string
-                            content_blocks.append({"type": "text", "text": content})
+                        continue
+                    if tool_id in legacy_tool_ids:
+                        if emit_warnings:
+                            logger.warning(
+                                "Skipping ambiguous duplicate assistant tool call id=%s",
+                                tool_id,
+                            )
+                        continue
+                    legacy_tool_ids.add(tool_id)
+                    try:
+                        native = native_wire_tool_use(call, native_computer_adapter)
+                    except ComputerToolsetError as exc:
+                        raise KernelInvalidRequestError(
+                            str(exc), provider="anthropic", status_code=400
+                        ) from exc
+                    cleaned_call = native or {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": call.get("input", call.get("arguments", {})),
+                    }
+                    content_blocks.append(cleaned_call)
+                    if cleaned_call.get("toolset_name") == COMPUTER_TOOLSET_NAME:
+                        native_tool_use_ids[tool_id] = COMPUTER_TOOLSET_NAME
+
+                if not structured_content and content_blocks and content not in (None, ""):
+                    # Preserve the old scalar-content shape for an ordinary
+                    # assistant turn. When compatibility blocks were rebuilt,
+                    # text belongs after legacy thinking and before tool uses.
+                    legacy_thinking_count = 1 if legacy_thinking else 0
+                    content_blocks.insert(
+                        legacy_thinking_count, {"type": "text", "text": content}
+                    )
+
+                if structured_content or content_blocks:
                     anthropic_messages.append(
                         {"role": "assistant", "content": content_blocks}
                     )
                 else:
-                    # Regular assistant message - may have structured content blocks
-                    if isinstance(content, list):
-                        # Content is a list of blocks - clean each block
-                        cleaned_blocks = [
-                            self._clean_content_block(block) for block in content
-                        ]
-                        anthropic_messages.append(
-                            {"role": "assistant", "content": cleaned_blocks}
-                        )
-                    else:
-                        # Content is a simple string
-                        anthropic_messages.append(
-                            {"role": "assistant", "content": content}
-                        )
+                    anthropic_messages.append({"role": "assistant", "content": content})
                 i += 1
             elif role == "developer":
                 # Developer messages -> XML-wrapped user messages (context files)
@@ -5240,7 +5477,7 @@ class AnthropicProvider:
         for tool in tools:
             # Check if this is a model-native tool (has 'type' that's not 'function')
             # Native tools like web_search_20250305 are passed through unchanged
-            tool_type = getattr(tool, "type", None)
+            tool_type = tool.get("type") if isinstance(tool, dict) else getattr(tool, "type", None)
             if tool_type and tool_type != "function":
                 # Model-native tool - pass through, minus the function-tool-only
                 # fields.
@@ -5265,7 +5502,7 @@ class AnthropicProvider:
                         native.pop(function_only_key, None)
                     anthropic_tools.append(native)
                 elif isinstance(tool, dict):
-                    anthropic_tools.append(tool)
+                    anthropic_tools.append(dict(tool))
                 else:
                     # Fallback: build dict from known attributes
                     native_tool: dict[str, Any] = {"type": tool_type}
@@ -5283,13 +5520,22 @@ class AnthropicProvider:
                 logger.debug(f"[PROVIDER] Added native tool: {tool_type}")
             else:
                 # Standard function tool - convert to Anthropic format
-                anthropic_tools.append(
-                    {
-                        "name": tool.name,
-                        "description": tool.description or "",
-                        "input_schema": tool.parameters,
-                    }
-                )
+                if isinstance(tool, dict):
+                    anthropic_tools.append(
+                        {
+                            "name": tool["name"],
+                            "description": tool.get("description") or "",
+                            "input_schema": tool["parameters"],
+                        }
+                    )
+                else:
+                    anthropic_tools.append(
+                        {
+                            "name": tool.name,
+                            "description": tool.description or "",
+                            "input_schema": tool.parameters,
+                        }
+                    )
         return anthropic_tools
 
     def _extract_web_search_citations(self, block: Any) -> list[dict[str, Any]]:
@@ -6083,7 +6329,12 @@ class AnthropicProvider:
                 }
             ]
 
-    def _convert_to_chat_response(self, response: Any) -> ChatResponse:
+    def _convert_to_chat_response(
+        self,
+        response: Any,
+        *,
+        native_computer_adapter: NativeComputerAdapter | None = None,
+    ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
         Args:
@@ -6094,6 +6345,7 @@ class AnthropicProvider:
         """
         from amplifier_core.message_models import TextBlock
         from amplifier_core.message_models import ThinkingBlock
+        from amplifier_core.message_models import RedactedThinkingBlock
         from amplifier_core.message_models import ToolCall
         from amplifier_core.message_models import ToolCallBlock
         from amplifier_core.message_models import Usage
@@ -6105,6 +6357,26 @@ class AnthropicProvider:
             TextContent | ThinkingContent | ToolCallContent | WebSearchContent
         ] = []
         text_accumulator: list[str] = []
+
+        native_blocks = (
+            [
+                block
+                for block in response.content
+                if getattr(block, "type", None) == "tool_use"
+                and getattr(block, "toolset_name", None)
+                == native_computer_adapter.toolset_name
+            ]
+            if native_computer_adapter is not None
+            else []
+        )
+        if len(native_blocks) > 1:
+            raise KernelInvalidRequestError(
+                "Opus 5.5 native computer toolset returned multiple action members; "
+                "this provider accepts one computer action per response.",
+                provider="anthropic",
+                status_code=400,
+                retryable=False,
+            )
 
         for block in response.content:
             if block.type == "text":
@@ -6121,15 +6393,46 @@ class AnthropicProvider:
                 )
                 event_blocks.append(ThinkingContent(text=block.thinking))
                 # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
+            elif block.type == "redacted_thinking":
+                content_blocks.append(RedactedThinkingBlock(data=block.data))
             elif block.type == "tool_use":
+                is_native_computer = (
+                    native_computer_adapter is not None
+                    and getattr(block, "toolset_name", None)
+                    == native_computer_adapter.toolset_name
+                )
+                name = block.name
+                input_data = block.input
+                block_extra: dict[str, Any] = {}
+                if is_native_computer:
+                    if not isinstance(input_data, dict):
+                        raise KernelInvalidRequestError(
+                            "Native computer action input must be a mapping.",
+                            provider="anthropic",
+                            status_code=400,
+                            retryable=False,
+                        )
+                    if "action" in input_data:
+                        raise KernelInvalidRequestError(
+                            "Native computer action input contains reserved key 'action'.",
+                            provider="anthropic",
+                            status_code=400,
+                            retryable=False,
+                        )
+                    name = native_computer_adapter.alias
+                    input_data = {"action": block.name, **input_data}
+                    block_extra = {
+                        PROVENANCE_TOOLSET: native_computer_adapter.toolset_name,
+                        PROVENANCE_MEMBER: block.name,
+                    }
                 content_blocks.append(
-                    ToolCallBlock(id=block.id, name=block.name, input=block.input)
+                    ToolCallBlock(id=block.id, name=name, input=input_data, **block_extra)
                 )
                 tool_calls.append(
-                    ToolCall(id=block.id, name=block.name, arguments=block.input)
+                    ToolCall(id=block.id, name=name, arguments=input_data, **block_extra)
                 )
                 event_blocks.append(
-                    ToolCallContent(id=block.id, name=block.name, arguments=block.input)
+                    ToolCallContent(id=block.id, name=name, arguments=input_data)
                 )
             elif block.type == "web_search_tool_result":
                 # Handle native web search results from Anthropic
