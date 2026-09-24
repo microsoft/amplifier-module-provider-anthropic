@@ -98,6 +98,63 @@ class TestRateLimitErrorUsesBodyJson:
         # Falls back to str(e) when body is None
         assert "rate limited" in str(exc_info.value)
 
+    def test_enforced_spend_limit_429_is_not_retryable(self):
+        """A permanent spend-cap 429 (error.details.error_code ==
+        'enforced_spend_limit_reached') is translated as non-retryable with
+        no retry_after, unlike an ordinary 429."""
+        provider = _make_provider()
+        body = {
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": "workspace spend limit reached",
+                "details": {"error_code": "enforced_spend_limit_reached"},
+            },
+        }
+        sdk_error = _make_anthropic_error_with_body(
+            anthropic.RateLimitError,
+            "spend limit reached",
+            status_code=429,
+            body=body,
+        )
+        sdk_error.response.headers = {"retry-after": "30"}
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            side_effect=sdk_error
+        )
+
+        with pytest.raises(KernelRateLimitError) as exc_info:
+            asyncio.run(provider.complete(_simple_request()))
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.retry_after is None
+        assert json.dumps(body) == str(exc_info.value)
+
+    def test_ordinary_429_with_unrelated_details_stays_retryable(self):
+        """A 429 with a details payload that isn't the spend-cap code is an
+        ordinary rate limit, and remains retryable."""
+        provider = _make_provider()
+        body = {
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": "rate limited",
+                "details": {"error_code": "some_other_code"},
+            },
+        }
+        sdk_error = _make_anthropic_error_with_body(
+            anthropic.RateLimitError, "rate limited", status_code=429, body=body
+        )
+        sdk_error.response.headers = {"retry-after": "5"}
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            side_effect=sdk_error
+        )
+
+        with pytest.raises(KernelRateLimitError) as exc_info:
+            asyncio.run(provider.complete(_simple_request()))
+
+        assert exc_info.value.retryable is True
+        assert exc_info.value.retry_after == 5.0
+
 
 # ---------------------------------------------------------------------------
 # Block 2: AuthenticationError — uses json.dumps(body) when body present

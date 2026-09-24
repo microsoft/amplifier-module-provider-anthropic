@@ -253,6 +253,7 @@ def compute_cost(
     cache_creation_5m_input_tokens: int | None = None,
     cache_creation_1h_input_tokens: int | None = None,
     speed: str | None = None,
+    inference_geo: str | None = None,
 ) -> Decimal | None:
     """Return the USD cost for an Anthropic API call as a :class:`~decimal.Decimal`.
 
@@ -292,6 +293,14 @@ def compute_cost(
     speed:
         When ``'fast'`` AND *model* is in :data:`_FAST_ELIGIBLE_MODELS` a 2x
         multiplier is applied; any other value leaves cost unchanged.
+    inference_geo:
+        Anthropic's reported ``usage.inference_geo``. When this is exactly
+        the string ``"us"`` (US-only regional inference), a documented 1.1x
+        multiplier is applied to the FINAL total cost -- after every other
+        component (fast-mode, cache read/write) has already been added --
+        since the surcharge applies to the whole bill, not just base input.
+        Any other value (``"global"``, ``None``, or anything else) leaves
+        cost unchanged; this is not a guess for unrecognised values.
 
     Returns
     -------
@@ -358,5 +367,8 @@ def compute_cost(
 
     if speed == "fast" and model in _FAST_ELIGIBLE_MODELS:
         cost *= 2
+
+    if inference_geo == "us":
+        cost *= Decimal("1.1")
 
     return cost

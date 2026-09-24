@@ -45,12 +45,23 @@ computer declaration (the documented legacy `computer_20241022`,
 `computer_20250124`, or `computer_20251124`, or
 `computer_toolset_20260801`) to `computer_toolset_20260801`. The adapter
 preserves the ToolSpec name as the executor dispatch alias and maps the native
-action member into `input.action`; ordinary function tools, including one named
-`computer`, remain ordinary function tools. The actual request assembly guards
-this first-party-only boundary: custom/proxy endpoints fail locally rather than
-claiming vendor-native toolset support, even though recognized Opus 5.5
-capabilities advertise the native path. This adapter is not a claim that the new
-toolset is fully equivalent to prior native-computer contracts. Native computer
+action member into `input.action`; ordinary function tools remain ordinary
+function tools, EXCEPT one named `computer`: that name is reserved by the
+vendor toolset (the native declaration is always fixed-name `computer` on the
+wire, regardless of its local dispatch alias), so declaring a separate
+ordinary function tool also named `computer` alongside any native computer
+declaration is rejected locally rather than sent to a request the API would
+itself reject for a duplicate tool name. A lone function tool named `computer`
+with no native computer declaration present is unaffected. This provider's
+direct `computer_toolset_20260801` adapter is deliberately scoped to Opus 5.5;
+declaring that type against another model is rejected locally. For a compatible
+fallback model, use the portable legacy `computer_20251124` declaration;
+otherwise use the target model's supported computer declaration. The actual
+request assembly guards this first-party-only boundary: custom/proxy endpoints fail
+locally rather than claiming vendor-native toolset support, even though
+recognized Opus 5.5 capabilities advertise the native path. This adapter is
+not a claim that the new toolset is fully equivalent to prior native-computer
+contracts. Native computer
 actions are single-action responses: the request uses `tool_choice: auto` with
 the **request-wide** `disable_parallel_tool_use: true`; forced/named choice
 remains unsupported on Opus 5.5. `key.repeat` is passed through when the model
@@ -195,6 +206,7 @@ SDK exceptions are translated to kernel errors before the retry loop sees them. 
 | SDK Exception | Condition | Kernel Error | Status | Retryable |
 | --- | --- | --- | --- | --- |
 | `RateLimitError` | 429 | `RateLimitError` | 429 | Yes |
+| `RateLimitError` | 429 with `error.details.error_code == "enforced_spend_limit_reached"` (a permanent workspace/organization spend cap) | `RateLimitError` | 429 | **No** (`retry_after` is also dropped) |
 | `OverloadedError` | 529 | `ProviderUnavailableError` | 529 | Yes (10× backoff) |
 | `InternalServerError` | 5xx | `ProviderUnavailableError` | 5xx | Yes |
 | `AuthenticationError` | 401 | `AuthenticationError` | 401 | No |

@@ -63,6 +63,7 @@ def _make_response(
     cache_read_input_tokens: int = 0,
     cache_creation_input_tokens: int = 0,
     speed: str | None = None,
+    inference_geo: str | None = None,
 ) -> MagicMock:
     """Build a fake Anthropic API response for testing _convert_to_chat_response."""
     response = MagicMock()
@@ -74,6 +75,7 @@ def _make_response(
     response.usage.cache_read_input_tokens = cache_read_input_tokens
     response.usage.cache_creation_input_tokens = cache_creation_input_tokens
     response.usage.speed = speed
+    response.usage.inference_geo = inference_geo
     return response
 
 
@@ -666,3 +668,108 @@ def test_convert_without_ttl_split_object_preserves_legacy_cost():
     assert result.usage.cost_usd == Decimal("3.75"), (
         f"Expected Decimal('3.75') (legacy behavior), got {result.usage.cost_usd!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# inference_geo US-only pricing multiplier
+# ---------------------------------------------------------------------------
+#
+# Anthropic applies a documented 1.1x multiplier to the total bill for
+# US-only regional inference (usage.inference_geo == "us"). "global" (the
+# default) and any other/absent value leave cost unchanged.
+
+
+def test_inference_geo_us_applies_1_1x_multiplier_to_input_and_output():
+    base = compute_cost(
+        "claude-opus-5-5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+    )
+    us = compute_cost(
+        "claude-opus-5-5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        inference_geo="us",
+    )
+    assert base == Decimal("24.00")
+    assert us == Decimal("26.40")
+    assert us == base * Decimal("1.1")
+
+
+def test_inference_geo_global_leaves_cost_unchanged():
+    base = compute_cost("claude-opus-5-5", input_tokens=1_000_000)
+    global_geo = compute_cost(
+        "claude-opus-5-5", input_tokens=1_000_000, inference_geo="global"
+    )
+    assert base == global_geo
+
+
+def test_inference_geo_absent_defaults_to_unchanged_cost():
+    base = compute_cost("claude-opus-5-5", input_tokens=1_000_000)
+    explicit_none = compute_cost(
+        "claude-opus-5-5", input_tokens=1_000_000, inference_geo=None
+    )
+    assert base == explicit_none
+
+
+def test_inference_geo_us_multiplier_includes_cache_and_fast_components():
+    """The 1.1x multiplier applies to the FINAL total, so it also covers
+    cache-read/write and fast-mode components, not just base input/output."""
+    us = compute_cost(
+        "claude-opus-5-5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        cache_read_input_tokens=1_000_000,
+        cache_creation_input_tokens=1_000_000,
+        speed="fast",
+        inference_geo="us",
+    )
+    without_geo = compute_cost(
+        "claude-opus-5-5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        cache_read_input_tokens=1_000_000,
+        cache_creation_input_tokens=1_000_000,
+        speed="fast",
+    )
+    assert us == without_geo * Decimal("1.1")
+
+
+def test_inference_geo_unrecognized_value_leaves_cost_unchanged():
+    """An unrecognized inference_geo string is not guessed at; cost matches
+    the geo-less computation exactly."""
+    base = compute_cost("claude-opus-5-5", input_tokens=1_000_000)
+    weird = compute_cost(
+        "claude-opus-5-5", input_tokens=1_000_000, inference_geo="eu"
+    )
+    assert base == weird
+
+
+def test_convert_stamps_us_geo_surcharge_on_cost_usd():
+    """End-to-end: response.usage.inference_geo == 'us' flows through
+    _convert_to_chat_response into a 1.1x-surcharged cost_usd."""
+    provider = _make_provider()
+    response = _make_response(
+        "claude-opus-5-5",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        inference_geo="us",
+    )
+    result = provider._convert_to_chat_response(response)
+    assert result.usage is not None
+    assert result.usage.cost_usd == Decimal("4.40")
+
+
+def test_convert_default_global_geo_matches_legacy_cost():
+    """When response.usage.inference_geo is 'global' (or unset), cost_usd
+    matches the pre-existing (no-surcharge) behavior exactly."""
+    provider = _make_provider()
+    response = _make_response(
+        "claude-opus-5-5",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        inference_geo="global",
+    )
+    result = provider._convert_to_chat_response(response)
+    assert result.usage is not None
+    assert result.usage.cost_usd == Decimal("4.00")

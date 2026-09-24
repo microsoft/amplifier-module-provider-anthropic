@@ -265,6 +265,90 @@ def test_opus55_rejects_unrepresentable_native_computer_field() -> None:
         _assemble(_request(tools=[_native_computer(unexpected="value")]))
 
 
+@pytest.mark.parametrize("legacy_first", [True, False])
+@pytest.mark.parametrize(
+    "tool_type", ["computer_20251124", "computer_toolset_20260801"]
+)
+def test_opus55_rejects_reserved_computer_name_alongside_native_declaration(
+    legacy_first: bool, tool_type: str
+) -> None:
+    """A separate ordinary function tool literally named 'computer' conflicts
+    with the native toolset's fixed wire name, regardless of the native
+    declaration's own dispatch alias, its wire dialect (legacy-adapted or
+    direct), or declaration order."""
+    native = _native_computer(name="desktop", tool_type=tool_type)
+    reserved_function = _function_tool("computer")
+    tools = (
+        [native, reserved_function] if legacy_first else [reserved_function, native]
+    )
+    with pytest.raises(KernelInvalidRequestError, match="reserved by Opus 5.5"):
+        _assemble(_request(tools=tools))
+
+
+def test_opus55_lone_function_named_computer_unaffected_by_conflict_guard() -> None:
+    """No native declaration present -> a lone function tool named 'computer'
+    is untouched by the reserved-name conflict guard."""
+    params = _assemble(_request(tools=[_function_tool("computer")]))
+    assert params["tools"][0]["name"] == "computer"
+    assert "type" not in params["tools"][0]
+
+
+@pytest.mark.parametrize(
+    "model", [PREVIOUS_OPUS_MODEL, "claude-sonnet-5", "claude-haiku-4-5", FABLE_MODEL]
+)
+def test_direct_toolset_20260801_rejected_for_non_opus55_models(model: str) -> None:
+    """Direct toolset declarations cannot pass through without the Opus 5.5
+    adapter. The error recommends the portable legacy declaration only for a
+    compatible fallback model and otherwise points to the target model's own
+    supported declaration."""
+    direct = _native_computer(tool_type="computer_toolset_20260801")
+    with pytest.raises(
+        KernelInvalidRequestError,
+        match="compatible fallback model",
+    ):
+        _assemble(_request(model=model, tools=[direct]), model=model)
+
+
+@pytest.mark.parametrize(
+    "model", [PREVIOUS_OPUS_MODEL, "claude-sonnet-5", "claude-haiku-4-5"]
+)
+def test_legacy_computer_types_unaffected_for_non_opus55_models(model: str) -> None:
+    """The new direct-toolset guard must not touch the existing, working
+    legacy-type pass-through for non-Opus-5.5 models."""
+    legacy = _native_computer(tool_type="computer_20251124")
+    params = _assemble(_request(model=model, tools=[legacy]), model=model)
+    assert params["tools"][0]["type"] == "computer_20251124"
+
+
+class TestOpus55DeferLoading:
+    """Legacy `defer_loading` cannot be represented on the request-local
+    computer_toolset_20260801 wire shape; it must fail clearly rather than
+    being silently dropped or silently widening deferred members. `False`
+    (an explicit opt-out) is not an error -- it is simply not on the wire,
+    without any `defer_loading`/`_defer_loading` pseudo-field surviving
+    translation."""
+
+    @pytest.mark.parametrize(
+        "tool_type", ["computer_20251124", "computer_toolset_20260801"]
+    )
+    def test_defer_loading_true_fails_clearly(self, tool_type: str) -> None:
+        native = _native_computer(tool_type=tool_type, defer_loading=True)
+        with pytest.raises(KernelInvalidRequestError, match="defer_loading"):
+            _assemble(_request(tools=[native]))
+
+    @pytest.mark.parametrize(
+        "tool_type", ["computer_20251124", "computer_toolset_20260801"]
+    )
+    def test_defer_loading_false_is_dropped_without_pseudo_field(
+        self, tool_type: str
+    ) -> None:
+        native = _native_computer(tool_type=tool_type, defer_loading=False)
+        params = _assemble(_request(tools=[native]))
+        wire_tool = params["tools"][0]
+        assert "defer_loading" not in wire_tool
+        assert "_defer_loading" not in wire_tool
+
+
 def test_opus55_rejects_native_computer_at_custom_endpoint() -> None:
     provider = _provider(base_url="https://gateway.example.test")
     with pytest.raises(KernelInvalidRequestError, match="first-party"):

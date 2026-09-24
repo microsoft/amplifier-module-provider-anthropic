@@ -116,15 +116,24 @@ def translate_tools(
     after a native declaration is found.
     """
     if not is_opus_55(model):
+        tool_mappings = [_tool_mapping(tool) for tool in tools]
         if has_unverified_opus_55_suffix(model) and any(
-            _native_computer_type(_tool_mapping(tool))
-            or _unknown_computer_type(_tool_mapping(tool))
-            for tool in tools
+            _native_computer_type(mapping) or _unknown_computer_type(mapping)
+            for mapping in tool_mappings
         ):
             raise ComputerToolsetError(
                 "Unrecognized Opus 5.5 model suffix; native computer declarations "
                 "are supported only for claude-opus-5-5 or a dated 8-digit alias."
             )
+        for mapping in tool_mappings:
+            if mapping.get("type") == COMPUTER_TOOLSET_TYPE:
+                raise ComputerToolsetError(
+                    f"{COMPUTER_TOOLSET_TYPE!r} is supported only by this "
+                    f"provider's Opus 5.5 adapter; {model!r} cannot use it here. "
+                    "For a compatible fallback model, declare portable legacy "
+                    "computer_20251124 instead; otherwise use the target model's "
+                    "supported computer declaration."
+                )
         return list(tools), None
 
     converted: list[Any] = []
@@ -212,6 +221,18 @@ def translate_tools(
                 wire[key] = tool[key]
         converted.append(wire)
         adapter = NativeComputerAdapter(alias=alias)
+    if adapter is not None:
+        for raw_tool in tools:
+            mapping = _tool_mapping(raw_tool)
+            if _native_computer_type(mapping):
+                continue
+            if mapping.get("name") == COMPUTER_TOOLSET_NAME:
+                raise ComputerToolsetError(
+                    f"Ordinary function tool name {COMPUTER_TOOLSET_NAME!r} is "
+                    "reserved by Opus 5.5's native computer toolset and cannot "
+                    "be declared alongside a native computer declaration, "
+                    "regardless of the native declaration's own dispatch alias."
+                )
     return converted, adapter
 
 

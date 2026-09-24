@@ -4,7 +4,9 @@ Verifies:
 - cache_read_tokens is set from cache_read_input_tokens
 - cache_write_tokens is set from cache_creation_input_tokens
 - Provider-native extras still present for backward compat
-- reasoning_tokens is None (Anthropic doesn't provide separate count)
+- reasoning_tokens surfaces usage.output_tokens_details.thinking_tokens when
+  present as an actual non-negative int, and is None when absent or malformed
+  (Anthropic's thinking tokens remain included in output_tokens either way)
 - Existing input/output/total tokens still correct
 """
 
@@ -45,8 +47,15 @@ def _make_raw_response(
     output_tokens: int = 50,
     cache_creation_input_tokens: int | None = None,
     cache_read_input_tokens: int | None = None,
+    thinking_tokens: object = "__absent__",
 ):
-    """Create a mock raw API response with usage data."""
+    """Create a mock raw API response with usage data.
+
+    `thinking_tokens` defaults to a sentinel meaning "no
+    output_tokens_details at all" (the ordinary non-thinking response
+    shape); pass an explicit value (including None) to simulate
+    `usage.output_tokens_details.thinking_tokens`.
+    """
     usage_attrs = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -55,6 +64,10 @@ def _make_raw_response(
         usage_attrs["cache_creation_input_tokens"] = cache_creation_input_tokens
     if cache_read_input_tokens is not None:
         usage_attrs["cache_read_input_tokens"] = cache_read_input_tokens
+    if thinking_tokens != "__absent__":
+        usage_attrs["output_tokens_details"] = SimpleNamespace(
+            thinking_tokens=thinking_tokens
+        )
 
     response = SimpleNamespace(
         content=[SimpleNamespace(type="text", text="response text")],
@@ -162,12 +175,9 @@ class TestUsageBackwardCompat:
 
 
 class TestUsageReasoningTokens:
-    def test_reasoning_tokens_is_none(self):
-        """reasoning_tokens should always be None for Anthropic.
-
-        Anthropic does not provide a separate reasoning token count —
-        thinking tokens are included in output_tokens.
-        """
+    def test_reasoning_tokens_none_when_details_absent(self):
+        """reasoning_tokens is None when the response has no
+        output_tokens_details at all (ordinary non-thinking responses)."""
         provider = _make_provider()
         provider.client.messages.with_raw_response.create = AsyncMock(
             return_value=_make_raw_response()
@@ -176,6 +186,59 @@ class TestUsageReasoningTokens:
         result = asyncio.run(provider.complete(_simple_request()))
         assert result.usage is not None
         assert result.usage.reasoning_tokens is None
+
+    def test_reasoning_tokens_populated_from_thinking_tokens(self):
+        """reasoning_tokens surfaces a real thinking_tokens count, while
+        output_tokens/total_tokens/cost stay based on the wire's own
+        output_tokens (thinking tokens are already included there)."""
+        provider = _make_provider()
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_response(
+                output_tokens=80, thinking_tokens=30
+            )
+        )
+
+        result = asyncio.run(provider.complete(_simple_request()))
+        assert result.usage is not None
+        assert result.usage.reasoning_tokens == 30
+        assert result.usage.output_tokens == 80
+        assert result.usage.total_tokens == 180
+
+    def test_reasoning_tokens_none_when_thinking_tokens_absent(self):
+        """reasoning_tokens is None when output_tokens_details is present
+        but carries no thinking_tokens attribute."""
+        provider = _make_provider()
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_response(thinking_tokens=None)
+        )
+
+        result = asyncio.run(provider.complete(_simple_request()))
+        assert result.usage is not None
+        assert result.usage.reasoning_tokens is None
+
+    @pytest.mark.parametrize("malformed", [-1, 1.5, True, "3", None])
+    def test_reasoning_tokens_none_for_malformed_values(self, malformed):
+        """A non-int, negative, or bool thinking_tokens value is dropped to
+        None rather than trusted verbatim."""
+        provider = _make_provider()
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_response(thinking_tokens=malformed)
+        )
+
+        result = asyncio.run(provider.complete(_simple_request()))
+        assert result.usage is not None
+        assert result.usage.reasoning_tokens is None
+
+    def test_reasoning_tokens_zero_is_preserved(self):
+        """0 is an actual (non-negative) int, not a falsy sentinel here."""
+        provider = _make_provider()
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            return_value=_make_raw_response(thinking_tokens=0)
+        )
+
+        result = asyncio.run(provider.complete(_simple_request()))
+        assert result.usage is not None
+        assert result.usage.reasoning_tokens == 0
 
 
 class TestUsageBaseFields:

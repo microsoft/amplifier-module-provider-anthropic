@@ -1683,12 +1683,13 @@ class AnthropicProvider:
                 retry_after = rate_info.get("retry_after_seconds")
                 body = getattr(e, "body", None)
                 msg = json.dumps(body) if body is not None else str(e)
+                spend_capped = self._is_enforced_spend_limit_body(body)
                 raise KernelRateLimitError(
                     msg,
                     provider="anthropic",
                     status_code=429,
-                    retryable=True,
-                    retry_after=retry_after,
+                    retryable=not spend_capped,
+                    retry_after=None if spend_capped else retry_after,
                 ) from e
             except AnthropicAuthenticationError as e:
                 body = getattr(e, "body", None)
@@ -2686,12 +2687,35 @@ class AnthropicProvider:
         which is the documented correct response.
 
         Spend-cap caveat, worth noting here: a tier spend-cap 429 has no
-        retry-after header and keeps failing until access resumes.
-        Retrying that is futile but harmless and bounded by max_retries;
-        detecting it specifically is out of scope.
+        retry-after header and keeps failing until access resumes. That
+        specific case IS now detected at translation time (see
+        `_is_enforced_spend_limit_body`) and translated as non-retryable,
+        rather than being retried to exhaustion here.
         """
         status_code = getattr(error, "status_code", None)
         return isinstance(error, KernelProviderUnavailableError) and status_code == 529
+
+    @staticmethod
+    def _is_enforced_spend_limit_body(body: Any) -> bool:
+        """True for Anthropic's permanent spend-cap 429 error detail.
+
+        A workspace/organization spend cap returns HTTP 429 with
+        ``error.details.error_code == "enforced_spend_limit_reached"``
+        (platform.claude.com/docs/en/api/errors). Unlike an ordinary 429
+        (transient rate limiting), this one keeps failing until the cap is
+        raised or the period rolls over -- retrying it burns the retry
+        budget for no benefit, so it is translated as non-retryable with no
+        retry_after, while every other 429 remains retryable as before.
+        """
+        if not isinstance(body, dict):
+            return False
+        error = body.get("error")
+        if not isinstance(error, dict):
+            return False
+        details = error.get("details")
+        if not isinstance(details, dict):
+            return False
+        return details.get("error_code") == "enforced_spend_limit_reached"
 
     def _resolve_effective_model(
         self, requested_model: str
@@ -3255,10 +3279,19 @@ class AnthropicProvider:
                     **current_kwargs,
                 )
             except KernelLLMError as e:
-                if use_short_retry_budget and not self._is_overload_fallback_error(e):
-                    # Preserve the old retry behavior for non-overload failures:
-                    # after the short downgrade budget is exhausted, retry the same
-                    # model once more with the full configured retry policy.
+                if (
+                    use_short_retry_budget
+                    and not self._is_overload_fallback_error(e)
+                    and e.retryable
+                ):
+                    # Preserve the old retry behavior for non-overload,
+                    # RETRYABLE failures only: after the short downgrade
+                    # budget is exhausted, retry the same model once more
+                    # with the full configured retry policy. A permanent
+                    # error (e.g. an enforced-spend-limit 429, or any other
+                    # e.retryable=False failure) must not get this second
+                    # full-budget pass -- it falls through to the raise
+                    # checks below and propagates immediately instead.
                     full_retry_budget_used.add(effective_model)
                     attempted_models.discard(effective_model)
                     continue
@@ -4556,13 +4589,14 @@ class AnthropicProvider:
                 retry_after = rate_info.get("retry_after_seconds")
                 body = getattr(e, "body", None)
                 msg = json.dumps(body) if body is not None else str(e)
+                spend_capped = self._is_enforced_spend_limit_body(body)
                 raise KernelRateLimitError(
                     msg,
                     provider="anthropic",
                     model=params["model"],
                     status_code=429,
-                    retryable=True,
-                    retry_after=retry_after,
+                    retryable=not spend_capped,
+                    retry_after=None if spend_capped else retry_after,
                 ) from e
 
             except AnthropicAuthenticationError as e:
@@ -6464,9 +6498,15 @@ class AnthropicProvider:
                 continue
 
         # Build usage with named kernel fields + provider-native extras for
-        # backward compatibility.  reasoning_tokens is intentionally None:
-        # Anthropic does not provide a separate reasoning token count (thinking
-        # tokens are included in output_tokens).
+        # backward compatibility.  reasoning_tokens surfaces Anthropic's
+        # thinking-token count when the API reports one (verified present
+        # on Opus 5.5's adaptive thinking as
+        # `usage.output_tokens_details.thinking_tokens`); it does NOT change
+        # total/output token or cost accounting, since thinking tokens are
+        # already included in `output_tokens` on the wire. Anything other
+        # than an actual non-negative int (absent, None, float, bool, or a
+        # malformed/negative value) leaves reasoning_tokens None rather than
+        # guessing.
         input_tokens = response.usage.input_tokens + (
             getattr(response.usage, "cache_read_input_tokens", None) or 0
         )
@@ -6477,6 +6517,16 @@ class AnthropicProvider:
         )
         cache_read = getattr(response.usage, "cache_read_input_tokens", None) or None
 
+        output_tokens_details = getattr(response.usage, "output_tokens_details", None)
+        thinking_tokens = getattr(output_tokens_details, "thinking_tokens", None)
+        reasoning_tokens = (
+            thinking_tokens
+            if isinstance(thinking_tokens, int)
+            and not isinstance(thinking_tokens, bool)
+            and thinking_tokens >= 0
+            else None
+        )
+
         usage_kwargs: dict[str, Any] = {
             # Required fields
             "input_tokens": input_tokens,
@@ -6485,6 +6535,7 @@ class AnthropicProvider:
             # Named kernel fields (Phase 2)
             "cache_read_tokens": cache_read,
             "cache_write_tokens": cache_creation,
+            "reasoning_tokens": reasoning_tokens,
         }
 
         # Keep provider-native extras for backward compat (extra="allow" on Usage)
@@ -6530,6 +6581,7 @@ class AnthropicProvider:
             cache_creation_5m_input_tokens=cache_creation_5m,
             cache_creation_1h_input_tokens=cache_creation_1h,
             speed=getattr(response.usage, "speed", None),
+            inference_geo=getattr(response.usage, "inference_geo", None),
         )
         usage = usage.model_copy(update={"cost_usd": cost})
         self._add_cost(cost)

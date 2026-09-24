@@ -89,6 +89,24 @@ def _make_sdk_rate_limit_overloaded_error() -> anthropic.RateLimitError:
     return anthropic.RateLimitError("overloaded", response=mock_response, body=body)
 
 
+def _make_sdk_enforced_spend_limit_error() -> anthropic.RateLimitError:
+    """A permanent workspace/organization spend-cap 429 -- translated as
+    KernelRateLimitError(retryable=False), unlike an ordinary 429."""
+    mock_response = MagicMock()
+    mock_response.status_code = 429
+    mock_response.headers = {"retry-after": "30"}
+    body = {
+        "error": {
+            "type": "rate_limit_error",
+            "message": "workspace spend limit reached",
+            "details": {"error_code": "enforced_spend_limit_reached"},
+        }
+    }
+    return anthropic.RateLimitError(
+        "spend limit reached", response=mock_response, body=body
+    )
+
+
 def _runtime_model_info(
     *,
     max_input_tokens: int | None = None,
@@ -515,3 +533,39 @@ class TestTemporaryFallbackOnOverload:
             "claude-opus-4-6",
             "claude-opus-4-6",
         ]
+
+    @patch("asyncio.sleep", new_callable=AsyncMock)
+    def test_enforced_spend_limit_429_raises_immediately_with_fallback_enabled(
+        self, mock_sleep
+    ):
+        """A permanent spend-cap 429 (retryable=False) must NOT get the
+        second same-model/full-budget pass that
+        `test_non_overload_errors_keep_full_retry_budget_on_same_model`
+        exercises for ordinary (retryable) non-overload failures: exactly
+        one wire call, no sleep, no fallback downgrade, and the original
+        non-retryable KernelRateLimitError propagates."""
+        from amplifier_core.llm_errors import RateLimitError as KernelRateLimitError
+
+        provider = _make_provider(
+            "claude-opus-4-6",
+            fallback_on_overload=True,
+            fallback_retry_count=1,
+            max_retries=3,
+        )
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            side_effect=_make_sdk_enforced_spend_limit_error()
+        )
+
+        with pytest.raises(KernelRateLimitError) as exc_info:
+            asyncio.run(provider.complete(_simple_request()))
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.retry_after is None
+        assert provider.client.messages.with_raw_response.create.await_count == 1
+        mock_sleep.assert_not_awaited()
+
+        fake_coord = cast(FakeCoordinator, provider.coordinator)
+        open_events = [
+            e for e in fake_coord.hooks.events if e[0] == "provider:fallback_open"
+        ]
+        assert open_events == []

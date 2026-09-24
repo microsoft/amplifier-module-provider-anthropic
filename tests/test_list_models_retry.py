@@ -19,6 +19,7 @@ import anthropic
 import pytest
 from amplifier_core import ModuleCoordinator
 from amplifier_core.llm_errors import AuthenticationError as KernelAuthenticationError
+from amplifier_core.llm_errors import RateLimitError as KernelRateLimitError
 from amplifier_core.llm_errors import (
     ProviderUnavailableError as KernelProviderUnavailableError,
 )
@@ -137,3 +138,35 @@ def test_list_models_non_retryable_error_raised_immediately():
 
     assert provider.client.models.list.await_count == 1
     mock_sleep.assert_not_awaited()
+
+
+def test_list_models_enforced_spend_limit_429_raised_immediately():
+    """A permanent spend-cap 429 is non-retryable on list_models() too, and
+    is not retried to exhaustion like an ordinary rate limit would be."""
+    provider = _make_provider()
+    mock_response = MagicMock()
+    mock_response.status_code = 429
+    mock_response.headers = {"retry-after": "30"}
+    body = {
+        "type": "error",
+        "error": {
+            "type": "rate_limit_error",
+            "message": "workspace spend limit reached",
+            "details": {"error_code": "enforced_spend_limit_reached"},
+        },
+    }
+    sdk_error = anthropic.RateLimitError(
+        "spend limit reached", response=mock_response, body=body
+    )
+    provider.client.models.list = AsyncMock(side_effect=sdk_error)
+
+    with (
+        patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        pytest.raises(KernelRateLimitError) as exc_info,
+    ):
+        asyncio.run(provider.list_models())
+
+    assert provider.client.models.list.await_count == 1
+    mock_sleep.assert_not_awaited()
+    assert exc_info.value.retryable is False
+    assert exc_info.value.retry_after is None
