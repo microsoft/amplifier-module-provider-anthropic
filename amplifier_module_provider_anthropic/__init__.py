@@ -3923,10 +3923,20 @@ class AnthropicProvider:
 
         # An explicit budget must never be silently ignored.  This shared guard
         # runs for dispatch only; a pure preflight is intentionally log-free.
+        #
+        # One exception: a caller that passes `extended_thinking=False` for THIS
+        # call (session naming, goal judges, summaries) has deliberately opted
+        # out, so an unused budget is the intended outcome, not a silent drop --
+        # and the warning's remedy ("turn thinking on") contradicts the caller.
+        # This holds for a kwargs budget too: loop-streaming forwards the routing
+        # role's config (e.g. `fast`: thinking_budget_tokens=32000) as kwargs
+        # alongside its opt-out, so the budget is not the caller's intent.
+        per_call_thinking_opt_out = options.get("extended_thinking") is False
         if (
             emit_diagnostics
             and requested_budget_source is not None
             and requested_budget is not None
+            and not per_call_thinking_opt_out
         ):
             wire_thinking = params.get("thinking")
             sent_budget = (
