@@ -242,20 +242,21 @@ class TestConfigBudgetReachesTheWire:
         assert "thinking" not in params
         assert _budget_warnings(caplog) == []
 
-    def test_per_call_opt_out_with_a_per_call_budget_still_warns(
+    def test_per_call_opt_out_does_not_warn_about_a_role_config_budget(
         self, caplog: pytest.LogCaptureFixture
     ):
-        """Opting out AND passing a budget in the same call is contradictory, so
-        the dropped budget must still be reported."""
+        """loop-streaming forwards the routing role's config as kwargs, then
+        applies `extended_thinking=False`, so a kwargs budget arrives WITH the
+        opt-out (routing-matrix `fast` role: thinking_budget_tokens=32000). The
+        opt-out wins and the unused budget is not reported."""
         provider = _make_provider(HAIKU)
         with caplog.at_level(logging.WARNING):
             params = _run(
-                provider, extended_thinking=False, thinking_budget_tokens=8000
+                provider, extended_thinking=False, thinking_budget_tokens=32000
             )
 
         assert "thinking" not in params
-        warnings = _budget_warnings(caplog)
-        assert warnings and "8000" in warnings[0]
+        assert _budget_warnings(caplog) == []
 
     def test_config_budget_on_a_model_that_cannot_think_warns(
         self, caplog: pytest.LogCaptureFixture
