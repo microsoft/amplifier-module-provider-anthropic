@@ -33,6 +33,10 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --dev
 
+      - name: Verify Core development source
+        run: >-
+          uv run python -c "import importlib.metadata as metadata, json; source = json.loads(metadata.distribution('amplifier-core').read_text('direct_url.json')); vcs = source.get('vcs_info', {}); assert source.get('url') == 'https://github.com/microsoft/amplifier-core' and vcs.get('vcs') == 'git' and vcs.get('requested_revision') == 'main', source; print('amplifier-core', metadata.version('amplifier-core'), 'from', vcs['vcs'], vcs['commit_id'])"
+
       - name: Run test suite
         # NOTE: `tests/test_validation.py` and `tests/test_behavioral.py`
         # silently depend on ANTHROPIC_API_KEY being exported. Measured on

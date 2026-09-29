@@ -1,9 +1,9 @@
-"""Narrow request-local adapter for Opus 5.5's native computer toolset.
+"""Narrow request-local adapter for Claude 5.5's native computer toolset.
 
 The core ToolSpec surface represents computer execution as an ordinary function
-tool.  Opus 5.5 instead expects one fixed native declaration and emits members
-of that declaration.  Keep that dialect boundary here: no provider instance
-state, no capability inference, and no broader endpoint classifier.
+tool.  Opus 5.5 and Sonnet 5.5 instead expect one fixed native declaration and
+emit members of that declaration.  Keep that dialect boundary here: no provider
+instance state, no capability inference, and no broader endpoint classifier.
 """
 
 from __future__ import annotations
@@ -50,9 +50,32 @@ def is_opus_55(model: str) -> bool:
     )
 
 
+def is_sonnet_55(model: str) -> bool:
+    """Recognize only canonical hyphenated Sonnet 5.5 model IDs."""
+    return bool(
+        re.fullmatch(
+            r"claude-sonnet-5-5(?:-\d{8})?",
+            model.lower(),
+        )
+    )
+
+
 def has_unverified_opus_55_suffix(model: str) -> bool:
     """Recognize malformed Opus 5.5 suffixes without accepting them as aliases."""
     return model.lower().startswith("claude-opus-5-5-") and not is_opus_55(model)
+
+
+def has_unverified_sonnet_55_suffix(model: str) -> bool:
+    """Recognize malformed Sonnet 5.5 suffixes without accepting them as aliases."""
+    return model.lower().startswith("claude-sonnet-5-5-") and not is_sonnet_55(model)
+
+
+def _supports_native_computer_toolset(model: str) -> bool:
+    return is_opus_55(model) or is_sonnet_55(model)
+
+
+def _has_unverified_55_suffix(model: str) -> bool:
+    return has_unverified_opus_55_suffix(model) or has_unverified_sonnet_55_suffix(model)
 
 
 def is_first_party_base_url(base_url: str | None) -> bool:
@@ -108,22 +131,24 @@ def translate_tools(
     model: str,
     base_url: str | None | Callable[[], str | None],
 ) -> tuple[list[Any], NativeComputerAdapter | None]:
-    """Translate the one supported native computer declaration for Opus 5.5.
+    """Translate the one supported native declaration for first-party Claude 5.5.
 
     Ordinary function tools and unrelated native tools are returned untouched.
     Non-first-party endpoints fail loudly instead of pretending they implement
     Anthropic's vendor-native toolset. A callable resolves the endpoint only
     after a native declaration is found.
     """
-    if not is_opus_55(model):
-        if has_unverified_opus_55_suffix(model) and any(
+    if not _supports_native_computer_toolset(model):
+        if _has_unverified_55_suffix(model) and any(
             _native_computer_type(_tool_mapping(tool))
             or _unknown_computer_type(_tool_mapping(tool))
             for tool in tools
         ):
+            model_family = "Opus" if has_unverified_opus_55_suffix(model) else "Sonnet"
             raise ComputerToolsetError(
-                "Unrecognized Opus 5.5 model suffix; native computer declarations "
-                "are supported only for claude-opus-5-5 or a dated 8-digit alias."
+                f"Unrecognized {model_family} 5.5 model suffix; native computer "
+                "declarations are supported only for canonical 5.5 IDs or dated "
+                "8-digit aliases."
             )
         return list(tools), None
 
@@ -134,7 +159,7 @@ def translate_tools(
         if _unknown_computer_type(tool) and not _native_computer_type(tool):
             raise ComputerToolsetError(
                 f"Unsupported native computer declaration type {tool['type']!r} for "
-                "Opus 5.5; supported types are computer_20241022, "
+                "Claude 5.5; supported types are computer_20241022, "
                 "computer_20250124, computer_20251124, and "
                 "computer_toolset_20260801."
             )
@@ -146,12 +171,11 @@ def translate_tools(
         if not is_first_party_base_url(base_url):
             raise ComputerToolsetError(
                 "Native computer-toolset declarations require Anthropic's first-party "
-                "API endpoint (the default or exact api.anthropic.com hostname); "
-                "this configured endpoint is not supported for Opus 5.5 native tools."
+                "API endpoint (the default or exact api.anthropic.com hostname)."
             )
         if adapter is not None:
             raise ComputerToolsetError(
-                "Only one native computer declaration is allowed per Opus 5.5 request."
+                "Only one native computer declaration is allowed per Claude 5.5 request."
             )
         alias = tool.get("name", COMPUTER_TOOLSET_NAME)
         if not isinstance(alias, str) or not alias:
@@ -184,7 +208,7 @@ def translate_tools(
             )
         if tool.get("defer_loading"):
             raise ComputerToolsetError(
-                "Opus 5.5 computer_toolset_20260801 cannot represent legacy "
+                "Claude 5.5 computer_toolset_20260801 cannot represent legacy "
                 "defer_loading safely; remove it rather than widening deferred members."
             )
         legacy_declaration = tool.get("type") != COMPUTER_TOOLSET_TYPE
@@ -203,10 +227,9 @@ def translate_tools(
             wire_configs["zoom"] = {**zoom, "enabled": tool["enable_zoom"]}
         elif legacy_declaration and "zoom" not in wire_configs:
             wire_configs["zoom"] = {"enabled": False}
-        wire: dict[str, Any] = {
-            "type": COMPUTER_TOOLSET_TYPE,
-            "configs": wire_configs,
-        }
+        wire: dict[str, Any] = {"type": COMPUTER_TOOLSET_TYPE}
+        if wire_configs:
+            wire["configs"] = wire_configs
         for key in ("cache_control", "allowed_callers"):
             if key in tool:
                 wire[key] = tool[key]

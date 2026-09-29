@@ -30,37 +30,39 @@ Provides access to Anthropic's Claude models (Claude 4 series: Sonnet, Opus, Hai
 ## Supported Models
 
 - `claude-sonnet-5` - Claude Sonnet 5 (recommended, default)
+- `claude-sonnet-5-5` - Claude Sonnet 5.5 ($2/$10 input/output per MTok)
 - `claude-opus-5` - Claude Opus 5 (most capable)
 - `claude-opus-5-5` - Claude Opus 5.5 (adaptive thinking; $4/$20 input/output per MTok)
 - `claude-haiku-4-5` - Claude Haiku 4.5 (fastest, cheapest)
 
-### Opus 5.5 support boundary
+### Claude 5.5 support boundary
 
-Opus 5.5 supports normal text, vision, function tools, streaming, effort, and
-prompt-cost tracking. Its thinking is always adaptive: an unset effort uses the
-vendor's `medium` effort, and `extended_thinking: false` cannot disable model
-thinking (the provider warns and preserves any selected effort and output cap).
-Only on Anthropic's first-party endpoint, Opus 5.5 adapts one explicit native
-computer declaration (the documented legacy `computer_20241022`,
-`computer_20250124`, or `computer_20251124`, or
+Opus 5.5 and Sonnet 5.5 support normal text, vision, function tools, streaming,
+effort, and prompt-cost tracking. Only on Anthropic's first-party endpoint, the
+provider adapts one explicit native computer declaration (the documented legacy
+`computer_20241022`, `computer_20250124`, or `computer_20251124`, or
 `computer_toolset_20260801`) to `computer_toolset_20260801`. The adapter
 preserves the ToolSpec name as the executor dispatch alias and maps the native
 action member into `input.action`; ordinary function tools, including one named
 `computer`, remain ordinary function tools. The actual request assembly guards
 this first-party-only boundary: custom/proxy endpoints fail locally rather than
-claiming vendor-native toolset support, even though recognized Opus 5.5
+claiming vendor-native toolset support, even though recognized Claude 5.5
 capabilities advertise the native path. This adapter is not a claim that the new
-toolset is fully equivalent to prior native-computer contracts. Native computer
-actions are single-action responses: the request uses `tool_choice: auto` with
-the **request-wide** `disable_parallel_tool_use: true`; forced/named choice
-remains unsupported on Opus 5.5. `key.repeat` is passed through when the model
-emits it. An old executor without repeat support presses once and reports
-success even when `repeat > 1`. Update the computer-action executor to honor
-`key.repeat` before, or together with, activating this native Opus 5.5 path.
+toolset is fully equivalent to prior native-computer contracts. Forced/named
+tool choice remains unsupported on both 5.5 models. Native members are marked
+for sequential execution if a response contains more than one.
+
+Opus 5.5 thinking is always adaptive: an unset effort uses the vendor's
+`medium` effort, and `extended_thinking: false` cannot disable model thinking
+(the provider warns and preserves any selected effort and output cap). On Sonnet
+5.5, `extended_thinking: false` (or `thinking_type: between_tools`) sends only
+`thinking: {type: between_tools}`. That mode rejects thinking display/budgets
+and `xhigh`/`max` effort; use adaptive thinking for those settings.
+
 Provider-derived headers do not add a legacy computer-use beta for the new
-toolset; an explicitly configured beta header is retained. As elsewhere in this provider, expert
-`extra_request_params.tool_choice` is an explicit wire-level override and wins
-over this derived default. This does not change the default model.
+toolset. The fine-grained-tool-streaming beta is incompatible with this toolset;
+use `eager_input_streaming` on individual tools instead. This does not change
+the default model.
 
 ## Configuration
 
@@ -499,7 +501,7 @@ House-style key reference. ✅ = wizard-visible ConfigField, ⚙️ = settings-o
 | `extended_thinking` | *(unset)* | ⚙️ | Turn extended thinking on/off without choosing an effort. Overrides the `reasoning_effort` implication; a per-call kwarg overrides this |
 | `thinking_budget_tokens` | *(model default)* | ⚙️ | Explicit `thinking.budget_tokens`. Outranks the effort-implied budget; warns if it can't reach the wire |
 | `thinking_budget_buffer` | `8192` | ⚙️ | Headroom added to the budget when sizing `max_tokens` |
-| `thinking_type` | `adaptive` | ⚙️ | `adaptive`\|`enabled`. `adaptive` lets the model manage its own budget (and forbids `budget_tokens`); falls back to `enabled` on models without adaptive support |
+| `thinking_type` | `adaptive` | ⚙️ | `adaptive`\|`enabled` (plus Sonnet 5.5-only `between_tools`). `adaptive` lets the model manage its own budget (and forbids `budget_tokens`); `between_tools` also forbids display/budget fields and `xhigh`/`max` effort |
 | `enable_1m_context` | `false` | ✅ | Advertise the 1M context window (more history kept = higher cost) |
 | `cache_stable_region_ttl_1h` | *(unset)* | ✅ | 1h cache TTL for system prompt + tools. 2x write cost, fewer writes |
 | `enable_prompt_caching` | `true` | ⚙️ | Place cache breakpoints |

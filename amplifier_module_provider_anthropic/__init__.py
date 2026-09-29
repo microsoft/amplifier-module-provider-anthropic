@@ -74,6 +74,7 @@ from ._computer_toolset import (
     ComputerToolsetError,
     NativeComputerAdapter,
     is_opus_55,
+    is_sonnet_55,
     native_wire_tool_use,
     translate_tools,
 )
@@ -364,6 +365,7 @@ NATIVE_TOOL_BETA_HEADERS: dict[str, str] = {
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
 BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
 BETA_HEADER_FAST_MODE = "fast-mode-2026-02-01"
+BETA_HEADER_FINE_GRAINED_TOOL_STREAMING = "fine-grained-tool-streaming-2025-05-14"
 PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
 FALLBACK_STATE_VERSION = 1
@@ -411,7 +413,7 @@ _STATIC_BUDGET_MODEL_VERSIONS: dict[str, frozenset[tuple[int, int]]] = {
     "fable": frozenset({(5, 0), (5, 1)}),
     "mythos": frozenset({(5, 0), (5, 1)}),
     "opus": frozenset({(4, 5), (4, 6), (4, 7), (4, 8), (5, 0), (5, 5)}),
-    "sonnet": frozenset({(4, 5), (4, 6), (5, 0)}),
+    "sonnet": frozenset({(4, 5), (4, 6), (5, 0), (5, 5)}),
     "haiku": frozenset({(4, 5)}),
 }
 
@@ -2131,6 +2133,8 @@ class AnthropicProvider:
             # Sonnet 5 also accepts the "max" effort tier (confirmed 2026-07-20);
             # it has no Opus-only fast mode.
             is_5_plus = not version_known or (major, minor) >= (5, 0)
+            is_55 = (major, minor) == (5, 5)
+            native_55_supported = is_sonnet_55(model_id)
             # Computer-use wire type, live-probed 2026-08-03 (same method as opus,
             # above):
             #   claude-sonnet-4-5-20250929 + computer_20250124 -> 200
@@ -2142,7 +2146,17 @@ class AnthropicProvider:
             # 4.1 and 4.4 exists to probe. Unlike opus (confirmed live down to 4.1), the
             # sonnet floor is set at the lowest version this evidence actually covers
             # (4.5) rather than extrapolated down to match opus's threshold.
-            if is_46_plus:
+            if native_55_supported:
+                # Like Opus 5.5, Sonnet 5.5's legacy computer declarations
+                # are adapted request-locally. translate_tools() enforces the
+                # canonical-ID and first-party-endpoint boundaries.
+                computer_use_tool_type = "computer_toolset_20260801"
+            elif is_55:
+                # Keep an unverified spelling on the established Sonnet 5.5
+                # capability branch, but do not imply that it can use the
+                # first-party toolset adapter.
+                computer_use_tool_type = None
+            elif is_46_plus:
                 computer_use_tool_type = "computer_20251124"
             elif is_45_plus:
                 computer_use_tool_type = "computer_20250124"
@@ -2193,8 +2207,13 @@ class AnthropicProvider:
                     else ("low", "medium", "high")
                 ),
                 default_thinking_budget=32000,
+                # Sonnet 5.5 supports both adaptive and between-tools
+                # thinking. Its explicit between-tools path is resolved in
+                # _assemble_request_params rather than treated as adaptive.
+                supports_forced_tool_choice=not is_55,
                 supports_native_computer_use=computer_use_tool_type is not None,
                 computer_use_tool_type=computer_use_tool_type,
+                min_cacheable_tokens=512 if is_55 else 1024,
                 capability_tags=(
                     "tools",
                     "thinking",
@@ -3564,6 +3583,7 @@ class AnthropicProvider:
         effective_model = options.get("model", self.default_model)
         if not isinstance(effective_model, str):
             return None
+        is_sonnet_55_model = is_sonnet_55(effective_model)
         try:
             request_tools, native_computer_adapter = translate_tools(
                 request.tools or [],
@@ -3710,7 +3730,7 @@ class AnthropicProvider:
                 and normalized_tool_choice.get("type") in {"any", "tool"}
             ):
                 raise KernelInvalidRequestError(
-                    "claude-opus-5-5 supports only tool_choice 'auto' or "
+                    f"{effective_model} supports only tool_choice 'auto' or "
                     "'none'; required/any and named tool choice are unavailable.",
                     provider="anthropic",
                     model=effective_model,
@@ -3797,6 +3817,48 @@ class AnthropicProvider:
                     )
                 requested_budget_source = None
 
+        configured_thinking_type = (
+            self.config.get("thinking_type") if "thinking_type" in self.config else None
+        )
+        requested_thinking_type = options.get("thinking_type", configured_thinking_type)
+        sonnet_between_tools = is_sonnet_55_model and (
+            options.get("extended_thinking") is False
+            or (
+                "extended_thinking" not in options
+                and config_thinking is False
+            )
+            or requested_thinking_type == "between_tools"
+        )
+        if sonnet_between_tools:
+            if requested_budget_source is not None:
+                raise KernelInvalidRequestError(
+                    "claude-sonnet-5-5 thinking.type='between_tools' cannot include "
+                    "thinking_budget_tokens.",
+                    provider="anthropic",
+                    model=effective_model,
+                    status_code=400,
+                )
+            if (
+                options.get("thinking_display") is not None
+                or self.config.get("thinking_display") is not None
+            ):
+                raise KernelInvalidRequestError(
+                    "claude-sonnet-5-5 thinking.type='between_tools' cannot include "
+                    "thinking.display.",
+                    provider="anthropic",
+                    model=effective_model,
+                    status_code=400,
+                )
+            between_tools_effort = options.get("effort", reasoning_effort)
+            if between_tools_effort in {"xhigh", "max"}:
+                raise KernelInvalidRequestError(
+                    "claude-sonnet-5-5 thinking.type='between_tools' supports only "
+                    "low, medium, or high effort; use adaptive thinking for xhigh or max.",
+                    provider="anthropic",
+                    model=effective_model,
+                    status_code=400,
+                )
+
         thinking_budget: int | None = None
         interleaved_thinking_enabled = False
         resolved_thinking_type: str | None = None
@@ -3837,7 +3899,13 @@ class AnthropicProvider:
                 effective_model,
                 request_caps.supported_efforts,
             )
-        if thinking_enabled:
+        if sonnet_between_tools:
+            # Sonnet 5.5's lowest thinking setting is a wire contract of its
+            # own. It must contain no adaptive-only display or budget fields.
+            thinking_enabled = True
+            params["thinking"] = {"type": "between_tools"}
+            resolved_thinking_type = "between_tools"
+        elif thinking_enabled:
             if request_caps.requires_adaptive_thinking:
                 params["thinking"] = {"type": "adaptive"}
                 resolved_thinking_type = "adaptive"
@@ -3913,8 +3981,10 @@ class AnthropicProvider:
                         params["max_tokens"],
                         interleaved_thinking_enabled,
                     )
-            if request_caps.thinking_display_required and isinstance(
-                params.get("thinking"), dict
+            if (
+                resolved_thinking_type != "between_tools"
+                and request_caps.thinking_display_required
+                and isinstance(params.get("thinking"), dict)
             ):
                 params["thinking"]["display"] = options.get(
                     "thinking_display",
@@ -4046,6 +4116,26 @@ class AnthropicProvider:
                 "anthropic-beta": ",".join(headers),
             }
         self._merge_extra_request_params(params, emit_warnings=emit_diagnostics)
+        if native_computer_adapter is not None:
+            raw_beta_headers = (
+                params.get("extra_headers", {}).get("anthropic-beta")
+                if isinstance(params.get("extra_headers"), dict)
+                else None
+            )
+            beta_headers = (
+                {header.strip() for header in raw_beta_headers.split(",")}
+                if isinstance(raw_beta_headers, str)
+                else set()
+            )
+            if BETA_HEADER_FINE_GRAINED_TOOL_STREAMING in beta_headers:
+                raise KernelInvalidRequestError(
+                    "computer_toolset_20260801 is incompatible with "
+                    "fine-grained-tool-streaming-2025-05-14; remove that beta "
+                    "header and use eager_input_streaming on individual tools.",
+                    provider="anthropic",
+                    model=effective_model,
+                    status_code=400,
+                )
         if request.max_output_tokens is not None:
             params["max_tokens"] = min(request.max_output_tokens, model_ceiling)
         elif params.get("max_tokens") and params["max_tokens"] > model_ceiling:
@@ -5098,11 +5188,14 @@ class AnthropicProvider:
         if block_type == "redacted_thinking":
             return {"type": "redacted_thinking", "data": block.get("data", "")}
         if block_type == "tool_result":
-            return {
+            cleaned = {
                 "type": "tool_result",
                 "tool_use_id": block.get("tool_use_id", ""),
                 "content": block.get("content", ""),
             }
+            if isinstance(block.get("is_error"), bool):
+                cleaned["is_error"] = block["is_error"]
+            return cleaned
         if block_type == "web_search_tool_result":
             # Web search results are model-native and should be passed through
             # with minimal cleaning (just remove internal fields)
@@ -5219,6 +5312,8 @@ class AnthropicProvider:
                         "tool_use_id": tool_use_id,
                         "content": tool_msg.get("content", ""),
                     }
+                    if isinstance(tool_msg.get("is_error"), bool):
+                        result["is_error"] = tool_msg["is_error"]
                     toolset_name = native_tool_use_ids.get(tool_use_id)
                     if toolset_name:
                         result["toolset_name"] = toolset_name
@@ -6358,26 +6453,6 @@ class AnthropicProvider:
         ] = []
         text_accumulator: list[str] = []
 
-        native_blocks = (
-            [
-                block
-                for block in response.content
-                if getattr(block, "type", None) == "tool_use"
-                and getattr(block, "toolset_name", None)
-                == native_computer_adapter.toolset_name
-            ]
-            if native_computer_adapter is not None
-            else []
-        )
-        if len(native_blocks) > 1:
-            raise KernelInvalidRequestError(
-                "Opus 5.5 native computer toolset returned multiple action members; "
-                "this provider accepts one computer action per response.",
-                provider="anthropic",
-                status_code=400,
-                retryable=False,
-            )
-
         for block in response.content:
             if block.type == "text":
                 content_blocks.append(TextBlock(text=block.text))
@@ -6428,8 +6503,19 @@ class AnthropicProvider:
                 content_blocks.append(
                     ToolCallBlock(id=block.id, name=name, input=input_data, **block_extra)
                 )
+                execution_mode = (
+                    {"_amplifier_execution_mode": "sequential"}
+                    if is_native_computer
+                    else {}
+                )
                 tool_calls.append(
-                    ToolCall(id=block.id, name=name, arguments=input_data, **block_extra)
+                    ToolCall(
+                        id=block.id,
+                        name=name,
+                        arguments=input_data,
+                        **block_extra,
+                        **execution_mode,
+                    )
                 )
                 event_blocks.append(
                     ToolCallContent(id=block.id, name=name, arguments=input_data)

@@ -496,7 +496,7 @@ def test_opus55_response_dispatch_and_history_are_request_scoped() -> None:
     }
 
 
-def test_opus55_rejects_multiple_or_colliding_native_actions() -> None:
+def test_opus55_preserves_multiple_native_actions_and_rejects_collisions() -> None:
     provider = _provider()
     adapter = provider._assemble_request_params(
         _request(tools=[_native_computer()]),
@@ -512,9 +512,12 @@ def test_opus55_rejects_multiple_or_colliding_native_actions() -> None:
         stop_reason="tool_use",
         model=MODEL,
     )
-    with pytest.raises(KernelInvalidRequestError, match="multiple action") as exc_info:
-        provider._convert_to_chat_response(multiple, native_computer_adapter=adapter)
-    assert exc_info.value.retryable is False
+    converted = provider._convert_to_chat_response(multiple, native_computer_adapter=adapter)
+    assert [call.id for call in converted.tool_calls] == ["one", "two"]
+    assert all(
+        getattr(call, "_amplifier_execution_mode") == "sequential"
+        for call in converted.tool_calls
+    )
 
     collision = SimpleNamespace(
         content=[
