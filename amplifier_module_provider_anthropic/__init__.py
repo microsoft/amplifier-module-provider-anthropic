@@ -3736,19 +3736,8 @@ class AnthropicProvider:
                     model=effective_model,
                     status_code=400,
                 )
-            if (
-                native_computer_adapter is not None
-                and normalized_tool_choice.get("type") == "auto"
-            ):
-                # Copy above keeps caller-owned tool_choice dictionaries intact.
-                # A native computer response is one executor action, so make
-                # that request-wide restriction explicit on the wire.
-                normalized_tool_choice["disable_parallel_tool_use"] = True
         elif native_computer_adapter is not None:
-            normalized_tool_choice = {
-                "type": "auto",
-                "disable_parallel_tool_use": True,
-            }
+            normalized_tool_choice = {"type": "auto"}
 
         if request_tools:
             tools = self._convert_tools_from_request(request_tools)

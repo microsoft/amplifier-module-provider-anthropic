@@ -101,6 +101,17 @@ def test_sonnet55_direct_native_toolset_without_configs_stays_bare() -> None:
     ]
 
 
+def test_sonnet55_native_auto_does_not_derive_parallel_restriction() -> None:
+    assert _assemble(_request(tools=[_native_computer()]))["tool_choice"] == {
+        "type": "auto"
+    }
+    caller_choice = {"type": "auto", "disable_parallel_tool_use": True}
+    assert _assemble(
+        _request(tools=[_native_computer()], tool_choice=caller_choice)
+    )["tool_choice"] == caller_choice
+    assert caller_choice == {"type": "auto", "disable_parallel_tool_use": True}
+
+
 def test_sonnet55_rejects_native_adapter_at_custom_endpoint() -> None:
     provider = _provider(base_url="https://gateway.example.test")
 

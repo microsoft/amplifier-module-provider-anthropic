@@ -50,7 +50,10 @@ claiming vendor-native toolset support, even though recognized Claude 5.5
 capabilities advertise the native path. This adapter is not a claim that the new
 toolset is fully equivalent to prior native-computer contracts. Forced/named
 tool choice remains unsupported on both 5.5 models. Native members are marked
-for sequential execution if a response contains more than one.
+for sequential execution if a response contains more than one, so native
+computer use requires sequential-capable orchestration. Callers that require
+one member per response can explicitly send
+`tool_choice: {"type": "auto", "disable_parallel_tool_use": true}`.
 
 Opus 5.5 thinking is always adaptive: an unset effort uses the vendor's
 `medium` effort, and `extended_thinking: false` cannot disable model thinking

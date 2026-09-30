@@ -156,19 +156,25 @@ def test_opus55_adapts_legacy_native_computer_declaration() -> None:
     assert "anthropic-beta" not in params.get("extra_headers", {})
 
 
-def test_opus55_native_computer_sets_single_action_auto_without_mutating_caller() -> None:
+def test_opus55_native_computer_permits_multiple_actions_without_mutating_caller() -> None:
     caller_choice = {"type": "auto"}
     params = _assemble(
         _request(tools=[_native_computer()], tool_choice=caller_choice)
     )
     assert caller_choice == {"type": "auto"}
-    assert params["tool_choice"] == {
-        "type": "auto",
-        "disable_parallel_tool_use": True,
-    }
+    assert params["tool_choice"] == {"type": "auto"}
     assert _assemble(_request(tools=[_native_computer()], tool_choice=None))[
         "tool_choice"
-    ] == {"type": "auto", "disable_parallel_tool_use": True}
+    ] == {"type": "auto"}
+    for caller_restriction in (
+        {"type": "auto", "disable_parallel_tool_use": True},
+        {"type": "auto", "disable_parallel_tool_use": False},
+    ):
+        expected_choice = dict(caller_restriction)
+        assert _assemble(
+            _request(tools=[_native_computer()], tool_choice=caller_restriction)
+        )["tool_choice"] == expected_choice
+        assert caller_restriction == expected_choice
     assert _assemble(_request(tools=[_native_computer()], tool_choice="none"))[
         "tool_choice"
     ] == {"type": "none"}
