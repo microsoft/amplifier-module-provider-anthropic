@@ -1314,6 +1314,7 @@ class AnthropicProvider:
             )
         self.extra_request_params: dict[str, Any] = dict(_extra)
         self._extra_params_warned_keys: set[str] = set()
+        self._between_tools_suppressed_config_warnings: set[str] = set()
 
         # Use streaming API by default to support large context windows (Anthropic requires streaming
         # for operations that may take > 10 minutes, e.g. with 300k+ token contexts)
@@ -3774,6 +3775,9 @@ class AnthropicProvider:
             if "extended_thinking" in self.config
             else None
         )
+        per_call_between_tools_opt_out = (
+            is_sonnet_55_model and options.get("extended_thinking") is False
+        )
         thinking_enabled = bool(options.get("extended_thinking"))
         if "extended_thinking" not in options:
             if config_thinking is not None:
@@ -3787,7 +3791,10 @@ class AnthropicProvider:
                 "kwargs",
                 options["thinking_budget_tokens"],
             )
-        elif self.config.get("thinking_budget_tokens") is not None:
+        elif (
+            not per_call_between_tools_opt_out
+            and self.config.get("thinking_budget_tokens") is not None
+        ):
             requested_budget_source, requested_budget_raw = (
                 "config",
                 self.config["thinking_budget_tokens"],
@@ -3819,6 +3826,20 @@ class AnthropicProvider:
             or requested_thinking_type == "between_tools"
         )
         if sonnet_between_tools:
+            if per_call_between_tools_opt_out and emit_diagnostics:
+                for config_key in ("thinking_budget_tokens", "thinking_display"):
+                    if (
+                        self.config.get(config_key) is not None
+                        and config_key
+                        not in self._between_tools_suppressed_config_warnings
+                    ):
+                        self._between_tools_suppressed_config_warnings.add(config_key)
+                        logger.warning(
+                            "[PROVIDER] Ignoring config '%s' for Sonnet 5.5 "
+                            "per-call extended_thinking=false: "
+                            "thinking.type='between_tools' sends no matching field.",
+                            config_key,
+                        )
             if requested_budget_source is not None:
                 raise KernelInvalidRequestError(
                     "claude-sonnet-5-5 thinking.type='between_tools' cannot include "
@@ -3829,7 +3850,10 @@ class AnthropicProvider:
                 )
             if (
                 options.get("thinking_display") is not None
-                or self.config.get("thinking_display") is not None
+                or (
+                    not per_call_between_tools_opt_out
+                    and self.config.get("thinking_display") is not None
+                )
             ):
                 raise KernelInvalidRequestError(
                     "claude-sonnet-5-5 thinking.type='between_tools' cannot include "

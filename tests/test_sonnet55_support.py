@@ -166,6 +166,81 @@ def test_sonnet55_between_tools_is_the_only_thinking_payload(options: dict[str, 
     assert params["thinking"] == {"type": "between_tools"}
 
 
+def test_sonnet55_per_call_between_tools_suppresses_inherited_thinking_fields_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = _provider(
+        reasoning_effort="max",
+        thinking_budget_tokens=8000,
+        thinking_display="summarized",
+    )
+    request = _request(reasoning_effort="high")
+
+    for _ in range(2):
+        assembly = provider._assemble_request_params(
+            request,
+            request_options={
+                "model": MODEL,
+                "extended_thinking": False,
+                "effort": "high",
+            },
+            request_caps=provider._get_capabilities(MODEL),
+            emit_diagnostics=True,
+        )
+        assert assembly is not None
+        assert assembly.params["thinking"] == {"type": "between_tools"}
+        assert assembly.params["output_config"] == {"effort": "high"}
+        assert assembly.params["max_tokens"] == 123
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "Ignoring config" in record.getMessage()
+    ]
+    assert warnings == [
+        "[PROVIDER] Ignoring config 'thinking_budget_tokens' for Sonnet 5.5 "
+        "per-call extended_thinking=false: thinking.type='between_tools' sends "
+        "no matching field.",
+        "[PROVIDER] Ignoring config 'thinking_display' for Sonnet 5.5 per-call "
+        "extended_thinking=false: thinking.type='between_tools' sends no "
+        "matching field.",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("options", "match"),
+    [
+        ({"thinking_budget_tokens": 1024}, "budget"),
+        ({"thinking_display": "summarized"}, "display"),
+    ],
+)
+def test_sonnet55_per_call_between_tools_rejects_explicit_thinking_fields(
+    options: dict[str, Any], match: str
+) -> None:
+    with pytest.raises(KernelInvalidRequestError, match=match):
+        _assemble(_request(), extended_thinking=False, **options)
+
+
+def test_sonnet55_adaptive_request_keeps_all_thinking_config() -> None:
+    provider = _provider(
+        reasoning_effort="max",
+        extended_thinking=True,
+        thinking_type="adaptive",
+        thinking_budget_tokens=8000,
+        thinking_display="summarized",
+    )
+    assembly = provider._assemble_request_params(
+        _request(),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    )
+
+    assert assembly is not None
+    assert assembly.params["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert assembly.params["output_config"] == {"effort": "max"}
+    assert assembly.params["max_tokens"] == 123
+
+
 @pytest.mark.parametrize(
     ("options", "match"),
     [

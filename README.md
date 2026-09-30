@@ -61,6 +61,11 @@ Opus 5.5 thinking is always adaptive: an unset effort uses the vendor's
 5.5, `extended_thinking: false` (or `thinking_type: between_tools`) sends only
 `thinking: {type: between_tools}`. That mode rejects thinking display/budgets
 and `xhigh`/`max` effort; use adaptive thinking for those settings.
+For a fresh utility call that explicitly sets `extended_thinking: false`, the
+provider ignores inherited `thinking_budget_tokens` and `thinking_display`
+settings (with one safe warning per setting), because between-tools sends
+neither field. Per-call budget/display values and other between-tools selections
+remain strict errors.
 
 Provider-derived headers do not add a legacy computer-use beta for the new
 toolset. The fine-grained-tool-streaming beta is incompatible with this toolset;
