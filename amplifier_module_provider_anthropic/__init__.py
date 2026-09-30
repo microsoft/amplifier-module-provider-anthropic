@@ -3527,6 +3527,27 @@ class AnthropicProvider:
                 params["extra_body"] = extra_body
 
     @staticmethod
+    def _validate_forced_tool_choice(
+        tool_choice: Any,
+        *,
+        request_caps: ModelCapabilities,
+        effective_model: str,
+    ) -> None:
+        """Reject forced tool choice where the resolved model does not support it."""
+        if (
+            not request_caps.supports_forced_tool_choice
+            and isinstance(tool_choice, Mapping)
+            and tool_choice.get("type") in {"any", "tool"}
+        ):
+            raise KernelInvalidRequestError(
+                f"{effective_model} supports only tool_choice 'auto' or "
+                "'none'; required/any and named tool choice are unavailable.",
+                provider="anthropic",
+                model=effective_model,
+                status_code=400,
+            )
+
+    @staticmethod
     def _fingerprint(value: Any) -> str | None:
         """Return a content fingerprint without retaining the source payload."""
         try:
@@ -3726,17 +3747,11 @@ class AnthropicProvider:
                     model=effective_model,
                     status_code=400,
                 )
-            if (
-                not request_caps.supports_forced_tool_choice
-                and normalized_tool_choice.get("type") in {"any", "tool"}
-            ):
-                raise KernelInvalidRequestError(
-                    f"{effective_model} supports only tool_choice 'auto' or "
-                    "'none'; required/any and named tool choice are unavailable.",
-                    provider="anthropic",
-                    model=effective_model,
-                    status_code=400,
-                )
+            self._validate_forced_tool_choice(
+                normalized_tool_choice,
+                request_caps=request_caps,
+                effective_model=effective_model,
+            )
         elif native_computer_adapter is not None:
             normalized_tool_choice = {"type": "auto"}
 
@@ -4129,6 +4144,11 @@ class AnthropicProvider:
                 "anthropic-beta": ",".join(headers),
             }
         self._merge_extra_request_params(params, emit_warnings=emit_diagnostics)
+        self._validate_forced_tool_choice(
+            params.get("tool_choice"),
+            request_caps=request_caps,
+            effective_model=effective_model,
+        )
         if native_computer_adapter is not None:
             raw_beta_headers = (
                 params.get("extra_headers", {}).get("anthropic-beta")

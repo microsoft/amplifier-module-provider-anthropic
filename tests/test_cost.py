@@ -36,6 +36,8 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
 
+import pytest
+
 from amplifier_core import ModuleCoordinator
 from amplifier_module_provider_anthropic import AnthropicProvider
 from amplifier_module_provider_anthropic._cost import compute_cost
@@ -471,6 +473,27 @@ def test_sonnet_55_matches_sonnet_5_pricing_including_one_hour_cache_write():
         cache_creation_5m_input_tokens=1_000_000,
         cache_creation_1h_input_tokens=1_000_000,
     ) == Decimal("18.70")
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"input_tokens": 1_000_000},
+        {"output_tokens": 1_000_000},
+        {"cache_creation_5m_input_tokens": 1_000_000},
+        {"cache_creation_1h_input_tokens": 1_000_000},
+    ],
+)
+def test_dated_sonnet_55_matches_canonical_pricing(
+    usage: dict[str, int],
+) -> None:
+    assert compute_cost("claude-sonnet-5-5", **usage) == compute_cost(
+        "claude-sonnet-5-5-20260929", **usage
+    )
+
+
+def test_unknown_sonnet_55_suffix_has_no_guessed_pricing() -> None:
+    assert compute_cost("claude-sonnet-5-5-latest", input_tokens=1_000_000) is None
 
 
 # ---------------------------------------------------------------------------

@@ -154,6 +154,64 @@ def test_sonnet55_rejects_forced_tool_choice_during_preflight() -> None:
 
 
 @pytest.mark.parametrize(
+    "choice",
+    [
+        {"type": "any"},
+        {"type": "tool", "name": "lookup"},
+    ],
+)
+def test_sonnet55_rejects_extra_params_forced_tool_choice_during_assembly(
+    choice: dict[str, str],
+) -> None:
+    provider = _provider(extra_request_params={"tool_choice": choice})
+
+    with pytest.raises(KernelInvalidRequestError, match="only tool_choice 'auto' or 'none'"):
+        provider._assemble_request_params(
+            _request(tools=[_native_computer()]),
+            request_options={"model": MODEL},
+            request_caps=provider._get_capabilities(MODEL),
+        )
+
+
+@pytest.mark.parametrize(
+    "choice",
+    [
+        {"type": "any"},
+        {"type": "tool", "name": "lookup"},
+    ],
+)
+def test_sonnet55_rejects_extra_params_forced_tool_choice_during_preflight(
+    choice: dict[str, str],
+) -> None:
+    provider = _provider(extra_request_params={"tool_choice": choice})
+
+    async def run() -> None:
+        with pytest.raises(
+            KernelInvalidRequestError, match="only tool_choice 'auto' or 'none'"
+        ):
+            await provider.request_budget(
+                _request(tools=[_native_computer()]),
+                context_estimate=10_000,
+            )
+
+    asyncio.run(run())
+
+
+def test_sonnet55_allows_extra_params_auto_tool_choice_with_parallel_flag() -> None:
+    choice = {"type": "auto", "disable_parallel_tool_use": True}
+    provider = _provider(extra_request_params={"tool_choice": choice})
+
+    assembly = provider._assemble_request_params(
+        _request(tools=[_native_computer()]),
+        request_options={"model": MODEL},
+        request_caps=provider._get_capabilities(MODEL),
+    )
+
+    assert assembly is not None
+    assert assembly.params["tool_choice"] == choice
+
+
+@pytest.mark.parametrize(
     "options",
     [
         {"extended_thinking": False},

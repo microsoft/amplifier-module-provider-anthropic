@@ -19,6 +19,7 @@ Usage
 from __future__ import annotations
 
 import logging
+import re
 from decimal import Decimal
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _PER_M = Decimal("1_000_000")
+_SONNET_55_PRICING_MODEL_RE = re.compile(
+    r"^claude-sonnet-5-5(?:-\d{8})?$", re.IGNORECASE
+)
 
 # _RATES maps model-id → {
 #   "input_per_m":      Decimal,   # fresh input tokens, per 1M
@@ -301,7 +305,12 @@ def compute_cost(
         The computed cost in USD, or ``None`` if *model* is not recognised.
         ``None`` is semantically distinct from ``Decimal('0')`` (a free call).
     """
-    rates = _RATES.get(model)
+    pricing_model = (
+        "claude-sonnet-5-5"
+        if _SONNET_55_PRICING_MODEL_RE.fullmatch(model)
+        else model
+    )
+    rates = _RATES.get(pricing_model)
     if rates is None:
         return None
 
