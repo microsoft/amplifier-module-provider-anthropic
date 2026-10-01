@@ -92,7 +92,7 @@ OWNER_LIVE_CONFIGS: dict[str, dict] = {
 # so it is exercised separately below rather than folded into this table.
 NUMERIC_KEYS = [
     ("priority", "priority", int, 100),
-    ("timeout", "timeout", float, 600.0),
+    ("timeout", "timeout", type(None), None),
     ("overloaded_delay_multiplier", "_overloaded_delay_multiplier", float, 10.0),
     ("throttle_threshold", "_throttle_threshold", float, 0.02),
     ("throttle_delay", "_throttle_delay", float, 1.0),

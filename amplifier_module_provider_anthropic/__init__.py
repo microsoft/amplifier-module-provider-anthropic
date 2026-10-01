@@ -1028,7 +1028,7 @@ class AnthropicProvider:
             return default
 
     @staticmethod
-    def _config_float(value: Any, default: float) -> float:
+    def _config_float(value: Any, default: float | None) -> float | None:
         """Parse a float config value with a safe fallback."""
         if value is None:
             return default
@@ -1117,8 +1117,9 @@ class AnthropicProvider:
             self.config.get("raw", False)
         )  # Include raw payload in events
         self.timeout = self._config_float(
-            self.config.get("timeout"), 600.0
-        )  # API timeout in seconds (default 10 minutes)
+            self.config.get("timeout"), None
+        )  # Optional caller deadline; healthy model work has no default cutoff.
+        self._sdk_timeout = AnthropicTimeout(self.timeout, connect=5.0, pool=5.0)
         # Hard bound on teardown's httpx aclose() -- see close(). This is NOT
         # `timeout` above: that one bounds an API request, this one bounds
         # closing the connection pool at session cleanup, where a half-closed
@@ -1493,45 +1494,16 @@ class AnthropicProvider:
         if self._client is None:
             if self._api_key is None:
                 raise ValueError("api_key must be provided for API calls")
-            # Set SDK max_retries=0 - we handle retries ourselves to properly
-            # honor retry-after headers with jitter and longer backoffs
-            #
-            # `timeout` must be passed. Two things break when it is omitted:
-            #
-            #   1. A configured `timeout` is silently ignored -- the SDK falls
-            #      back to its own default and long single-turn streams die at
-            #      that default even when the operator asked for more.
-            #
-            #   2. Without it, `self._client.timeout == DEFAULT_TIMEOUT` stays
-            #      true, which arms a client-side guard in the SDK's Messages
-            #      resource: for a NON-streaming call it estimates the request
-            #      duration from `max_tokens` alone and raises
-            #      "Streaming is required for operations that may take longer
-            #      than 10 minutes" before issuing any HTTP request. The
-            #      estimate is `3600 * max_tokens / 128_000 > 600`, i.e. any
-            #      `max_tokens` above 21,333 -- and `self.max_tokens` defaults
-            #      to the model's full output ceiling (64k-128k), so every
-            #      non-streaming call is refused unless the caller also lowered
-            #      `max_tokens`. Passing an explicit timeout skips that guess
-            #      entirely; the guard exists to estimate a bound we already
-            #      know and already enforce ourselves via `asyncio.wait_for` /
-            #      `asyncio.timeout` on both completion paths.
-            #
-            # Pass a Timeout rather than a bare float: a bare float applies to
-            # every phase, stretching connect from the SDK's 5s to the full
-            # request timeout. `connect=5.0` mirrors what the SDK itself builds
-            # in `_calculate_nonstreaming_timeout`.
-            #
-            # Imported from `anthropic`, not from the underlying HTTP package.
-            # The SDK re-exports its own timeout type, so this survives another
-            # transport swap like the 1.0 move from httpx to httpx2 -- a bare
-            # `import httpx` is precisely what broke on that upgrade.
+            # Keep connection/pool acquisition bounded while allowing silent model
+            # work to finish. An explicit SDK timeout also disables Anthropic's
+            # max_tokens-based non-streaming duration estimate. Use the SDK's
+            # re-exported Timeout so this works with its current HTTP transport.
             self._client = AsyncAnthropic(
                 api_key=self._api_key,
                 base_url=self._base_url,
                 default_headers=self._default_headers,
                 max_retries=0,
-                timeout=AnthropicTimeout(self.timeout, connect=5.0),
+                timeout=self._sdk_timeout,
             )
         return self._client
 
@@ -1553,7 +1525,7 @@ class AnthropicProvider:
                 "model": self.default_model,
                 "max_tokens": 4096,
                 "temperature": 0.7,
-                "timeout": 600.0,
+                "timeout": None,
                 "context_window": 1000000
                 if self._enable_1m_context and self._default_caps.supports_1m
                 else self._default_caps.base_context_window,
@@ -4329,6 +4301,9 @@ class AnthropicProvider:
                 if isinstance(_metadata, dict) and _metadata.get("stream") is False:
                     _use_streaming = False
 
+                # SDK-only policy stays out of the assembled generation payload.
+                # Explicit transport overrides in extra_request_params win.
+                sdk_params = {"timeout": self._sdk_timeout, **params}
                 if _use_streaming:
                     # ----- Streaming path with per-block event emission --------
                     # We iterate the SDK's event stream rather than calling
@@ -4373,7 +4348,7 @@ class AnthropicProvider:
                     )
                     try:
                         async with asyncio.timeout(self.timeout):
-                            async with self.client.messages.stream(**params) as stream:
+                            async with self.client.messages.stream(**sdk_params) as stream:
                                 async for event in stream:
                                     sdk_stream_started = True
                                     etype = type(event).__name__
@@ -4508,39 +4483,11 @@ class AnthropicProvider:
                             )
                         raise
                 else:
-                    # Use with_raw_response to access headers.
-                    #
-                    # `timeout=` is passed explicitly, not merged into `params`,
-                    # so it reaches only this call -- the streaming branch above
-                    # takes the client-level timeout and the SDK guard below
-                    # does not apply to it.
-                    #
-                    # The SDK's Messages resource guards non-streaming calls:
-                    #
-                    #   if not stream and not is_given(timeout) and
-                    #      self._client.timeout == DEFAULT_TIMEOUT:
-                    #       timeout = self._client._calculate_nonstreaming_timeout(...)
-                    #
-                    # ...which raises "Streaming is required for operations that
-                    # may take longer than 10 minutes" whenever `max_tokens`
-                    # exceeds 21,333 -- and `self.max_tokens` defaults to the
-                    # model's full output ceiling (64k-128k), so the estimate
-                    # refuses ordinary calls before any HTTP request is made.
-                    #
-                    # Setting the client-level timeout is NOT sufficient to skip
-                    # it: with the default `self.timeout` of 600.0, the client
-                    # timeout is value-equal to the SDK's own DEFAULT_TIMEOUT
-                    # (read/write/pool 600, connect 5.0), so that comparison
-                    # stays true. `is_given(timeout)` is checked first, so the
-                    # per-request timeout is what reliably skips the estimate.
-                    #
-                    # This is not evading a safety check. The guard exists to
-                    # bound a request it cannot time; we already bound this one
-                    # with the same value, on the line directly below.
+                    # Pass the timeout on the request too: this avoids hidden SDK
+                    # deadlines and its max_tokens-based non-streaming estimate,
+                    # including when a client is supplied by the host.
                     raw_response = await asyncio.wait_for(
-                        self.client.messages.with_raw_response.create(
-                            **params, timeout=self.timeout
-                        ),
+                        self.client.messages.with_raw_response.create(**sdk_params),
                         timeout=self.timeout,
                     )
                     response = await raw_response.parse()
