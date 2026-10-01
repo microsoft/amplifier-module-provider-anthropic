@@ -19,6 +19,7 @@ Usage
 from __future__ import annotations
 
 import logging
+import re
 from decimal import Decimal
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _PER_M = Decimal("1_000_000")
+_SONNET_55_PRICING_MODEL_RE = re.compile(
+    r"^claude-sonnet-5-5(?:-\d{8})?$", re.IGNORECASE
+)
 
 # _RATES maps model-id → {
 #   "input_per_m":      Decimal,   # fresh input tokens, per 1M
@@ -62,18 +66,20 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("0.30"),
         "cache_write_per_m": Decimal("3.75"),
     },
-    # Claude Sonnet 5 (launched 2026-06-30; anthropic.com/news/claude-sonnet-5).
-    # Standard rates $3 / $15 (same as the Sonnet 4.x tier). NOTE: an
-    # introductory discount of $2 input / $10 output applies through
-    # 2026-08-31 only; we deliberately encode the durable STANDARD rates here
-    # (no time-windowed pricing logic anywhere in this table). The updated
-    # Sonnet 5 tokenizer maps the same text to ~1.0-1.35x more tokens, which
-    # raises effective per-request cost even at identical rates.
+    # Claude Sonnet 5 / 5.5 ($2 / $10 / $0.20 / $2.50).
+    # Source: https://platform.claude.com/docs/en/models/sonnet-5-5/migration-guide
+    # (verified 2026-09-29). One-hour cache writes are computed at $4/MTok.
     "claude-sonnet-5": {
-        "input_per_m": Decimal("3.00"),
-        "output_per_m": Decimal("15.00"),
-        "cache_read_per_m": Decimal("0.30"),
-        "cache_write_per_m": Decimal("3.75"),
+        "input_per_m": Decimal("2.00"),
+        "output_per_m": Decimal("10.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("2.50"),
+    },
+    "claude-sonnet-5-5": {
+        "input_per_m": Decimal("2.00"),
+        "output_per_m": Decimal("10.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("2.50"),
     },
     # ------------------------------------------------------------------
     # Claude Opus 4.5 / 4.6 / 4.7 family  ($5 / $25 / $0.50 / $6.25)
@@ -299,7 +305,12 @@ def compute_cost(
         The computed cost in USD, or ``None`` if *model* is not recognised.
         ``None`` is semantically distinct from ``Decimal('0')`` (a free call).
     """
-    rates = _RATES.get(model)
+    pricing_model = (
+        "claude-sonnet-5-5"
+        if _SONNET_55_PRICING_MODEL_RE.fullmatch(model)
+        else model
+    )
+    rates = _RATES.get(pricing_model)
     if rates is None:
         return None
 

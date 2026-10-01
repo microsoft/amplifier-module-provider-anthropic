@@ -36,6 +36,8 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
 
+import pytest
+
 from amplifier_core import ModuleCoordinator
 from amplifier_module_provider_anthropic import AnthropicProvider
 from amplifier_module_provider_anthropic._cost import compute_cost
@@ -435,32 +437,63 @@ def test_fable51_input_output_same_as_fable5():
 
 
 # ---------------------------------------------------------------------------
-# (r) Sonnet 5 pricing: standard rates $3 / $15 / $0.30 / $3.75 per MTok
-#     (intro discount $2/$10 through 2026-08-31 is intentionally NOT encoded;
-#     _RATES carries durable standard rates, matching the rest of the table.)
+# (r) Sonnet 5 / 5.5 pricing: $2 / $10 / $0.20 / $2.50 per MTok.
 # ---------------------------------------------------------------------------
 def test_sonnet_5_input_tokens_cost():
-    """claude-sonnet-5: 1M input -> $3.00"""
+    """claude-sonnet-5: 1M input -> $2.00"""
     result = compute_cost("claude-sonnet-5", input_tokens=1_000_000)
-    assert result == Decimal("3.00"), f"Expected Decimal('3.00'), got {result!r}"
+    assert result == Decimal("2.00"), f"Expected Decimal('2.00'), got {result!r}"
 
 
 def test_sonnet_5_output_tokens_cost():
-    """claude-sonnet-5: 1M output -> $15.00"""
+    """claude-sonnet-5: 1M output -> $10.00"""
     result = compute_cost("claude-sonnet-5", output_tokens=1_000_000)
-    assert result == Decimal("15.00"), f"Expected Decimal('15.00'), got {result!r}"
+    assert result == Decimal("10.00"), f"Expected Decimal('10.00'), got {result!r}"
 
 
 def test_sonnet_5_cache_read_cost():
-    """claude-sonnet-5: 1M cache-read -> $0.30 (10% of input)."""
+    """claude-sonnet-5: 1M cache-read -> $0.20 (10% of input)."""
     result = compute_cost("claude-sonnet-5", cache_read_input_tokens=1_000_000)
-    assert result == Decimal("0.30"), f"Expected Decimal('0.30'), got {result!r}"
+    assert result == Decimal("0.20"), f"Expected Decimal('0.20'), got {result!r}"
 
 
 def test_sonnet_5_cache_write_cost():
-    """claude-sonnet-5: 1M cache-write -> $3.75 (125% of input)."""
+    """claude-sonnet-5: 1M cache-write -> $2.50 (125% of input)."""
     result = compute_cost("claude-sonnet-5", cache_creation_input_tokens=1_000_000)
-    assert result == Decimal("3.75"), f"Expected Decimal('3.75'), got {result!r}"
+    assert result == Decimal("2.50"), f"Expected Decimal('2.50'), got {result!r}"
+
+
+def test_sonnet_55_matches_sonnet_5_pricing_including_one_hour_cache_write():
+    """Sonnet 5.5 shares Sonnet 5's rates; one-hour cache writes cost $4/MTok."""
+    assert compute_cost(
+        "claude-sonnet-5-5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        cache_read_input_tokens=1_000_000,
+        cache_creation_5m_input_tokens=1_000_000,
+        cache_creation_1h_input_tokens=1_000_000,
+    ) == Decimal("18.70")
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"input_tokens": 1_000_000},
+        {"output_tokens": 1_000_000},
+        {"cache_creation_5m_input_tokens": 1_000_000},
+        {"cache_creation_1h_input_tokens": 1_000_000},
+    ],
+)
+def test_dated_sonnet_55_matches_canonical_pricing(
+    usage: dict[str, int],
+) -> None:
+    assert compute_cost("claude-sonnet-5-5", **usage) == compute_cost(
+        "claude-sonnet-5-5-20260929", **usage
+    )
+
+
+def test_unknown_sonnet_55_suffix_has_no_guessed_pricing() -> None:
+    assert compute_cost("claude-sonnet-5-5-latest", input_tokens=1_000_000) is None
 
 
 # ---------------------------------------------------------------------------

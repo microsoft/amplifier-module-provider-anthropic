@@ -12,7 +12,9 @@ jobs:
     # A hang must fail LOUDLY and fast, not sit burning runner time until the
     # 6h default -- a job stuck at "in_progress" reads as "not done yet"
     # rather than "broken", which is how a false green gets merged.
-    timeout-minutes: 10
+    # Windows builds Core from its pinned Git source, so let the bounded
+    # dependency-install stage report its own failure before GitHub ends it.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 25 || 10 }}
     strategy:
       # A Windows failure must not cancel the POSIX legs. Those tell us whether
       # we regressed the population that works today, which is the more
@@ -30,8 +32,48 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install Rust
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
       - name: Install dependencies
+        if: runner.os != 'Windows'
         run: uv sync --all-extras --dev
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: python
+        run: |
+          import subprocess
+          import sys
+
+          process = subprocess.Popen(
+              ["uv", "sync", "--all-extras", "--dev", "--verbose"],
+          )
+          try:
+              exit_code = process.wait(timeout=1200)
+          except subprocess.TimeoutExpired:
+              print(
+                  "CI stage budget failure: Windows dependency setup exceeded "
+                  "1200 seconds; terminating the uv process tree rooted at "
+                  f"PID {process.pid}.",
+                  flush=True,
+              )
+              # /T scopes the termination to children of this uv process only.
+              subprocess.run(
+                  ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                  check=False,
+              )
+              sys.exit(1)
+
+          sys.exit(exit_code)
+
+      - name: Verify Core development source
+        run: >-
+          uv run python -c "import importlib.metadata as metadata, json; source = json.loads(metadata.distribution('amplifier-core').read_text('direct_url.json')); vcs = source.get('vcs_info', {}); assert source.get('url') == 'https://github.com/microsoft/amplifier-core' and vcs.get('vcs') == 'git' and vcs.get('requested_revision') == 'main', source; print('amplifier-core', metadata.version('amplifier-core'), 'from', vcs['vcs'], vcs['commit_id'])"
 
       - name: Run test suite
         # NOTE: `tests/test_validation.py` and `tests/test_behavioral.py`

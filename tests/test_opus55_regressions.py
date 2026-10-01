@@ -156,19 +156,25 @@ def test_opus55_adapts_legacy_native_computer_declaration() -> None:
     assert "anthropic-beta" not in params.get("extra_headers", {})
 
 
-def test_opus55_native_computer_sets_single_action_auto_without_mutating_caller() -> None:
+def test_opus55_native_computer_permits_multiple_actions_without_mutating_caller() -> None:
     caller_choice = {"type": "auto"}
     params = _assemble(
         _request(tools=[_native_computer()], tool_choice=caller_choice)
     )
     assert caller_choice == {"type": "auto"}
-    assert params["tool_choice"] == {
-        "type": "auto",
-        "disable_parallel_tool_use": True,
-    }
+    assert params["tool_choice"] == {"type": "auto"}
     assert _assemble(_request(tools=[_native_computer()], tool_choice=None))[
         "tool_choice"
-    ] == {"type": "auto", "disable_parallel_tool_use": True}
+    ] == {"type": "auto"}
+    for caller_restriction in (
+        {"type": "auto", "disable_parallel_tool_use": True},
+        {"type": "auto", "disable_parallel_tool_use": False},
+    ):
+        expected_choice = dict(caller_restriction)
+        assert _assemble(
+            _request(tools=[_native_computer()], tool_choice=caller_restriction)
+        )["tool_choice"] == expected_choice
+        assert caller_restriction == expected_choice
     assert _assemble(_request(tools=[_native_computer()], tool_choice="none"))[
         "tool_choice"
     ] == {"type": "none"}
@@ -496,7 +502,7 @@ def test_opus55_response_dispatch_and_history_are_request_scoped() -> None:
     }
 
 
-def test_opus55_rejects_multiple_or_colliding_native_actions() -> None:
+def test_opus55_preserves_multiple_native_actions_and_rejects_collisions() -> None:
     provider = _provider()
     adapter = provider._assemble_request_params(
         _request(tools=[_native_computer()]),
@@ -512,9 +518,12 @@ def test_opus55_rejects_multiple_or_colliding_native_actions() -> None:
         stop_reason="tool_use",
         model=MODEL,
     )
-    with pytest.raises(KernelInvalidRequestError, match="multiple action") as exc_info:
-        provider._convert_to_chat_response(multiple, native_computer_adapter=adapter)
-    assert exc_info.value.retryable is False
+    converted = provider._convert_to_chat_response(multiple, native_computer_adapter=adapter)
+    assert [call.id for call in converted.tool_calls] == ["one", "two"]
+    assert all(
+        getattr(call, "_amplifier_execution_mode") == "sequential"
+        for call in converted.tool_calls
+    )
 
     collision = SimpleNamespace(
         content=[
