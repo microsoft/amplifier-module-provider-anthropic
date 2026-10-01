@@ -77,6 +77,11 @@ class TestComputerUseOpus:
         assert caps.computer_use_tool_type == "computer_20251124"
         assert caps.supports_native_computer_use is True
 
+    def test_opus_55_advertises_its_native_toolset(self):
+        caps = AnthropicProvider._get_capabilities("claude-opus-5-5-20260901")
+        assert caps.supports_native_computer_use is True
+        assert caps.computer_use_tool_type == "computer_toolset_20260801"
+
     def test_opus_below_41_unsupported(self):
         """Below 4.1 is a NEGATIVE case: the only pre-4.1 opus model
         (claude-opus-4-20250514) returned HTTP 404 (retired) when probed live,
@@ -235,6 +240,14 @@ class TestComputerUseSurvivesRuntimeOverride:
         )
         assert overridden.supports_native_computer_use is True
         assert overridden.computer_use_tool_type == "computer_20251124"
+
+    def test_opus_55_native_toolset_survives_override(self):
+        base = AnthropicProvider._get_capabilities("claude-opus-5-5")
+        overridden = AnthropicProvider._apply_runtime_capability_overrides(
+            base, _RuntimeModelInfo()
+        )
+        assert overridden.supports_native_computer_use is True
+        assert overridden.computer_use_tool_type == "computer_toolset_20260801"
 
     def test_sonnet_45_computer_use_survives_override(self):
         base = AnthropicProvider._get_capabilities("claude-sonnet-4-5-20250929")
