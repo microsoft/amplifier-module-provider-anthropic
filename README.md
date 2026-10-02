@@ -4,6 +4,12 @@ Claude model integration for Amplifier via Anthropic API.
 
 ## Prerequisites
 
+Offline structural and behavioral contracts now execute without real keys.
+Scoped fixtures use a nonfunctional credential and mock only the SDK catalog
+page, preserving real mount and provider mapping checks. Run `uv run pytest -q`.
+Family discovery sorts semantic versions before snapshots, so multi-digit minor
+releases cannot be hidden from routing by lexical menu filtering.
+
 - **Python 3.11+**
 - **[UV](https://github.com/astral-sh/uv)** - Fast Python package manager
 

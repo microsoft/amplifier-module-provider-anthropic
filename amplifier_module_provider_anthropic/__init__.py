@@ -1784,8 +1784,12 @@ class AnthropicProvider:
             if not models:
                 continue
 
-            # Sort by model_id descending (IDs contain dates like claude-sonnet-4-5-20250929)
-            models.sort(key=lambda x: x[0], reverse=True)
+            # Compare semantic versions before snapshots or lexical spelling:
+            # 5.10 is newer than 5.9, and clean aliases win equal-version ties.
+            models.sort(
+                key=lambda item: (self._detect_version(item[0], family), -len(item[0]), item[0]),
+                reverse=True,
+            )
 
             # Free side-channel population of the fallback ladder's live
             # "newest model per family" cache (B-03/_resolve_fallback_model
