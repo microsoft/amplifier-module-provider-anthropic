@@ -411,7 +411,7 @@ _STATIC_BUDGET_MODEL_VERSIONS: dict[str, frozenset[tuple[int, int]]] = {
     "fable": frozenset({(5, 0), (5, 1)}),
     "mythos": frozenset({(5, 0), (5, 1)}),
     "opus": frozenset({(4, 5), (4, 6), (4, 7), (4, 8), (5, 0), (5, 5)}),
-    "sonnet": frozenset({(4, 5), (4, 6), (5, 0)}),
+    "sonnet": frozenset({(4, 5), (4, 6), (5, 0), (5, 5)}),
     "haiku": frozenset({(4, 5)}),
 }
 
@@ -1064,7 +1064,7 @@ class AnthropicProvider:
         self._client: AsyncAnthropic | None = None  # Lazy init
         self.config = config or {}
         self.coordinator = coordinator
-        self.default_model = self.config.get("default_model", "claude-sonnet-5")
+        self.default_model = self.config.get("default_model", "claude-sonnet-5-5")
         self._default_caps = self._get_capabilities(self.default_model)
 
         # Effort-family config keys. Canonical key: "reasoning_effort" (matches
@@ -1784,8 +1784,12 @@ class AnthropicProvider:
             if not models:
                 continue
 
-            # Sort by model_id descending (IDs contain dates like claude-sonnet-4-5-20250929)
-            models.sort(key=lambda x: x[0], reverse=True)
+            # Compare semantic versions before snapshots or lexical spelling:
+            # 5.10 is newer than 5.9, and clean aliases win equal-version ties.
+            models.sort(
+                key=lambda item: (self._detect_version(item[0], family), -len(item[0]), item[0]),
+                reverse=True,
+            )
 
             # Free side-channel population of the fallback ladder's live
             # "newest model per family" cache (B-03/_resolve_fallback_model

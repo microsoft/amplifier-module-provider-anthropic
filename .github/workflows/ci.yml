@@ -34,13 +34,6 @@ jobs:
         run: uv sync --all-extras --dev
 
       - name: Run test suite
-        # NOTE: `tests/test_validation.py` and `tests/test_behavioral.py`
-        # silently depend on ANTHROPIC_API_KEY being exported. Measured on
-        # Linux: key unset -> 1 failed, 6 passed, 5 errors; key set -> 12
-        # passed. On a fresh runner with no secret they fail for a reason that
-        # has nothing to do with the code under test.
-        #
-        # They should skip explicitly when the key is absent, or mock the
-        # provider. Until that is fixed, this job will be red on those six --
-        # that is the pre-existing defect becoming visible, not a new one.
+        # Inherited contracts mount with a scoped nonfunctional credential.
+        # Catalog contract tests mock only the SDK boundary; no live secrets.
         run: uv run pytest -q

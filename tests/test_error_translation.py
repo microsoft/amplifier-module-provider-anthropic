@@ -43,7 +43,7 @@ def _make_provider() -> AnthropicProvider:
     """Create a provider with streaming disabled and max_retries=0 for isolation."""
     provider = AnthropicProvider(
         api_key="test-key",
-        config={"use_streaming": False, "max_retries": 0},
+        config={"use_streaming": False, "max_retries": 0, "default_model": "claude-sonnet-5"},
     )
     provider.coordinator = cast(ModuleCoordinator, FakeCoordinator())
     return provider
