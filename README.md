@@ -29,7 +29,8 @@ Provides access to Anthropic's Claude models (Claude 4 series: Sonnet, Opus, Hai
 
 ## Supported Models
 
-- `claude-sonnet-5` - Claude Sonnet 5 (recommended, default)
+- `claude-sonnet-5-5` - Claude Sonnet 5.5 (default; explicit model pins remain unchanged)
+- `claude-sonnet-5` - Claude Sonnet 5 (previous default; still supported)
 - `claude-opus-5` - Claude Opus 5 (most capable)
 - `claude-opus-5-5` - Claude Opus 5.5 (adaptive thinking; $4/$20 input/output per MTok)
 - `claude-haiku-4-5` - Claude Haiku 4.5 (fastest, cheapest)
@@ -69,7 +70,7 @@ over this derived default. This does not change the default model.
 module = "provider-anthropic"
 name = "anthropic"
 config = {
-    default_model = "claude-sonnet-5",
+    default_model = "claude-sonnet-5-5",
     max_tokens = 8192,
     temperature = 1.0,   # Silently ignored by models without sampling support (sonnet-5, opus-4.7+)
     raw = false          # Include full request/response payloads in llm:* events
@@ -494,7 +495,7 @@ House-style key reference. ✅ = wizard-visible ConfigField, ⚙️ = settings-o
 |---|---|---|---|
 | `api_key` | *(env `ANTHROPIC_API_KEY`)* | ✅ | Anthropic API key |
 | `base_url` | `https://api.anthropic.com` | ✅ | Custom endpoint |
-| `default_model` | `claude-sonnet-5` | *(model picker)* | Model used when a request does not name one |
+| `default_model` | `claude-sonnet-5-5` | *(model picker)* | Model used when a request does not name one |
 | `reasoning_effort` | *(unset)* | ✅ | `low`\|`medium`\|`high`\|`xhigh`\|`max`. Enables extended thinking. Legacy alias: `effort` (deprecated) |
 | `extended_thinking` | *(unset)* | ⚙️ | Turn extended thinking on/off without choosing an effort. Overrides the `reasoning_effort` implication; a per-call kwarg overrides this |
 | `thinking_budget_tokens` | *(model default)* | ⚙️ | Explicit `thinking.budget_tokens`. Outranks the effort-implied budget; warns if it can't reach the wire |
@@ -534,7 +535,7 @@ export ANTHROPIC_API_KEY="your-api-key-here"
 # In amplifier configuration
 [provider]
 name = "anthropic"
-default_model = "claude-sonnet-5"
+default_model = "claude-sonnet-5-5"
 ```
 
 ## Features
