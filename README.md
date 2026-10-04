@@ -71,6 +71,22 @@ over this derived default. This does not change the default model.
 
 ## Configuration
 
+### Reasoning history from another provider
+
+When a conversation switches to Anthropic, assistant reasoning blocks with an
+absent or `null` signature are omitted from the Anthropic request. Core also uses
+these blocks for other providers' reasoning, including OpenAI's encrypted state;
+they are not replayable Anthropic thinking. The original messages and persisted
+history remain unchanged, and private reasoning is never converted into visible
+text. Text, tool calls/results, signed thinking, and redacted thinking retain their
+order. A reasoning-only assistant turn contributes no empty wire message.
+
+String signatures are preserved verbatim, including the existing empty-string
+round-trip contract. This is not signature authentication: Core does not provide
+universal provider provenance for signed reasoning, so foreign signed blocks are
+not inferred to be Anthropic-compatible. Authentication, model selection, effort,
+token bounds, and retry behavior are unchanged.
+
 ```toml
 [[providers]]
 module = "provider-anthropic"
