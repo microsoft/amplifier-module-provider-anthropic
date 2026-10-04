@@ -5080,6 +5080,19 @@ class AnthropicProvider:
             return dict(dumped) if isinstance(dumped, dict) else None
         return None
 
+    @staticmethod
+    def _unsigned_thinking(block: dict[str, Any] | None) -> bool:
+        """Unsigned Core reasoning is not replayable Anthropic thinking state.
+
+        A string signature is preserved verbatim, not authenticated here. Core
+        has no universal provider provenance for signed reasoning blocks.
+        """
+        return bool(
+            block
+            and block.get("type") == "thinking"
+            and block.get("signature") is None
+        )
+
     def _convert_messages(
         self,
         messages: list[dict[str, Any]],
@@ -5198,6 +5211,7 @@ class AnthropicProvider:
                 content_blocks: list[dict[str, Any]] = []
                 canonical_tool_ids: set[str] = set()
                 canonical_tools: dict[str, dict[str, Any]] = {}
+                omitted_unsigned_thinking = False
                 if structured_content:
                     for raw_block in content:
                         block = self._content_block_mapping(raw_block)
@@ -5207,6 +5221,13 @@ class AnthropicProvider:
                                     "Skipping malformed assistant content block of type %s",
                                     type(raw_block).__name__,
                                 )
+                            continue
+                        if self._unsigned_thinking(block):
+                            # Core also represents other providers' reasoning as
+                            # ThinkingBlock(signature=None). Anthropic cannot
+                            # replay that unsigned state. Adapt the wire copy,
+                            # never the canonical message or persisted history.
+                            omitted_unsigned_thinking = True
                             continue
                         try:
                             cleaned = native_wire_tool_use(
@@ -5235,6 +5256,9 @@ class AnthropicProvider:
                     legacy_thinking = self._content_block_mapping(
                         msg.get("thinking_block")
                     )
+                    if self._unsigned_thinking(legacy_thinking):
+                        omitted_unsigned_thinking = True
+                        legacy_thinking = None
                     if (
                         legacy_thinking
                         and not any(
@@ -5251,6 +5275,9 @@ class AnthropicProvider:
                     legacy_thinking = self._content_block_mapping(
                         msg.get("thinking_block")
                     )
+                    if self._unsigned_thinking(legacy_thinking):
+                        omitted_unsigned_thinking = True
+                        legacy_thinking = None
                     if legacy_thinking:
                         content_blocks.append(self._clean_content_block(legacy_thinking))
 
@@ -5348,6 +5375,13 @@ class AnthropicProvider:
                         legacy_thinking_count, {"type": "text", "text": content}
                     )
 
+                if omitted_unsigned_thinking and not content_blocks and (
+                    structured_content or content in (None, "")
+                ):
+                    # A reasoning-only foreign turn has no Anthropic wire
+                    # content; do not replace it with an invalid empty message.
+                    i += 1
+                    continue
                 if structured_content or content_blocks:
                     anthropic_messages.append(
                         {"role": "assistant", "content": content_blocks}

@@ -1233,7 +1233,7 @@ def test_breakpoint_never_lands_on_a_trailing_thinking_block():
             role="assistant",
             content=[
                 TextBlock(text="Looking into it."),
-                ThinkingBlock(thinking="private chain of thought"),
+                ThinkingBlock(thinking="private chain of thought", signature="signed-cache-fixture"),
             ],
         ),
         _ephemeral_tail("<system-reminder>live</system-reminder>"),
@@ -1262,7 +1262,7 @@ def test_breakpoint_never_lands_on_a_thinking_only_turn():
         Message(role="user", content="do the thing"),
         Message(
             role="assistant",
-            content=[ThinkingBlock(thinking="only the thinking survived")],
+            content=[ThinkingBlock(thinking="only the thinking survived", signature="signed-cache-fixture")],
         ),
         _ephemeral_tail("<system-reminder>live</system-reminder>"),
     ]
