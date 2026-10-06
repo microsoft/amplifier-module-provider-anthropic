@@ -3107,6 +3107,8 @@ class AnthropicProvider:
         response: ChatResponse,
         request: ChatRequest,
         effective_model: str,
+        *,
+        observation: RequestObservation,
         **complete_kwargs,
     ) -> ChatResponse:
         """If response is a refusal, retry once against the refusal-fallback model.
@@ -3133,7 +3135,9 @@ class AnthropicProvider:
         fallback_kwargs = dict(complete_kwargs)
         fallback_kwargs["model"] = fallback_model
         fallback_request = self._strip_thinking_blocks(request)
-        return await self._complete_chat_request(fallback_request, **fallback_kwargs)
+        return await self._complete_chat_request(
+            fallback_request, observation=observation, **fallback_kwargs
+        )
 
     async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """
@@ -3146,6 +3150,19 @@ class AnthropicProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
+        observation = RequestObservation(getattr(self.coordinator, "hooks", None))
+        try:
+            return await self._complete_with_fallback(request, observation, **kwargs)
+        finally:
+            # Only this boundary knows whether retries/fallbacks are finished.
+            # Await before returning/raising to the logical-call wrapper; never
+            # schedule a heartbeat or delay settlement to meet the throttle.
+            await observation.flush()
+
+    async def _complete_with_fallback(
+        self, request: ChatRequest, observation: RequestObservation, **kwargs
+    ) -> ChatResponse:
+        """Existing completion/fallback policy under one logical observer."""
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)
 
@@ -3194,11 +3211,14 @@ class AnthropicProvider:
                 )
 
         if not self._fallback_on_overload:
-            response = await self._complete_chat_request(request, **kwargs)
+            response = await self._complete_chat_request(
+                request, observation=observation, **kwargs
+            )
             return await self._apply_refusal_fallback(
                 response,
                 request,
                 str(kwargs.get("model", self.default_model)),
+                observation=observation,
                 **kwargs,
             )
 
@@ -3249,6 +3269,7 @@ class AnthropicProvider:
                 response = await self._complete_chat_request(
                     request,
                     retry_config=retry_config,
+                    observation=observation,
                     **current_kwargs,
                 )
             except KernelLLMError as e:
@@ -3277,6 +3298,7 @@ class AnthropicProvider:
                     response,
                     request,
                     effective_model,
+                    observation=observation,
                     retry_config=retry_config,
                     **current_kwargs,
                 )
@@ -4228,6 +4250,8 @@ class AnthropicProvider:
         self,
         request: ChatRequest,
         retry_config: RetryConfig | None = None,
+        *,
+        observation: RequestObservation,
         **kwargs,
     ) -> ChatResponse:
         """Handle ChatRequest format with developer message conversion.
@@ -4311,11 +4335,8 @@ class AnthropicProvider:
         # Mutable container for rate_limit_info captured inside _do_complete
         captured_rate_limit_info: dict[str, Any] = {}
         sdk_params = {"timeout": self._sdk_timeout, **params}
-        observation = RequestObservation(
-            getattr(self.coordinator, "hooks", None),
-            effective_limits(
-                self.timeout, sdk_params["timeout"], phase_override="timeout" in params
-            ),
+        limits = effective_limits(
+            self.timeout, sdk_params["timeout"], phase_override="timeout" in params
         )
 
         async def _do_complete():
@@ -4332,7 +4353,7 @@ class AnthropicProvider:
                     "Generation requires HTTP follow_redirects=False to prevent hidden POST replay.",
                     provider="anthropic", model=params["model"], retryable=False,
                 )
-            await observation.started()
+            await observation.started(limits)
             try:
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
@@ -4772,9 +4793,6 @@ class AnthropicProvider:
                 raise RequestOutcomeUnknownError(
                     model=params["model"],
                 ) from e
-            finally:
-                await observation.flush()
-
         async def _on_retry(attempt: int, delay: float, error: KernelLLMError):
             """Callback invoked before each retry sleep."""
             error_type = type(error).__name__

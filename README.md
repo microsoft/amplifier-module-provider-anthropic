@@ -661,8 +661,11 @@ The optional `llm:progress` version 1 channel reports only `attempt_started` and
 actual parsed `response_activity`, a positive local attempt number, and effective
 limits (`mode`, `elapsed_seconds`, and connect/pool/read/write seconds or null).
 It contains no text, reasoning, arguments, headers, URLs, identifiers, or keys.
-Activity is throttled to one publication per second, with a final flush of the
-latest actual observation at settlement. There are no periodic heartbeats.
+Activity is throttled to one publication per second across one logical
+`complete()` call, including retries and model fallbacks. Physical generation
+attempts increment the same local counter without resetting that throttle.
+Only logical settlement can flush the latest pending actual observation once,
+before the enclosing call wrapper's terminal event. There are no periodic heartbeats.
 SDK-hidden SSE ping/comment bytes are not reported as parsed activity.
 Silence remains pending, not evidence of a stalled model or a dead connection.
 

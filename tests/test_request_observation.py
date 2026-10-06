@@ -125,6 +125,46 @@ async def test_request_local_throttle_and_receipt_context(monkeypatch):
         assert all(set(p) == {"version", "observation", "attempt", "limits"} for p in local)
 
 
+@pytest.mark.asyncio
+async def test_attempt_admission_keeps_pacing_and_latest_actual_limits(monkeypatch):
+    events = []
+    hooks = SimpleNamespace(emit=AsyncMock(side_effect=lambda name, data: events.append(data)))
+    clock = [10.0]
+    monkeypatch.setattr(
+        "amplifier_module_provider_anthropic._request_observation.time.monotonic",
+        lambda: clock[0],
+    )
+    first = effective_limits(None, Timeout(None, connect=5, pool=5))
+    second = effective_limits(None, Timeout(7, connect=2, pool=3))
+    observation = RequestObservation(hooks)
+    await observation.started(first)
+    await observation.activity()
+    clock[0] += 0.01
+    await observation.activity()
+    await observation.started(second)
+    assert [p["observation"] for p in events] == [
+        "attempt_started", "response_activity", "attempt_started",
+    ]
+    # A new admission with no response cannot relabel the prior activity.
+    await observation.flush()
+    assert events[-1]["attempt"] == 1 and events[-1]["limits"] == first
+    await observation.activity()
+    await observation.activity()
+    assert len(events) == 4
+    await observation.flush()
+    await observation.flush()
+    assert len(events) == 5
+    assert events[-1]["attempt"] == 2 and events[-1]["limits"] == second
+
+
+@pytest.mark.asyncio
+async def test_optional_observation_hook_cancellation_propagates():
+    hooks = SimpleNamespace(emit=AsyncMock(side_effect=asyncio.CancelledError))
+    observation = RequestObservation(hooks, effective_limits(None, None))
+    with pytest.raises(asyncio.CancelledError):
+        await observation.started()
+
+
 @pytest.mark.parametrize("hooks", [None, SimpleNamespace(), SimpleNamespace(emit=AsyncMock(side_effect=ValueError("private-hook")))])
 @pytest.mark.asyncio
 async def test_optional_hook_absence_or_failure_does_not_fail_generation(hooks):

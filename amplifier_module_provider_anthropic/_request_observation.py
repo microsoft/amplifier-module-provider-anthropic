@@ -1,4 +1,4 @@
-"""Optional, request-local, payload-free observations (not a liveness timer)."""
+"""Optional, logical-call-local, payload-free observations (not a liveness timer)."""
 
 import math
 import time
@@ -46,14 +46,16 @@ def effective_limits(
 class RequestObservation:
     """No tasks, timers, raw events, identifiers, or provider payloads retained."""
 
-    def __init__(self, hooks: Any, limits: dict[str, Any]):
+    def __init__(self, hooks: Any, limits: dict[str, Any] | None = None):
         self.hooks = hooks
-        self.limits = limits
+        self.limits = limits if limits is not None else {}
         self.attempt = 0
         self.last_activity: float | None = None
-        self.pending = False
+        self.pending: tuple[int, dict[str, Any]] | None = None
 
-    async def _emit(self, observation: str) -> None:
+    async def _emit(
+        self, observation: str, attempt: int, limits: dict[str, Any]
+    ) -> None:
         emit = getattr(self.hooks, "emit", None)
         if not callable(emit):
             return
@@ -61,22 +63,24 @@ class RequestObservation:
             await emit("llm:progress", {
                 "version": 1,
                 "observation": observation,
-                "attempt": self.attempt,
-                "limits": dict(self.limits),
+                "attempt": attempt,
+                "limits": dict(limits),
             })
         except Exception:
             # Optional observation must not turn success into a failed request.
             # CancelledError is BaseException and deliberately propagates.
             pass
 
-    async def started(self) -> None:
+    async def started(self, limits: dict[str, Any] | None = None) -> None:
         self.attempt += 1
-        self.last_activity = None
-        self.pending = False
-        await self._emit("attempt_started")
+        if limits is not None:
+            self.limits = dict(limits)
+        # A physical dispatch does not reset logical-call pacing or discard
+        # the last actual activity from a previous attempt.
+        await self._emit("attempt_started", self.attempt, self.limits)
 
     async def activity(self) -> None:
-        self.pending = True
+        self.pending = (self.attempt, dict(self.limits))
         now = time.monotonic()
         if self.last_activity is None or now - self.last_activity >= 1.0:
             await self.flush()
@@ -84,7 +88,8 @@ class RequestObservation:
     async def flush(self) -> None:
         # Terminal boundary retains the latest ACTUAL observation, even within
         # the throttle window. There is no periodic/silent-wait publication.
-        if self.pending:
-            self.pending = False
+        if self.pending is not None:
+            attempt, limits = self.pending
+            self.pending = None
             self.last_activity = time.monotonic()
-            await self._emit("response_activity")
+            await self._emit("response_activity", attempt, limits)
