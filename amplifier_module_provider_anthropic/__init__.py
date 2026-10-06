@@ -74,6 +74,7 @@ from ._request_safety import (
     proved_refusal,
     unknown_timeout,
 )
+from ._request_observation import RequestObservation, effective_limits
 from ._computer_toolset import (
     COMPUTER_TOOLSET_NAME,
     PROVENANCE_MEMBER,
@@ -4309,6 +4310,13 @@ class AnthropicProvider:
 
         # Mutable container for rate_limit_info captured inside _do_complete
         captured_rate_limit_info: dict[str, Any] = {}
+        sdk_params = {"timeout": self._sdk_timeout, **params}
+        observation = RequestObservation(
+            getattr(self.coordinator, "hooks", None),
+            effective_limits(
+                self.timeout, sdk_params["timeout"], phase_override="timeout" in params
+            ),
+        )
 
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
@@ -4324,6 +4332,7 @@ class AnthropicProvider:
                     "Generation requires HTTP follow_redirects=False to prevent hidden POST replay.",
                     provider="anthropic", model=params["model"], retryable=False,
                 )
+            await observation.started()
             try:
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
@@ -4342,7 +4351,6 @@ class AnthropicProvider:
 
                 # SDK-only policy stays out of the assembled generation payload.
                 # Explicit transport overrides in extra_request_params win.
-                sdk_params = {"timeout": self._sdk_timeout, **params}
                 if _use_streaming:
                     # ----- Streaming path with per-block event emission --------
                     # We iterate the SDK's event stream rather than calling
@@ -4391,6 +4399,7 @@ class AnthropicProvider:
                             async with self.client.messages.stream(**sdk_params) as stream:
                                 async for event in stream:
                                     sdk_stream_started = True
+                                    await observation.activity()
                                     etype = type(event).__name__
                                     if getattr(event, "type", None) == "message_stop":
                                         sdk_stream_finished = True
@@ -4537,6 +4546,7 @@ class AnthropicProvider:
                         timeout=self.timeout,
                     )
                     response = await raw_response.parse()
+                    await observation.activity()
                     rate_limit_info = self._extract_rate_limit_headers(
                         raw_response.headers
                     )
@@ -4762,6 +4772,8 @@ class AnthropicProvider:
                 raise RequestOutcomeUnknownError(
                     model=params["model"],
                 ) from e
+            finally:
+                await observation.flush()
 
         async def _on_retry(attempt: int, delay: float, error: KernelLLMError):
             """Callback invoked before each retry sleep."""

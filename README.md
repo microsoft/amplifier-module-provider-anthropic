@@ -656,3 +656,18 @@ retry backoff. Expert `extra_request_params.timeout` can override SDK phase
 limits without overriding that configured elapsed bound. This provider does
 not implement `ChatRequest.timeout` parity. Cancellation propagates locally
 without replay; an accepted remote request may still complete or incur usage.
+
+The optional `llm:progress` version 1 channel reports only `attempt_started` and
+actual parsed `response_activity`, a positive local attempt number, and effective
+limits (`mode`, `elapsed_seconds`, and connect/pool/read/write seconds or null).
+It contains no text, reasoning, arguments, headers, URLs, identifiers, or keys.
+Activity is throttled to one publication per second, with a final flush of the
+latest actual observation at settlement. There are no periodic heartbeats.
+SDK-hidden SSE ping/comment bytes are not reported as parsed activity.
+Silence remains pending, not evidence of a stalled model or a dead connection.
+
+Offline wire checks live in `tests/test_transport_liveness.py`. Set
+`ANTHROPIC_WAIT_SOAK_SECONDS=2100` to run the opt-in real-time silence fixture
+for both streaming and nonstreaming outside CI. These fixtures prove receiving-
+boundary handling, not real-provider billing cancellation or OS network-switch
+behavior.
