@@ -61,6 +61,8 @@ def setup_call(streaming, config=None, failure=None):
             return DummyResponse()
 
     client = MagicMock()
+    client.max_retries = 0
+    client._client.follow_redirects = False
     provider._client = client
     if streaming:
         call = client.messages.stream = MagicMock(return_value=Stream())
@@ -224,6 +226,7 @@ async def test_actual_sdk_request_disables_hidden_read_deadline(streaming):
 
     provider._client = client_type(
         api_key="fixture",
+        max_retries=0,
         timeout=0.001,
         http_client=transport.AsyncClient(transport=transport.MockTransport(handle)),
     )

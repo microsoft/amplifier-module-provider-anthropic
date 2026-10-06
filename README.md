@@ -210,7 +210,7 @@ SDK exceptions are translated to kernel errors before the retry loop sees them. 
 | `BadRequestError` | other | `InvalidRequestError` | 400 | No |
 | `APIStatusError` | 403 | `AccessDeniedError` | 403 | No |
 | `APIStatusError` | 404 | `NotFoundError` | 404 | No |
-| `APIStatusError` | other non-5xx | `LLMError` | — | No |
+| `APIStatusError` | Other status / SSE error under HTTP 200 | `RequestOutcomeUnknownError` (Core `LLMError`) | — | No |
 | SDK connection error | Exact typed connect/pool cause, SDK retry disabled, before response activity | `ProviderUnavailableError` | — | Yes |
 | `asyncio.TimeoutError` / SDK timeout | Elapsed/read/write or unknown stage | `LLMTimeoutError` | — | No |
 | Other | Reset, missing terminal stream event, malformed result, unknown stage | `RequestOutcomeUnknownError` (Core `LLMError`) | — | No |
@@ -226,6 +226,13 @@ and a fixed public message; the underlying cause remains private.
 This deliberately turns some formerly retried transient failures (including
 bare 500s) into explicit failures to avoid duplicate accepted generations.
 It does not eliminate silent waits or establish provider-side cancellation.
+Supplied SDK clients must also have `max_retries=0`; generation fails locally
+before dispatch otherwise. Generation HTTP redirects are disabled, and supplied
+clients must have `follow_redirects=False`: a redirect can otherwise replay an
+accepted POST before a later connect failure/refusal reaches the provider.
+Configured elapsed deadlines must be finite positive
+seconds or null; zero, negative, and nonfinite values are rejected rather than
+reported as unlimited.
 
 #### Backoff Formula
 

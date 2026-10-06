@@ -44,7 +44,6 @@ from amplifier_core.llm_errors import ContentFilterError as KernelContentFilterE
 from amplifier_core.llm_errors import ContextLengthError as KernelContextLengthError
 from amplifier_core.llm_errors import InvalidRequestError as KernelInvalidRequestError
 from amplifier_core.llm_errors import LLMError as KernelLLMError
-from amplifier_core.llm_errors import LLMTimeoutError as KernelLLMTimeoutError
 from amplifier_core.llm_errors import NotFoundError as KernelNotFoundError
 from amplifier_core.llm_errors import (
     ProviderUnavailableError as KernelProviderUnavailableError,
@@ -60,6 +59,7 @@ from anthropic import APIStatusError as AnthropicAPIStatusError
 from anthropic import AsyncAnthropic
 from anthropic import AuthenticationError as AnthropicAuthenticationError
 from anthropic import BadRequestError as AnthropicBadRequestError
+from anthropic import DefaultAsyncHttpxClient
 from anthropic import RateLimitError as AnthropicRateLimitError
 from anthropic import Timeout as AnthropicTimeout
 from anthropic._exceptions import (
@@ -1126,6 +1126,10 @@ class AnthropicProvider:
         self.timeout = self._config_float(
             self.config.get("timeout"), None
         )  # Optional caller deadline; healthy model work has no default cutoff.
+        if self.timeout is not None and (
+            not math.isfinite(self.timeout) or self.timeout <= 0
+        ):
+            raise ValueError("timeout must be finite positive seconds or null")
         self._sdk_timeout = AnthropicTimeout(self.timeout, connect=5.0, pool=5.0)
         # Hard bound on teardown's httpx aclose() -- see close(). This is NOT
         # `timeout` above: that one bounds an API request, this one bounds
@@ -1511,6 +1515,11 @@ class AnthropicProvider:
                 default_headers=self._default_headers,
                 max_retries=0,
                 timeout=self._sdk_timeout,
+                # A 307/308 can replay an accepted POST inside HTTPX before the
+                # provider sees a later connect failure or refusal.
+                http_client=DefaultAsyncHttpxClient(
+                    timeout=self._sdk_timeout, follow_redirects=False
+                ),
             )
         return self._client
 
@@ -4305,6 +4314,16 @@ class AnthropicProvider:
             """Single API call attempt with SDK → kernel error translation."""
             nonlocal captured_rate_limit_info
             sdk_stream_started = False
+            if self.client.max_retries != 0:
+                raise KernelInvalidRequestError(
+                    "Generation requires SDK max_retries=0 to prevent ambiguous replay.",
+                    provider="anthropic", model=params["model"], retryable=False,
+                )
+            if self.client._client.follow_redirects is not False:
+                raise KernelInvalidRequestError(
+                    "Generation requires HTTP follow_redirects=False to prevent hidden POST replay.",
+                    provider="anthropic", model=params["model"], retryable=False,
+                )
             try:
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
@@ -4523,7 +4542,18 @@ class AnthropicProvider:
                     )
 
                 captured_rate_limit_info = rate_limit_info
-                if not isinstance(getattr(response, "stop_reason", None), str):
+                usage = getattr(response, "usage", None)
+                if (
+                    not isinstance(getattr(response, "stop_reason", None), str)
+                    or not response.stop_reason
+                    or not isinstance(getattr(response, "model", None), str)
+                    or not isinstance(getattr(response, "content", None), list)
+                    or any(
+                        type(getattr(usage, field, None)) is not int
+                        or getattr(usage, field) < 0
+                        for field in ("input_tokens", "output_tokens")
+                    )
+                ):
                     raise ValueError("Missing terminal generation result")
                 return response
 
@@ -4637,6 +4667,12 @@ class AnthropicProvider:
 
             except AnthropicAPIStatusError as e:
                 status = getattr(e, "status_code", 500)
+                # SSE error events retain the successful HTTP 200 status in
+                # current SDKs, including before their first yielded event.
+                if sdk_stream_started or status == 200:
+                    raise RequestOutcomeUnknownError(
+                        model=params["model"], status_code=status
+                    ) from e
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
                 if status == 403:
@@ -4688,19 +4724,21 @@ class AnthropicProvider:
                         model=params["model"],
                         status_code=status,
                     ) from e
-                raise KernelLLMError(
-                    error_msg,
-                    provider="anthropic",
+                raise RequestOutcomeUnknownError(
                     model=params["model"],
                     status_code=status,
-                    retryable=False,
                 ) from e
 
             except asyncio.TimeoutError as e:
                 raise unknown_timeout(params["model"]) from e
 
-            except KernelLLMError:
-                raise  # Already translated, don't double-wrap
+            except KernelLLMError as e:
+                # Unexpected retryable Core errors from a custom client/hook
+                # have no dispatch evidence. Our translations raised in except
+                # clauses do not pass through this handler.
+                if e.retryable:
+                    raise RequestOutcomeUnknownError(model=params["model"]) from e
+                raise
 
             except Exception as e:
                 # Do not expose arbitrary response/cause text or infer dispatch
@@ -4959,9 +4997,8 @@ class AnthropicProvider:
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
-            # Ensure error message is never empty
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
-            logger.error(f"[PROVIDER] Anthropic response processing error: {error_msg}")
+            error_msg = UNKNOWN_MESSAGE
+            logger.error("[PROVIDER] Anthropic response processing error: %s", error_msg)
 
             # Emit error event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -4975,7 +5012,7 @@ class AnthropicProvider:
                         "error": error_msg,
                     },
                 )
-            raise
+            raise RequestOutcomeUnknownError(model=params["model"]) from e
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         """

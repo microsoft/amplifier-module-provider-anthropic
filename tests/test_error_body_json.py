@@ -410,7 +410,7 @@ class TestAPIStatusErrorUsesBodyJson:
         assert exc_info.value.__cause__ is sdk_error
         assert provider.client.messages.with_raw_response.create.await_count == 1
 
-    def test_other_status_falls_back_to_str_when_body_none(self):
+    def test_other_status_is_unknown_when_body_none(self):
         provider = _make_provider()
         sdk_error = _make_anthropic_error_with_body(
             anthropic.APIStatusError, "I'm a teapot", status_code=418, body=None
@@ -422,9 +422,10 @@ class TestAPIStatusErrorUsesBodyJson:
         with pytest.raises(KernelLLMError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        assert "I'm a teapot" in str(exc_info.value)
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.request_outcome == "unknown"
 
-    def test_other_status_uses_json_body(self):
+    def test_other_status_does_not_publish_body(self):
         provider = _make_provider()
         body = {"type": "error", "error": {"type": "teapot", "message": "I'm a teapot"}}
         sdk_error = _make_anthropic_error_with_body(
@@ -437,7 +438,8 @@ class TestAPIStatusErrorUsesBodyJson:
         with pytest.raises(KernelLLMError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        assert json.dumps(body) == str(exc_info.value)
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.request_outcome == "unknown"
 
 
 # ---------------------------------------------------------------------------
