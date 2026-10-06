@@ -1739,16 +1739,13 @@ class AnthropicProvider:
                             "with HTML body) on list_models(). Treating as "
                             "transient -- will retry."
                         )
-                        challenge = KernelProviderUnavailableError(
+                        raise KernelProviderUnavailableError(
                             "Cloudflare bot challenge (transient 403 with HTML "
                             "body). This typically resolves on retry.",
                             provider="anthropic",
                             status_code=403,
                             retryable=True,
-                        )
-                        challenge.request_outcome = "unknown"
-                        challenge.effects = "may_have_occurred"
-                        raise challenge from e
+                        ) from e
                     raise KernelAccessDeniedError(
                         error_msg,
                         provider="anthropic",
@@ -4880,14 +4877,17 @@ class AnthropicProvider:
                                     "timestamp": time.time(),
                                 },
                             )
-                        raise KernelProviderUnavailableError(
+                        challenge = KernelProviderUnavailableError(
                             "Cloudflare bot challenge (transient 403 with HTML body). "
                             "No automatic replacement request was sent.",
                             provider="anthropic",
                             model=params["model"],
                             status_code=403,
                             retryable=False,
-                        ) from e
+                        )
+                        challenge.request_outcome = "unknown"
+                        challenge.effects = "may_have_occurred"
+                        raise challenge from e
                     raise KernelAccessDeniedError(
                         error_msg,
                         provider="anthropic",

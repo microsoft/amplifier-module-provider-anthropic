@@ -253,6 +253,8 @@ class TestCloudflare403NoGenerationRetry:
         assert exc_info.value.retryable is False
         assert exc_info.value.status_code == 403
         assert "Cloudflare" in str(exc_info.value)
+        assert exc_info.value.request_outcome == "unknown"
+        assert exc_info.value.effects == "may_have_occurred"
         assert exc_info.value.__cause__ is cf_error
         assert provider.client.messages.with_raw_response.create.await_count == 1
 
