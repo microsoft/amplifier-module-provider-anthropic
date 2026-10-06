@@ -694,8 +694,9 @@ before the enclosing call wrapper's terminal event, best-effort within a 100ms
 cooperative delivery window on success, failure, or cancellation. The provider
 drains its own delivery child; explicitly asynchronous dispatchers may finish
 their callback cleanup after provider settlement. Non-yielding or cancellation-
-suppressing hook code cannot be strictly bounded by asyncio. Internal hook
-cancellation cannot impersonate caller Stop; new caller cancellation still
+suppressing hook code cannot be strictly bounded by asyncio. Internal terminal
+cleanup hook cancellation cannot impersonate caller Stop; active-call hook
+cancellation remains propagating. New caller cancellation still
 propagates with its message and count. There are no periodic heartbeats.
 SDK-hidden SSE ping/comment bytes are not reported as parsed activity.
 Silence remains pending, not evidence of a stalled model or a dead connection.

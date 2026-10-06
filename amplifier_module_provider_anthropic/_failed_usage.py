@@ -1,5 +1,6 @@
 """Usage-only measurements from consumed SDK events, never failed content."""
 
+import asyncio
 from typing import Any
 
 from ._cost import compute_cost
@@ -30,7 +31,19 @@ class FailedUsage:
         if cost is None or self.cost_callback_state != "not_invoked":
             return
         self.cost_callback_state = "unknown"
-        callback(cost)
+        try:
+            caller = asyncio.current_task()
+        except RuntimeError:
+            caller = None
+        cancellations = caller.cancelling() if caller is not None else 0
+        try:
+            callback(cost)
+        except asyncio.CancelledError:
+            if caller is not None and caller.cancelling() > cancellations:
+                raise
+            # Optional synchronous accounting must not impersonate caller Stop.
+            # The callback may already have contributed, so never redeliver it.
+            raise RuntimeError("Cost contribution did not settle") from None
         self.cost_callback_state = "returned"
 
     def capture(self, usage: Any, *, complete: bool = False) -> None:

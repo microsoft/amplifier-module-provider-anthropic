@@ -105,7 +105,7 @@ from ._computer_toolset import (
 _WIRE_ONLY_PARAMS: tuple[str, ...] = ("temperature", "speed")
 
 
-async def _terminal_delivery(awaitable) -> None:
+async def _terminal_delivery(awaitable, *, usage=None) -> None:
     """Bound optional terminal work, draining the one child we own.
 
     Cooperative hooks only: non-yielding/cancellation-suppressing code cannot
@@ -133,6 +133,8 @@ async def _terminal_delivery(awaitable) -> None:
         except (Exception, asyncio.CancelledError):
             pass
     if cancelled is not None:
+        if usage is not None:
+            cancelled.usage = dict(usage)
         raise cancelled
 
 
@@ -1737,13 +1739,16 @@ class AnthropicProvider:
                             "with HTML body) on list_models(). Treating as "
                             "transient -- will retry."
                         )
-                        raise KernelProviderUnavailableError(
+                        challenge = KernelProviderUnavailableError(
                             "Cloudflare bot challenge (transient 403 with HTML "
                             "body). This typically resolves on retry.",
                             provider="anthropic",
                             status_code=403,
                             retryable=True,
-                        ) from e
+                        )
+                        challenge.request_outcome = "unknown"
+                        challenge.effects = "may_have_occurred"
+                        raise challenge from e
                     raise KernelAccessDeniedError(
                         error_msg,
                         provider="anthropic",
@@ -3218,7 +3223,7 @@ class AnthropicProvider:
                     "error": str(translated), "request_outcome": translated.request_outcome,
                     "effects": translated.effects,
                     **({"usage": translated.usage} if hasattr(translated, "usage") else {}),
-                }))
+                }), usage=observation.usage)
             if translated is error:
                 raise
             raise translated from error
@@ -3226,7 +3231,7 @@ class AnthropicProvider:
             # Only this boundary knows whether retries/fallbacks are finished.
             # Await before returning/raising to the logical-call wrapper; never
             # schedule a heartbeat or delay settlement to meet the throttle.
-            await _terminal_delivery(observation.flush())
+            await _terminal_delivery(observation.flush(), usage=observation.usage)
 
     async def _complete_with_fallback(
         self, request: ChatRequest, observation: RequestObservation, **kwargs
@@ -4421,14 +4426,22 @@ class AnthropicProvider:
             if observation.phase == "not_dispatched":
                 return None
             _, cost = failed_usage.settlement()
+            caller = asyncio.current_task()
+            cancellations = caller.cancelling() if caller is not None else 0
             try:
                 failed_usage.contribute(self._add_cost, cost)
-            except Exception:
+            except (Exception, asyncio.CancelledError) as secondary:
                 # A callback may commit then raise. Do not retry it or hide the
                 # primary failure behind an optional accounting extension.
-                pass
+                if (isinstance(secondary, asyncio.CancelledError)
+                        and caller is not None and caller.cancelling() > cancellations):
+                    usage, _ = failed_usage.settlement()
+                    secondary.usage = dict(usage)
+                    observation.usage = dict(usage)
+                    raise
             usage, _ = failed_usage.settlement()
             error.usage = dict(usage)
+            observation.usage = dict(usage)
             return usage
 
         def received(response):
@@ -5190,7 +5203,7 @@ class AnthropicProvider:
                         "error": "Local wait cancelled; remote effects are not rolled back.",
                         "usage": usage,
                     },
-                ))
+                ), usage=usage)
             raise
         except KernelLLMError as e:
             if observation.phase == "received" and not isinstance(e, LocalRequestError):
@@ -5221,7 +5234,7 @@ class AnthropicProvider:
                         "request_outcome": getattr(e, "request_outcome", None),
                         "effects": getattr(e, "effects", None),
                     },
-                ))
+                ), usage=usage)
             raise e
 
         except Exception as e:
@@ -5253,7 +5266,7 @@ class AnthropicProvider:
                         "request_outcome": translated.request_outcome,
                         "effects": translated.effects,
                     },
-                ))
+                ), usage=usage)
             raise translated from e
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:

@@ -36,14 +36,19 @@ def terminal(hooks):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["bad_tool", "notification", "callback", "bad_tool_callback"])
+@pytest.mark.parametrize("failure", [
+    "bad_tool", "notification", "callback", "bad_tool_callback",
+    "callback_cancel", "bad_tool_callback_cancel",
+])
 async def test_cost_ownership_at_actual_callback(monkeypatch, failure):
     monkeypatch.setattr(live, "Wire", FinalWire)
-    mode = "bad_tool" if failure == "bad_tool_callback" else failure
+    mode = "bad_tool" if failure.startswith("bad_tool") else failure
     async with live.wire_call(mode, streaming=False, default_model="claude-sonnet-5") as (wire, provider, request, hooks):
         costs = []
         def contribute(cost):
             costs.append(cost)
+            if failure.endswith("_cancel"):
+                raise asyncio.CancelledError("not-caller-stop")
             if failure in {"callback", "bad_tool_callback"}:
                 raise RuntimeError(live.PRIVATE)
         provider._add_cost = contribute
@@ -189,6 +194,9 @@ async def test_new_external_stop_has_priority_during_terminal_flush():
                 await task
             assert caught.value.args == ("caller-stop-at-settlement",)
             assert task.cancelling() == 1 and wire.posts == 1
+            assert caught.value.usage["input_tokens"] is not None
+            assert caught.value.usage["output_tokens"] is not None
+            assert caught.value.usage["cost_callback_state"] in {"returned", "not_invoked"}
         finally:
             if not task.done():
                 task.cancel()
