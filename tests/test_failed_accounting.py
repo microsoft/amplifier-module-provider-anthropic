@@ -347,12 +347,27 @@ async def test_final_usage_cancel_retains_one_cost_callback(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_failure_without_hooks_still_attaches_measured_usage(monkeypatch):
+    from amplifier_module_provider_anthropic._failed_usage import FailedUsage
+    consumed = asyncio.Event()
+    original_capture = FailedUsage.capture
+    def capture(self, usage, **kwargs):
+        original_capture(self, usage, **kwargs)
+        if self.values.get("input_tokens") == 125:
+            consumed.set()
+    monkeypatch.setattr(FailedUsage, "capture", capture)
     fixture_wire(monkeypatch, {"input_tokens": 125}, partial=False)
     async with live.wire_call() as (wire, provider, request, hooks):
         provider.coordinator = None
-        wire.release.set()
-        with pytest.raises(RequestOutcomeUnknownError) as caught:
-            await provider.complete(request)
+        task = asyncio.create_task(provider.complete(request))
+        try:
+            await asyncio.wait_for(consumed.wait(), 2)
+            wire.release.set()
+            with pytest.raises(RequestOutcomeUnknownError) as caught:
+                await task
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         assert caught.value.usage["input_tokens"] == 125
         assert caught.value.usage["output_tokens"] is None
         assert caught.value.usage["cost_usd"] is None

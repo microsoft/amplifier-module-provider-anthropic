@@ -118,10 +118,14 @@ async def test_terminal_pending_activity_preserves_outcome(mode, failure, native
         receipts = []
         entered = asyncio.Event()
         finished = asyncio.Event()
+        callback_release = asyncio.Event()
+        consumed = asyncio.Event()
         activities = 0
         async def record(name, data):
             nonlocal activities
             receipts.append((name, data))
+            if name == "llm:stream_block_delta":
+                consumed.set()
             if name == "llm:progress" and data["observation"] == "response_activity":
                 activities += 1
                 if activities == 2:
@@ -131,13 +135,13 @@ async def test_terminal_pending_activity_preserves_outcome(mode, failure, native
                             raise RuntimeError(live.PRIVATE)
                         if failure == "cancel":
                             raise asyncio.CancelledError("not-a-caller-stop")
-                        await asyncio.Event().wait()
+                        await callback_release.wait()
                     finally:
                         finished.set()
             return HookResult()
         if native_core:
             coordinator = ModuleCoordinator()
-            for name in ("llm:progress", "llm:response", "llm:stream_aborted"):
+            for name in ("llm:progress", "llm:response", "llm:stream_aborted", "llm:stream_block_delta"):
                 coordinator.hooks.register(name, record)
             provider.coordinator = coordinator
         else:
@@ -148,6 +152,8 @@ async def test_terminal_pending_activity_preserves_outcome(mode, failure, native
             fake.emit = emit
         task = asyncio.create_task(provider.complete(request))
         try:
+            if mode == "partial_reset":
+                await asyncio.wait_for(consumed.wait(), 2)
             wire.release.set()
             started = time.monotonic()
             if mode == "partial_reset":
@@ -161,11 +167,13 @@ async def test_terminal_pending_activity_preserves_outcome(mode, failure, native
             assert task.cancelling() == 0
             # These are this fixture's registered callbacks, not foreign tasks.
             # Native Core can complete callback cleanup after provider settlement.
+            callback_release.set()
             await asyncio.wait_for(finished.wait(), 2)
             assert wire.posts == wire.accepted == 1
             assert not any(n == "provider:retry" for n, _ in receipts)
             assert live.PRIVATE not in json.dumps([d for n, d in receipts if n == "llm:progress"])
         finally:
+            callback_release.set()
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -234,13 +242,14 @@ async def test_second_stop_at_real_cancel_cleanup(native_core):
         displayed = asyncio.Event()
         cleanup = asyncio.Event()
         finished = asyncio.Event()
+        callback_release = asyncio.Event()
         async def record(name, data):
             if name == "llm:stream_block_delta":
                 displayed.set()
             if name == "llm:stream_aborted":
                 cleanup.set()
                 try:
-                    await asyncio.Event().wait()
+                    await callback_release.wait()
                 finally:
                     finished.set()
             return HookResult()
@@ -265,8 +274,10 @@ async def test_second_stop_at_real_cancel_cleanup(native_core):
                 await asyncio.wait_for(task, 2)
             assert caught.value.args == ("second-wire-stop",)
             assert task.cancelling() == 2 and wire.posts == 1
+            callback_release.set()
             await asyncio.wait_for(finished.wait(), 2)
         finally:
+            callback_release.set()
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
