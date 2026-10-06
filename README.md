@@ -657,6 +657,18 @@ limits without overriding that configured elapsed bound. This provider does
 not implement `ChatRequest.timeout` parity. Cancellation propagates locally
 without replay; an accepted remote request may still complete or incur usage.
 
+On failure or local cancellation, `error.usage` and `llm:response.usage` retain
+only validated raw counters from consumed SDK events (uncached `input_tokens`,
+not the successful response's cache-inclusive total). Absent counters are
+unknown, not zero; partial snapshots and incomplete pricing inputs leave
+`cost_usd` null. Complete measured usage is priced only when the existing
+calculator can price every measured bucket and tier, once per attempt. Failed
+text, reasoning, and tool arguments never become a completed response. Local
+cancellation publishes status `cancelled` and one sanitized `llm:stream_aborted`
+after displayed partial output; cleanup hooks are best-effort and bounded, and
+the original `CancelledError` still propagates. This is not remote rollback or
+billing cancellation.
+
 The optional `llm:progress` version 1 channel reports only `attempt_started` and
 actual parsed `response_activity`, a positive local attempt number, and effective
 limits (`mode`, `elapsed_seconds`, and connect/pool/read/write seconds or null).
