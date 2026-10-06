@@ -32,24 +32,10 @@ class MockStreamManager:
         return False
 
     def __aiter__(self):
-        """Yield no events, matching a stream whose content is already final.
-
-        The real SDK stream manager is an async iterator: the provider does
-        `async for event in stream` to observe deltas and emit hooks, then
-        calls `get_final_message()` for the assembled result. This mock
-        previously implemented only the context-manager half, so the
-        `async for` raised TypeError -- surfacing as an LLMError that the
-        provider then retried 5 times, which reads as a provider bug rather
-        than an incomplete mock.
-
-        These tests exercise tool-call repair on the *final* message, not
-        incremental delta handling, so an empty event stream is the accurate
-        shape: nothing streamed, `get_final_message()` supplies the response.
-        """
+        """Confirm stream completion without exercising incremental deltas."""
 
         async def _events():
-            return
-            yield  # pragma: no cover - makes this an async generator
+            yield SimpleNamespace(type="message_stop")
 
         return _events()
 

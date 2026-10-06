@@ -44,7 +44,6 @@ from amplifier_core.llm_errors import ContentFilterError as KernelContentFilterE
 from amplifier_core.llm_errors import ContextLengthError as KernelContextLengthError
 from amplifier_core.llm_errors import InvalidRequestError as KernelInvalidRequestError
 from amplifier_core.llm_errors import LLMError as KernelLLMError
-from amplifier_core.llm_errors import LLMTimeoutError as KernelLLMTimeoutError
 from amplifier_core.llm_errors import NotFoundError as KernelNotFoundError
 from amplifier_core.llm_errors import (
     ProviderUnavailableError as KernelProviderUnavailableError,
@@ -60,6 +59,7 @@ from anthropic import APIStatusError as AnthropicAPIStatusError
 from anthropic import AsyncAnthropic
 from anthropic import AuthenticationError as AnthropicAuthenticationError
 from anthropic import BadRequestError as AnthropicBadRequestError
+from anthropic import DefaultAsyncHttpxClient
 from anthropic import RateLimitError as AnthropicRateLimitError
 from anthropic import Timeout as AnthropicTimeout
 from anthropic._exceptions import (
@@ -67,6 +67,17 @@ from anthropic._exceptions import (
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 from ._cost import compute_cost
+from ._failed_usage import FailedUsage
+from ._request_safety import (
+    UNKNOWN_MESSAGE,
+    RequestOutcomeUnknownError,
+    LocalRequestError,
+    proved_local_url,
+    proved_pre_send,
+    proved_refusal,
+    unknown_timeout,
+)
+from ._request_observation import RequestObservation, effective_limits
 from ._computer_toolset import (
     COMPUTER_TOOLSET_NAME,
     PROVENANCE_MEMBER,
@@ -92,6 +103,39 @@ from ._computer_toolset import (
 # "got an unexpected keyword argument", which the retry loop then treats as a
 # transient failure and retries five times before surfacing.
 _WIRE_ONLY_PARAMS: tuple[str, ...] = ("temperature", "speed")
+
+
+async def _terminal_delivery(awaitable, *, usage=None) -> None:
+    """Bound optional terminal work, draining the one child we own.
+
+    Cooperative hooks only: non-yielding/cancellation-suppressing code cannot
+    be strictly bounded by asyncio. External cancellation retains its message
+    and count; an internally cancelled child is not a caller Stop.
+    """
+    child = asyncio.create_task(awaitable)
+    cancelled = None
+    try:
+        await asyncio.wait({child}, timeout=0.1)
+    except asyncio.CancelledError as error:
+        cancelled = error
+    finally:
+        if not child.done():
+            child.cancel()
+        # Waiting does not forward a new caller Stop into child cleanup.
+        # Retrieve the child's own failure separately, only once it is done.
+        while not child.done():
+            try:
+                await asyncio.wait({child})
+            except asyncio.CancelledError as error:
+                cancelled = error
+        try:
+            child.result()
+        except (Exception, asyncio.CancelledError):
+            pass
+    if cancelled is not None:
+        if usage is not None:
+            cancelled.usage = dict(usage)
+        raise cancelled
 
 
 def _route_wire_only_params(params: dict[str, Any]) -> dict[str, Any]:
@@ -1119,6 +1163,10 @@ class AnthropicProvider:
         self.timeout = self._config_float(
             self.config.get("timeout"), None
         )  # Optional caller deadline; healthy model work has no default cutoff.
+        if self.timeout is not None and (
+            not math.isfinite(self.timeout) or self.timeout <= 0
+        ):
+            raise ValueError("timeout must be finite positive seconds or null")
         self._sdk_timeout = AnthropicTimeout(self.timeout, connect=5.0, pool=5.0)
         # Hard bound on teardown's httpx aclose() -- see close(). This is NOT
         # `timeout` above: that one bounds an API request, this one bounds
@@ -1504,6 +1552,11 @@ class AnthropicProvider:
                 default_headers=self._default_headers,
                 max_retries=0,
                 timeout=self._sdk_timeout,
+                # A 307/308 can replay an accepted POST inside HTTPX before the
+                # provider sees a later connect failure or refusal.
+                http_client=DefaultAsyncHttpxClient(
+                    timeout=self._sdk_timeout, follow_redirects=False
+                ),
             )
         return self._client
 
@@ -2667,7 +2720,11 @@ class AnthropicProvider:
         detecting it specifically is out of scope.
         """
         status_code = getattr(error, "status_code", None)
-        return isinstance(error, KernelProviderUnavailableError) and status_code == 529
+        return (
+            error.retryable
+            and isinstance(error, KernelProviderUnavailableError)
+            and status_code == 529
+        )
 
     def _resolve_effective_model(
         self, requested_model: str
@@ -3086,6 +3143,8 @@ class AnthropicProvider:
         response: ChatResponse,
         request: ChatRequest,
         effective_model: str,
+        *,
+        observation: RequestObservation,
         **complete_kwargs,
     ) -> ChatResponse:
         """If response is a refusal, retry once against the refusal-fallback model.
@@ -3112,7 +3171,9 @@ class AnthropicProvider:
         fallback_kwargs = dict(complete_kwargs)
         fallback_kwargs["model"] = fallback_model
         fallback_request = self._strip_thinking_blocks(request)
-        return await self._complete_chat_request(fallback_request, **fallback_kwargs)
+        return await self._complete_chat_request(
+            fallback_request, observation=observation, **fallback_kwargs
+        )
 
     async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """
@@ -3125,6 +3186,54 @@ class AnthropicProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
+        observation = RequestObservation(getattr(self.coordinator, "hooks", None))
+        try:
+            return await self._complete_with_fallback(request, observation, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if isinstance(error, KernelLLMError) and getattr(error, "_anthropic_settled", False):
+                raise
+            model = str(kwargs.get("model", self.default_model))
+            translated = error if (
+                isinstance(error, KernelLLMError)
+                and getattr(error, "request_outcome", None) == "not_dispatched"
+            ) else (
+                RequestOutcomeUnknownError(model=model)
+                if observation.phase == "dispatched" else
+                LocalRequestError(model=model, received=observation.phase == "received")
+            )
+            if observation.phase == "not_dispatched":
+                translated.request_outcome = "not_dispatched"
+                translated.effects = "none"
+                translated.retryable = False
+            if observation.phase == "received" and observation.usage is not None:
+                translated.usage = dict(observation.usage)
+            logger.error(
+                "[PROVIDER] Anthropic local failure (%s): %s",
+                type(error).__name__[:80], str(translated),
+            )
+            hooks = getattr(self.coordinator, "hooks", None)
+            if hooks is not None:
+                await _terminal_delivery(hooks.emit("llm:response", {
+                    "provider": "anthropic", "model": model, "status": "error",
+                    "error": str(translated), "request_outcome": translated.request_outcome,
+                    "effects": translated.effects,
+                    **({"usage": translated.usage} if hasattr(translated, "usage") else {}),
+                }), usage=observation.usage)
+            if translated is error:
+                raise
+            raise translated from error
+        finally:
+            # Only this boundary knows whether retries/fallbacks are finished.
+            # Await before returning/raising to the logical-call wrapper; never
+            # schedule a heartbeat or delay settlement to meet the throttle.
+            await _terminal_delivery(observation.flush(), usage=observation.usage)
+
+    async def _complete_with_fallback(
+        self, request: ChatRequest, observation: RequestObservation, **kwargs
+    ) -> ChatResponse:
+        """Existing completion/fallback policy under one logical observer."""
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)
 
@@ -3173,11 +3282,14 @@ class AnthropicProvider:
                 )
 
         if not self._fallback_on_overload:
-            response = await self._complete_chat_request(request, **kwargs)
+            response = await self._complete_chat_request(
+                request, observation=observation, **kwargs
+            )
             return await self._apply_refusal_fallback(
                 response,
                 request,
                 str(kwargs.get("model", self.default_model)),
+                observation=observation,
                 **kwargs,
             )
 
@@ -3228,10 +3340,15 @@ class AnthropicProvider:
                 response = await self._complete_chat_request(
                     request,
                     retry_config=retry_config,
+                    observation=observation,
                     **current_kwargs,
                 )
             except KernelLLMError as e:
-                if use_short_retry_budget and not self._is_overload_fallback_error(e):
+                if (
+                    e.retryable
+                    and use_short_retry_budget
+                    and not self._is_overload_fallback_error(e)
+                ):
                     # Preserve the old retry behavior for non-overload failures:
                     # after the short downgrade budget is exhausted, retry the same
                     # model once more with the full configured retry policy.
@@ -3252,6 +3369,7 @@ class AnthropicProvider:
                     response,
                     request,
                     effective_model,
+                    observation=observation,
                     retry_config=retry_config,
                     **current_kwargs,
                 )
@@ -3665,7 +3783,7 @@ class AnthropicProvider:
                 }
                 if choice not in normalized_choices:
                     raise KernelInvalidRequestError(
-                        f"Unsupported tool_choice {choice!r}; use 'none', 'auto', "
+                        "Unsupported tool_choice; use 'none', 'auto', "
                         "'required', or an Anthropic wire dictionary.",
                         provider="anthropic",
                         model=effective_model,
@@ -4203,6 +4321,8 @@ class AnthropicProvider:
         self,
         request: ChatRequest,
         retry_config: RetryConfig | None = None,
+        *,
+        observation: RequestObservation,
         **kwargs,
     ) -> ChatResponse:
         """Handle ChatRequest format with developer message conversion.
@@ -4234,13 +4354,21 @@ class AnthropicProvider:
                 _DEPRECATED_MODELS[effective_model],
             )
         prefix_state_before_assembly = OrderedDict(self._prefix_fingerprints)
-        assembly = self._assemble_request_params(
-            request,
-            request_options=kwargs,
-            request_caps=request_caps,
-            prefix_state=OrderedDict(prefix_state_before_assembly),
-            emit_diagnostics=True,
-        )
+        try:
+            assembly = self._assemble_request_params(
+                request,
+                request_options=kwargs,
+                request_caps=request_caps,
+                prefix_state=OrderedDict(prefix_state_before_assembly),
+                emit_diagnostics=True,
+            )
+        except KernelInvalidRequestError as error:
+            # Provider-owned local validation keeps its existing specific
+            # diagnostic/type; arbitrary hook/SDK exceptions are sanitized.
+            error.request_outcome = "not_dispatched"
+            error.effects = "none"
+            error.retryable = False
+            raise
         if assembly is None:
             raise ValueError("Anthropic request assembly requires a string model")
         self._prefix_fingerprints = assembly.prefix_state
@@ -4285,10 +4413,76 @@ class AnthropicProvider:
 
         # Mutable container for rate_limit_info captured inside _do_complete
         captured_rate_limit_info: dict[str, Any] = {}
+        sdk_params = {"timeout": self._sdk_timeout, **params}
+        limits = effective_limits(
+            self.timeout, sdk_params["timeout"], phase_override="timeout" in params
+        )
+        failed_usage = FailedUsage(params["model"])
+
+        def settle_usage(error):
+            if observation.phase == "not_dispatched":
+                return None
+            _, cost = failed_usage.settlement()
+            caller = asyncio.current_task()
+            cancellations = caller.cancelling() if caller is not None else 0
+            try:
+                failed_usage.contribute(self._add_cost, cost)
+            except (Exception, asyncio.CancelledError) as secondary:
+                # A callback may commit then raise. Do not retry it or hide the
+                # primary failure behind an optional accounting extension.
+                if (isinstance(secondary, asyncio.CancelledError)
+                        and caller is not None and caller.cancelling() > cancellations):
+                    usage, _ = failed_usage.settlement()
+                    secondary.usage = dict(usage)
+                    observation.usage = dict(usage)
+                    raise
+            usage, _ = failed_usage.settlement()
+            error.usage = dict(usage)
+            observation.usage = dict(usage)
+            return usage
+
+        def received(response):
+            usage = getattr(response, "usage", None)
+            if (
+                not isinstance(getattr(response, "stop_reason", None), str)
+                or not response.stop_reason
+                or not isinstance(getattr(response, "model", None), str)
+                or not isinstance(getattr(response, "content", None), list)
+                or any(
+                    type(getattr(usage, field, None)) is not int
+                    or getattr(usage, field) < 0
+                    for field in ("input_tokens", "output_tokens")
+                )
+            ):
+                raise ValueError("Missing terminal generation result")
+            observation.phase = "received"
+            failed_usage.model = response.model
 
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
-            nonlocal captured_rate_limit_info
+            nonlocal captured_rate_limit_info, failed_usage
+            failed_usage = FailedUsage(params["model"])
+            sdk_stream_started = False
+            if self.client.max_retries != 0:
+                raise KernelInvalidRequestError(
+                    "Generation requires SDK max_retries=0 to prevent ambiguous replay.",
+                    provider="anthropic", model=params["model"], retryable=False,
+                )
+            if self.client._client.follow_redirects is not False:
+                raise KernelInvalidRequestError(
+                    "Generation requires HTTP follow_redirects=False to prevent hidden POST replay.",
+                    provider="anthropic", model=params["model"], retryable=False,
+                )
+            if isinstance(self.client, AsyncAnthropic):
+                # Resolve/validate the SDK's own authentication/header config
+                # before entering its send path. This is known local evidence,
+                # unlike interpreting a later generic SDK TypeError.
+                from anthropic._models import FinalRequestOptions
+                self.client._build_headers(FinalRequestOptions.construct(
+                    method="post", url="/v1/messages",
+                    headers=sdk_params.get("extra_headers"),
+                ))
+            await observation.started(limits)
             try:
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
@@ -4307,7 +4501,6 @@ class AnthropicProvider:
 
                 # SDK-only policy stays out of the assembled generation payload.
                 # Explicit transport overrides in extra_request_params win.
-                sdk_params = {"timeout": self._sdk_timeout, **params}
                 if _use_streaming:
                     # ----- Streaming path with per-block event emission --------
                     # We iterate the SDK's event stream rather than calling
@@ -4347,15 +4540,29 @@ class AnthropicProvider:
                     # The very first SDK event makes an overflow nonrecoverable,
                     # even if it carries no displayable text or hook payload.
                     sdk_stream_started = False
+                    sdk_stream_finished = False
                     hooks_available = self.coordinator and hasattr(
                         self.coordinator, "hooks"
                     )
                     try:
                         async with asyncio.timeout(self.timeout):
-                            async with self.client.messages.stream(**sdk_params) as stream:
+                            manager = self.client.messages.stream(**sdk_params)
+                            observation.phase = "dispatched"
+                            async with manager as stream:
                                 async for event in stream:
                                     sdk_stream_started = True
+                                    if getattr(event, "type", None) == "message_start":
+                                        failed_usage.capture(getattr(getattr(event, "message", None), "usage", None))
+                                    elif getattr(event, "type", None) == "message_delta":
+                                        reason = getattr(getattr(event, "delta", None), "stop_reason", None)
+                                        failed_usage.capture(
+                                            getattr(event, "usage", None),
+                                            complete=isinstance(reason, str) and bool(reason),
+                                        )
+                                    await observation.activity()
                                     etype = type(event).__name__
+                                    if getattr(event, "type", None) == "message_stop":
+                                        sdk_stream_finished = True
                                     idx = getattr(event, "index", None)
                                     if etype == "RawContentBlockStartEvent":
                                         if idx is None:
@@ -4406,6 +4613,7 @@ class AnthropicProvider:
                                         if dtype == "text_delta":
                                             text = getattr(delta, "text", "") or ""
                                             if text and hooks_available:
+                                                partial_emitted = True
                                                 await self.coordinator.hooks.emit(
                                                     "llm:stream_block_delta",
                                                     {
@@ -4418,10 +4626,10 @@ class AnthropicProvider:
                                                         "text": text,
                                                     },
                                                 )
-                                                partial_emitted = True
                                         elif dtype == "thinking_delta":
                                             text = getattr(delta, "thinking", "") or ""
                                             if text and hooks_available:
+                                                partial_emitted = True
                                                 await self.coordinator.hooks.emit(
                                                     "llm:stream_block_delta",
                                                     {
@@ -4434,7 +4642,6 @@ class AnthropicProvider:
                                                         "text": text,
                                                     },
                                                 )
-                                                partial_emitted = True
                                         # signature_delta and any future delta
                                         # types are observed silently — the
                                         # SDK still accumulates them into the
@@ -4461,13 +4668,31 @@ class AnthropicProvider:
                                     # accumulator and are not surfaced.
 
                                 # Stream drained. Final message is now ready.
+                                # SDK get_final_message can return its partial
+                                # snapshot after EOF without a message_stop.
+                                if not sdk_stream_finished:
+                                    raise ValueError("Incomplete generation stream")
                                 response = await stream.get_final_message()
+                                received(response)
 
                                 # Capture rate limit headers from stream response
                                 if hasattr(stream, "response") and stream.response:
                                     rate_limit_info = self._extract_rate_limit_headers(
                                         stream.response.headers
                                     )
+                    except asyncio.CancelledError:
+                        if partial_emitted and hooks_available:
+                            await _terminal_delivery(self.coordinator.hooks.emit(
+                                "llm:stream_aborted",
+                                {
+                                    "request_id": request_id,
+                                    "error": {
+                                        "type": "Cancelled",
+                                        "msg": "Local wait cancelled; remote effects are not rolled back.",
+                                    },
+                                },
+                            ))
+                        raise
                     except Exception as e:
                         # Mid-stream failure. If we emitted any partial output,
                         # tell the renderer so it can close any open Live
@@ -4475,26 +4700,35 @@ class AnthropicProvider:
                         # clauses below translate the SDK error to a kernel
                         # error type.
                         if partial_emitted and hooks_available:
-                            await self.coordinator.hooks.emit(
-                                "llm:stream_aborted",
-                                {
-                                    "request_id": request_id,
-                                    "error": {
-                                        "type": type(e).__name__,
-                                        "msg": str(e),
+                            await _terminal_delivery(self.coordinator.hooks.emit(
+                                    "llm:stream_aborted",
+                                    {
+                                        "request_id": request_id,
+                                        "error": {
+                                            "type": "Unknown",
+                                            "msg": UNKNOWN_MESSAGE,
+                                        },
                                     },
-                                },
-                            )
+                            ))
                         raise
                 else:
                     # Pass the timeout on the request too: this avoids hidden SDK
                     # deadlines and its max_tokens-based non-streaming estimate,
                     # including when a client is supplied by the host.
+                    pending_response = self.client.messages.with_raw_response.create(**sdk_params)
+                    observation.phase = "dispatched"
                     raw_response = await asyncio.wait_for(
-                        self.client.messages.with_raw_response.create(**sdk_params),
+                        pending_response,
                         timeout=self.timeout,
                     )
                     response = await raw_response.parse()
+                    reason = getattr(response, "stop_reason", None)
+                    failed_usage.capture(
+                        getattr(response, "usage", None),
+                        complete=isinstance(reason, str) and bool(reason),
+                    )
+                    received(response)
+                    await observation.activity()
                     rate_limit_info = self._extract_rate_limit_headers(
                         raw_response.headers
                     )
@@ -4503,12 +4737,16 @@ class AnthropicProvider:
                 return response
 
             except AnthropicRateLimitError as e:
+                if sdk_stream_started or not proved_refusal(
+                    e, status=429, kind="rate_limit_error"
+                ):
+                    raise RequestOutcomeUnknownError(
+                        model=params["model"], status_code=getattr(e, "status_code", None)
+                    ) from e
                 rate_info = self._parse_rate_limit_info(e)
                 retry_after = rate_info.get("retry_after_seconds")
-                body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
                 raise KernelRateLimitError(
-                    msg,
+                    "Anthropic refused the request due to a rate limit.",
                     provider="anthropic",
                     model=params["model"],
                     status_code=429,
@@ -4582,8 +4820,12 @@ class AnthropicProvider:
                     ) from e
 
             except AnthropicOverloadedError as e:
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
+                if sdk_stream_started or not proved_refusal(
+                    e, status=529, kind="overloaded_error"
+                ):
+                    raise RequestOutcomeUnknownError(
+                        model=params["model"], status_code=getattr(e, "status_code", None)
+                    ) from e
                 retry_after: float | None = None
                 if hasattr(e, "response") and e.response:
                     raw = e.response.headers.get("retry-after")
@@ -4593,7 +4835,7 @@ class AnthropicProvider:
                         except (ValueError, TypeError):
                             pass
                 raise KernelProviderUnavailableError(
-                    error_msg,
+                    "Anthropic refused the request due to overload.",
                     provider="anthropic",
                     model=params["model"],
                     status_code=529,
@@ -4604,6 +4846,12 @@ class AnthropicProvider:
 
             except AnthropicAPIStatusError as e:
                 status = getattr(e, "status_code", 500)
+                # SSE error events retain the successful HTTP 200 status in
+                # current SDKs, including before their first yielded event.
+                if sdk_stream_started or status == 200:
+                    raise RequestOutcomeUnknownError(
+                        model=params["model"], status_code=status
+                    ) from e
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
                 if status == 403:
@@ -4614,7 +4862,7 @@ class AnthropicProvider:
                     if self._is_cloudflare_challenge(e):
                         logger.warning(
                             "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
-                            "with HTML body). Treating as transient — will retry."
+                            "with HTML body). Generation will not be replayed."
                         )
                         if self.coordinator and hasattr(self.coordinator, "hooks"):
                             await self.coordinator.hooks.emit(
@@ -4629,14 +4877,17 @@ class AnthropicProvider:
                                     "timestamp": time.time(),
                                 },
                             )
-                        raise KernelProviderUnavailableError(
+                        challenge = KernelProviderUnavailableError(
                             "Cloudflare bot challenge (transient 403 with HTML body). "
-                            "This typically resolves on retry.",
+                            "No automatic replacement request was sent.",
                             provider="anthropic",
                             model=params["model"],
                             status_code=403,
-                            retryable=True,
-                        ) from e
+                            retryable=False,
+                        )
+                        challenge.request_outcome = "unknown"
+                        challenge.effects = "may_have_occurred"
+                        raise challenge from e
                     raise KernelAccessDeniedError(
                         error_msg,
                         provider="anthropic",
@@ -4651,87 +4902,63 @@ class AnthropicProvider:
                         status_code=404,
                     ) from e
                 if status >= 500:
-                    raise KernelProviderUnavailableError(
-                        error_msg,
-                        provider="anthropic",
+                    raise RequestOutcomeUnknownError(
                         model=params["model"],
                         status_code=status,
-                        retryable=True,
                     ) from e
-                raise KernelLLMError(
-                    error_msg,
-                    provider="anthropic",
+                raise RequestOutcomeUnknownError(
                     model=params["model"],
                     status_code=status,
-                    retryable=False,
                 ) from e
 
             except asyncio.TimeoutError as e:
-                raise KernelLLMTimeoutError(
-                    f"Request timed out after {self.timeout}s",
-                    provider="anthropic",
-                    model=params["model"],
-                    retryable=True,
-                ) from e
+                if observation.phase != "dispatched":
+                    raise LocalRequestError(
+                        model=params["model"], received=observation.phase == "received"
+                    ) from e
+                raise unknown_timeout(params["model"]) from e
 
-            except KernelLLMError:
-                raise  # Already translated, don't double-wrap
+            except KernelLLMError as e:
+                # Unexpected retryable Core errors from a custom client/hook
+                # have no dispatch evidence. Our translations raised in except
+                # clauses do not pass through this handler.
+                if observation.phase == "not_dispatched":
+                    raise LocalRequestError(model=params["model"]) from e
+                if observation.phase == "received":
+                    raise LocalRequestError(model=params["model"], received=True) from e
+                if e.retryable:
+                    raise RequestOutcomeUnknownError(model=params["model"]) from e
+                raise
 
             except Exception as e:
-                body = getattr(e, "body", None)
-                error_msg = (
-                    json.dumps(body)
-                    if body is not None
-                    else (str(e) or f"{type(e).__name__}: (no message)")
-                )
-                # GAP-016: the Anthropic SDK's own APIConnectionError carries a
-                # fixed, generic message ("Connection error.") regardless of
-                # *why* the underlying httpx/httpcore call failed -- DNS
-                # failure, TLS failure, a malformed base_url producing
-                # `UnsupportedProtocol`, etc. all look identical to a user or
-                # to logs, and are indistinguishable from real transient
-                # network flakiness. The SDK chains the real exception via
-                # `raise APIConnectionError(...) from err`, so it's available
-                # on `__cause__` -- surface it instead of silently dropping it,
-                # so "Connection error." becomes something a user can actually
-                # act on (e.g. "caused by UnsupportedProtocol: Request URL is
-                # missing an 'http://' or 'https://' protocol" directly names
-                # a misconfigured base_url instead of looking like the network
-                # is down).
-                cause = e.__cause__
-                if cause is not None:
-                    # Redact before interpolating: this path is generic, so ANY
-                    # exception with a __cause__ gets its str() spliced into a
-                    # message that reaches logs and user-facing output. A
-                    # base_url carrying embedded basic-auth
-                    # (https://user:pass@proxy.internal/) shows up verbatim in
-                    # httpx/httpcore's own exception text (e.g. the URL is
-                    # quoted back in "Request URL is missing/invalid ..."), so
-                    # redact_secrets() alone isn't enough -- it only redacts
-                    # dict values under a sensitive key, not credentials
-                    # embedded inside a plain string. Strip URL userinfo first,
-                    # then apply the same redact_secrets() treatment the raw
-                    # request/response payloads already get elsewhere in this
-                    # file.
-                    cause_text = redact_secrets(_redact_url_credentials(str(cause)))
-                    # Compare on the redacted text -- comparing on the raw text
-                    # would suppress the suffix whenever the unredacted string
-                    # happened to appear, which is not the question being asked.
-                    #
-                    # `cause_text` is checked for truthiness explicitly: an
-                    # exception with an empty str() ("" in anything is True)
-                    # would otherwise silently drop the whole suffix, taking the
-                    # useful *type name* with it -- the one piece of diagnostic
-                    # value such a cause still has.
-                    if not cause_text or cause_text not in error_msg:
-                        error_msg = f"{error_msg} (caused by {type(cause).__name__}: {cause_text})"
-                raise KernelLLMError(
-                    error_msg,
-                    provider="anthropic",
-                    model=params["model"],
-                    retryable=True,
-                ) from e
+                # Do not expose arbitrary response/cause text or infer dispatch
+                # stage from it. Custom clients with SDK retries enabled cannot
+                # prove there was no earlier accepted attempt.
+                if observation.phase == "received":
+                    raise LocalRequestError(model=params["model"], received=True) from e
+                if observation.phase == "not_dispatched" or (
+                    not sdk_stream_started and proved_local_url(e)
+                ):
+                    observation.phase = "not_dispatched"
+                    raise LocalRequestError(model=params["model"]) from e
+                if (
+                    not sdk_stream_started
+                    and self.client.max_retries == 0
+                    and proved_pre_send(e)
+                ):
+                    raise KernelProviderUnavailableError(
+                        "Connection or pool acquisition failed before submission.",
+                        provider="anthropic",
+                        model=params["model"],
+                        retryable=True,
+                    ) from e
+                from anthropic import APITimeoutError
 
+                if isinstance(e, APITimeoutError):
+                    raise unknown_timeout(params["model"]) from e
+                raise RequestOutcomeUnknownError(
+                    model=params["model"],
+                ) from e
         async def _on_retry(attempt: int, delay: float, error: KernelLLMError):
             """Callback invoked before each retry sleep."""
             error_type = type(error).__name__
@@ -4764,6 +4991,21 @@ class AnthropicProvider:
                 )
 
         async def _do_complete_guarded():
+            try:
+                return await _do_complete_guarded_inner()
+            except KernelLLMError as error:
+                if observation.phase == "not_dispatched":
+                    error.request_outcome = "not_dispatched"
+                    error.effects = "none"
+                    if error.retryable:
+                        raise LocalRequestError(model=params["model"]) from error
+                raise
+            except Exception as error:
+                if observation.phase == "not_dispatched":
+                    raise LocalRequestError(model=params["model"]) from error
+                raise
+
+        async def _do_complete_guarded_inner():
             """Semaphore-gated wrapper around _do_complete with concurrency logging.
 
             Acquires the process-wide concurrency semaphore before each API call
@@ -4775,6 +5017,7 @@ class AnthropicProvider:
             - each fresh attempt must re-acquire before hitting the network
             """
             global _active_requests, _waiting_requests
+            observation.phase = "not_dispatched"
             sem = await _get_process_semaphore(self._max_concurrent_requests)
             if sem is not None:
                 _waiting_requests += 1
@@ -4907,10 +5150,12 @@ class AnthropicProvider:
                         f"[PROVIDER] Rate limit: {tokens_remaining:,}/{tokens_limit:,} tokens remaining ({pct_used:.1f}% used)"
                     )
 
-            # Build ChatResponse first
+            # Conversion only owns contribution once it invokes the callback.
             chat_response = self._convert_to_chat_response(
-                response, native_computer_adapter=assembly.native_computer_adapter
+                response, native_computer_adapter=assembly.native_computer_adapter,
+                failed_usage=failed_usage,
             )
+            observation.usage, _ = failed_usage.settlement()
 
             # Emit from canonical fields
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -4945,14 +5190,39 @@ class AnthropicProvider:
 
             return chat_response  # Return the already-built response
 
+        except asyncio.CancelledError as e:
+            usage = settle_usage(e)
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await _terminal_delivery(self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": "anthropic",
+                        "model": params["model"],
+                        "status": "cancelled",
+                        "duration_ms": int((time.time() - start_time) * 1000),
+                        "error": "Local wait cancelled; remote effects are not rolled back.",
+                        "usage": usage,
+                    },
+                ), usage=usage)
+            raise
         except KernelLLMError as e:
+            if observation.phase == "received" and not isinstance(e, LocalRequestError):
+                translated = LocalRequestError(model=params["model"], received=True)
+                translated.__cause__ = e
+                e = translated
+            elif observation.phase == "not_dispatched":
+                e.request_outcome = "not_dispatched"
+                e.effects = "none"
+                e.retryable = False
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
             logger.error("[PROVIDER] Anthropic API error: %s", error_msg)
+            usage = settle_usage(e)
+            e._anthropic_settled = True
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
+                await _terminal_delivery(self.coordinator.hooks.emit(
                     "llm:response",
                     {
                         "provider": "anthropic",
@@ -4960,19 +5230,31 @@ class AnthropicProvider:
                         "status": "error",
                         "duration_ms": elapsed_ms,
                         "error": error_msg,
+                        **({"usage": usage} if usage is not None else {}),
+                        "request_outcome": getattr(e, "request_outcome", None),
+                        "effects": getattr(e, "effects", None),
                     },
-                )
-            raise
+                ), usage=usage)
+            raise e
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
-            # Ensure error message is never empty
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
-            logger.error(f"[PROVIDER] Anthropic response processing error: {error_msg}")
+            translated = (
+                RequestOutcomeUnknownError(model=params["model"])
+                if observation.phase == "dispatched" else
+                LocalRequestError(model=params["model"], received=observation.phase == "received")
+            )
+            error_msg = str(translated)
+            logger.error(
+                "[PROVIDER] Anthropic response processing error (%s): %s",
+                type(e).__name__[:80], error_msg,
+            )
+            usage = settle_usage(translated)
+            translated._anthropic_settled = True
 
             # Emit error event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
+                await _terminal_delivery(self.coordinator.hooks.emit(
                     "llm:response",
                     {
                         "provider": "anthropic",
@@ -4980,9 +5262,12 @@ class AnthropicProvider:
                         "status": "error",
                         "duration_ms": elapsed_ms,
                         "error": error_msg,
+                        **({"usage": usage} if usage is not None else {}),
+                        "request_outcome": translated.request_outcome,
+                        "effects": translated.effects,
                     },
-                )
-            raise
+                ), usage=usage)
+            raise translated from e
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         """
@@ -6285,6 +6570,7 @@ class AnthropicProvider:
         response: Any,
         *,
         native_computer_adapter: NativeComputerAdapter | None = None,
+        failed_usage: FailedUsage | None = None,
     ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
@@ -6483,7 +6769,10 @@ class AnthropicProvider:
             speed=getattr(response.usage, "speed", None),
         )
         usage = usage.model_copy(update={"cost_usd": cost})
-        self._add_cost(cost)
+        if failed_usage is None:
+            self._add_cost(cost)
+        else:
+            failed_usage.contribute(self._add_cost, cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 

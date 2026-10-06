@@ -1,8 +1,7 @@
-"""Tests for json.dumps(e.body) in KernelLLMError messages.
+"""Tests for public generation error messages and private SDK bodies.
 
-Verifies that when Anthropic SDK errors have a .body attribute,
-the kernel error message uses json.dumps(body) instead of str(e).
-When body is None, str(e) is used as fallback.
+Known request errors retain their body/str behavior. Safe rate-limit refusals
+use a fixed description; unknown outcomes never expose response or cause text.
 """
 
 import asyncio
@@ -22,11 +21,14 @@ from amplifier_core.llm_errors import (
     InvalidRequestError as KernelInvalidRequestError,
     LLMError as KernelLLMError,
     NotFoundError as KernelNotFoundError,
-    ProviderUnavailableError as KernelProviderUnavailableError,
     RateLimitError as KernelRateLimitError,
 )
 from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
+from amplifier_module_provider_anthropic._request_safety import (
+    UNKNOWN_MESSAGE,
+    RequestOutcomeUnknownError,
+)
 
 from tests._helpers import FakeCoordinator
 
@@ -59,12 +61,12 @@ def _make_anthropic_error_with_body(cls, message="error", status_code=400, body=
 
 
 # ---------------------------------------------------------------------------
-# Block 1: RateLimitError — uses json.dumps(body) when body present
+# Block 1: RateLimitError — structured refusal versus unknown outcome
 # ---------------------------------------------------------------------------
 
 
-class TestRateLimitErrorUsesBodyJson:
-    def test_error_message_contains_json_body_when_body_present(self):
+class TestRateLimitErrorPublicMessage:
+    def test_structured_refusal_uses_fixed_message(self):
         provider = _make_provider()
         body = {
             "type": "error",
@@ -80,10 +82,11 @@ class TestRateLimitErrorUsesBodyJson:
         with pytest.raises(KernelRateLimitError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        # The error message should be the JSON dump of body, not str(e)
-        assert json.dumps(body) == str(exc_info.value)
+        assert str(exc_info.value) == "Anthropic refused the request due to a rate limit."
+        assert exc_info.value.retryable is True
+        assert exc_info.value.__cause__ is sdk_error
 
-    def test_error_message_falls_back_to_str_when_body_none(self):
+    def test_missing_body_is_unknown_not_a_refusal(self):
         provider = _make_provider()
         sdk_error = _make_anthropic_error_with_body(
             anthropic.RateLimitError, "rate limited", status_code=429, body=None
@@ -92,11 +95,15 @@ class TestRateLimitErrorUsesBodyJson:
             side_effect=sdk_error
         )
 
-        with pytest.raises(KernelRateLimitError) as exc_info:
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        # Falls back to str(e) when body is None
-        assert "rate limited" in str(exc_info.value)
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.retryable is False
+        assert exc_info.value.request_outcome == "unknown"
+        assert exc_info.value.effects == "may_have_occurred"
+        assert exc_info.value.__cause__ is sdk_error
+        assert provider.client.messages.with_raw_response.create.await_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +336,7 @@ class TestAPIStatusErrorUsesBodyJson:
 
         assert json.dumps(body) == str(exc_info.value)
 
-    def test_5xx_provider_unavailable_uses_json_body(self):
+    def test_5xx_unknown_outcome_keeps_body_private(self):
         provider = _make_provider()
         body = {
             "type": "error",
@@ -345,10 +352,15 @@ class TestAPIStatusErrorUsesBodyJson:
             side_effect=sdk_error
         )
 
-        with pytest.raises(KernelProviderUnavailableError) as exc_info:
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        assert json.dumps(body) == str(exc_info.value)
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.retryable is False
+        assert exc_info.value.request_outcome == "unknown"
+        assert exc_info.value.effects == "may_have_occurred"
+        assert exc_info.value.__cause__ is sdk_error
+        assert provider.client.messages.with_raw_response.create.await_count == 1
 
     def test_403_access_denied_falls_back_to_str_when_body_none(self):
         provider = _make_provider()
@@ -378,7 +390,7 @@ class TestAPIStatusErrorUsesBodyJson:
 
         assert "not found" in str(exc_info.value)
 
-    def test_5xx_provider_unavailable_falls_back_to_str_when_body_none(self):
+    def test_5xx_unknown_outcome_keeps_sdk_message_private(self):
         provider = _make_provider()
         sdk_error = _make_anthropic_error_with_body(
             anthropic.InternalServerError,
@@ -390,12 +402,15 @@ class TestAPIStatusErrorUsesBodyJson:
             side_effect=sdk_error
         )
 
-        with pytest.raises(KernelProviderUnavailableError) as exc_info:
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        assert "internal server error" in str(exc_info.value)
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.retryable is False
+        assert exc_info.value.__cause__ is sdk_error
+        assert provider.client.messages.with_raw_response.create.await_count == 1
 
-    def test_other_status_falls_back_to_str_when_body_none(self):
+    def test_other_status_is_unknown_when_body_none(self):
         provider = _make_provider()
         sdk_error = _make_anthropic_error_with_body(
             anthropic.APIStatusError, "I'm a teapot", status_code=418, body=None
@@ -407,9 +422,10 @@ class TestAPIStatusErrorUsesBodyJson:
         with pytest.raises(KernelLLMError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        assert "I'm a teapot" in str(exc_info.value)
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.request_outcome == "unknown"
 
-    def test_other_status_uses_json_body(self):
+    def test_other_status_does_not_publish_body(self):
         provider = _make_provider()
         body = {"type": "error", "error": {"type": "teapot", "message": "I'm a teapot"}}
         sdk_error = _make_anthropic_error_with_body(
@@ -422,17 +438,18 @@ class TestAPIStatusErrorUsesBodyJson:
         with pytest.raises(KernelLLMError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        assert json.dumps(body) == str(exc_info.value)
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.request_outcome == "unknown"
 
 
 # ---------------------------------------------------------------------------
-# Block 7: Generic Exception catch-all — uses json.dumps(body) when body present
+# Generic exception catch-all — fixed public message and private cause
 # ---------------------------------------------------------------------------
 
 
-class TestGenericExceptionUsesBodyJson:
-    def test_exception_with_body_uses_json(self):
-        """Exceptions with a body attribute should use json.dumps(body)."""
+class TestGenericExceptionPrivacy:
+    def test_exception_with_body_keeps_body_private(self):
+        """An arbitrary body is not safe to include in the public message."""
         provider = _make_provider()
         body = {"type": "error", "error": {"message": "unexpected"}}
         original = Exception("something unexpected")
@@ -441,33 +458,41 @@ class TestGenericExceptionUsesBodyJson:
             side_effect=original
         )
 
-        with pytest.raises(KernelLLMError) as exc_info:
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        assert json.dumps(body) == str(exc_info.value)
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.retryable is False
+        assert exc_info.value.request_outcome == "unknown"
+        assert exc_info.value.effects == "may_have_occurred"
+        assert exc_info.value.__cause__ is original
+        assert provider.client.messages.with_raw_response.create.await_count == 1
 
-    def test_exception_without_body_uses_str(self):
-        """Exceptions without body should fall back to str(e)."""
+    def test_exception_without_body_keeps_message_private(self):
+        """Unknown-stage exception text stays in the private cause chain."""
         provider = _make_provider()
         original = RuntimeError("something unexpected")
         provider.client.messages.with_raw_response.create = AsyncMock(
             side_effect=original
         )
 
-        with pytest.raises(KernelLLMError) as exc_info:
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        assert "something unexpected" in str(exc_info.value)
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.retryable is False
+        assert exc_info.value.__cause__ is original
+        assert provider.client.messages.with_raw_response.create.await_count == 1
 
 
 # ---------------------------------------------------------------------------
-# Unchanged blocks: verify they are NOT affected
+# Deadline errors — compatible timeout type, conservative outcome
 # ---------------------------------------------------------------------------
 
 
-class TestUnchangedBlocks:
-    def test_timeout_error_message_unchanged(self):
-        """asyncio.TimeoutError still uses hardcoded f-string, not body JSON."""
+class TestTimeoutPrivacy:
+    def test_timeout_error_uses_fixed_unknown_message(self):
+        """A deadline does not prove that the provider stopped generation."""
         provider = _make_provider()
         provider.client.messages.with_raw_response.create = AsyncMock(
             side_effect=asyncio.TimeoutError()
@@ -478,4 +503,8 @@ class TestUnchangedBlocks:
         with pytest.raises(KernelLLMTimeoutError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
-        assert "timed out" in str(exc_info.value).lower()
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.retryable is False
+        assert exc_info.value.request_outcome == "unknown"
+        assert exc_info.value.effects == "may_have_occurred"
+        assert provider.client.messages.with_raw_response.create.await_count == 1

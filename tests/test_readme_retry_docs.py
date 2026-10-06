@@ -3,7 +3,7 @@
 Validates:
 - Old 'Rate Limit Configuration' section is removed
 - New 'Retry and Error Handling' section exists with correct structure
-- Error translation table has all 12 SDK-to-kernel mappings
+- Error translation table distinguishes proved refusals from unknown outcomes
 - Backoff formula documented correctly
 - 529 attempt table shows correct values
 - Config table documents all 5 keys with defaults
@@ -105,13 +105,18 @@ class TestOpeningParagraph:
 
 
 class TestErrorTranslationTable:
-    """Error translation table must have all 12 SDK-to-kernel mappings."""
+    """Generation retry eligibility must be explicit in each relevant row."""
 
     def test_rate_limit_error_row(self, readme_content):
         """RateLimitError -> RateLimitError, 429, retryable."""
         section = _extract_section(readme_content, "#### Error Translation")
         assert "RateLimitError" in section
         assert "429" in section
+        row = next(
+            line for line in section.splitlines() if line.startswith("| `RateLimitError`")
+        )
+        assert "Structured HTTP `rate_limit_error` refusal before any stream event" in row
+        assert row.endswith("| 429 | Yes |")
 
     def test_overloaded_error_row(self, readme_content):
         """OverloadedError -> ProviderUnavailableError, 529, 10x backoff."""
@@ -119,11 +124,22 @@ class TestErrorTranslationTable:
         assert "OverloadedError" in section
         assert "ProviderUnavailableError" in section
         assert "529" in section
+        row = next(
+            line for line in section.splitlines() if line.startswith("| `OverloadedError`")
+        )
+        assert "Structured HTTP `overloaded_error` refusal before any stream event" in row
+        assert row.endswith("| 529 | Yes (10× backoff) |")
 
     def test_internal_server_error_row(self, readme_content):
-        """InternalServerError/5xx -> ProviderUnavailableError."""
+        """InternalServerError/5xx -> non-retryable unknown outcome."""
         section = _extract_section(readme_content, "#### Error Translation")
-        assert "InternalServerError" in section
+        row = next(
+            line
+            for line in section.splitlines()
+            if line.startswith("| `InternalServerError`")
+        )
+        assert "`RequestOutcomeUnknownError` (Core `LLMError`)" in row
+        assert row.endswith("| 5xx | No |")
 
     def test_authentication_error_row(self, readme_content):
         """AuthenticationError -> AuthenticationError, 401, not retryable."""
@@ -159,13 +175,20 @@ class TestErrorTranslationTable:
         assert "404" in section
 
     def test_timeout_error_row(self, readme_content):
-        """asyncio.TimeoutError -> LLMTimeoutError, retryable."""
+        """Elapsed/read/write timeouts -> LLMTimeoutError, non-retryable."""
         section = _extract_section(readme_content, "#### Error Translation")
         assert "TimeoutError" in section
         assert "LLMTimeoutError" in section
+        row = next(
+            line
+            for line in section.splitlines()
+            if line.startswith("| `asyncio.TimeoutError`")
+        )
+        assert "Elapsed/read/write or unknown stage" in row
+        assert row.endswith("| No |")
 
     def test_other_error_row(self, readme_content):
-        """Other exceptions -> LLMError, retryable."""
+        """Unknown-stage errors -> compatible LLMError, never retryable."""
         section = _extract_section(readme_content, "#### Error Translation")
         # Check for a table row containing "Other" and "LLMError" but not "LLMTimeoutError"
         lines = section.split("\n")
@@ -175,24 +198,31 @@ class TestErrorTranslationTable:
         assert any("LLMTimeoutError" not in row for row in other_rows), (
             "Only found LLMTimeoutError rows, not the generic LLMError row"
         )
+        assert all("RequestOutcomeUnknownError" in row for row in other_rows)
+        assert all(row.endswith("| No |") for row in other_rows)
 
     def test_cause_preservation_note(self, readme_content):
         """Must note that all errors preserve __cause__."""
         section = _extract_section(readme_content, "#### Error Translation")
         assert "__cause__" in section
+        assert 'request_outcome="unknown"' in section
+        assert 'effects="may_have_occurred"' in section
+        assert "fixed public message; the underlying cause remains private" in section
+        assert "HTML 403 challenges no longer automatically replay" in section
+        assert "read-only model listing keeps its existing policy" in section
 
     def test_table_has_markdown_format(self, readme_content):
         """Error translation section should contain a well-formed markdown table."""
         section = _extract_section(readme_content, "#### Error Translation")
         # Count lines that start with | and contain at least 4 | characters (table rows).
-        # Expects 14 total: 1 header + 1 separator + 12 data rows.
+        # 1 header + 1 separator + 13 documented mappings.
         table_rows = [
             line
             for line in section.split("\n")
             if line.strip().startswith("|") and line.count("|") >= 4
         ]
-        assert len(table_rows) >= 12, (
-            f"Table should have at least 12 rows (header + separator + 10 data), "
+        assert len(table_rows) >= 15, (
+            f"Table should have at least 15 rows (header + separator + 13 data), "
             f"found {len(table_rows)}"
         )
 

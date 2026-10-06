@@ -9,6 +9,10 @@ import pytest
 from amplifier_core.llm_errors import LLMError, LLMTimeoutError
 from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
+from amplifier_module_provider_anthropic._request_safety import (
+    UNKNOWN_MESSAGE,
+    RequestOutcomeUnknownError,
+)
 from tests._helpers import DummyResponse, FakeCoordinator
 
 
@@ -35,6 +39,7 @@ def setup_call(streaming, config=None, failure=None):
 
     class Stream:
         response = SimpleNamespace(headers={})
+        finished = False
 
         async def __aenter__(self):
             return self
@@ -46,13 +51,18 @@ def setup_call(streaming, config=None, failure=None):
             return self
 
         async def __anext__(self):
+            if self.finished:
+                raise StopAsyncIteration
             await wait()
-            raise StopAsyncIteration
+            self.finished = True
+            return SimpleNamespace(type="message_stop")
 
         async def get_final_message(self):
             return DummyResponse()
 
     client = MagicMock()
+    client.max_retries = 0
+    client._client.follow_redirects = False
     provider._client = client
     if streaming:
         call = client.messages.stream = MagicMock(return_value=Stream())
@@ -98,7 +108,9 @@ async def test_default_wait_survives_an_hour_then_completes(monkeypatch, streami
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_explicit_cancellation_propagates_without_retry(streaming):
-    provider, request, entered, _release, closed, call = setup_call(streaming)
+    provider, request, entered, _release, closed, call = setup_call(
+        streaming, {"max_retries": 3, "fallback_on_overload": True}
+    )
     task = asyncio.create_task(provider.complete(request))
     await entered.wait()
     task.cancel()
@@ -113,7 +125,7 @@ async def test_explicit_cancellation_propagates_without_retry(streaming):
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_explicit_deadline_still_stops_model_work(monkeypatch, streaming):
     provider, request, entered, _release, closed, call = setup_call(
-        streaming, {"timeout": 10}
+        streaming, {"timeout": 10, "max_retries": 3, "fallback_on_overload": True}
     )
     task = asyncio.create_task(provider.complete(request))
     await entered.wait()
@@ -121,8 +133,14 @@ async def test_explicit_deadline_still_stops_model_work(monkeypatch, streaming):
     clock = loop.time
     with monkeypatch.context() as patch:
         patch.setattr(loop, "time", lambda: clock() + 11)
-        with pytest.raises(LLMTimeoutError):
+        with pytest.raises(LLMTimeoutError) as exc_info:
             await task
+    assert str(exc_info.value) == UNKNOWN_MESSAGE
+    assert exc_info.value.retryable is False
+    assert exc_info.value.request_outcome == "unknown"
+    assert exc_info.value.effects == "may_have_occurred"
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    assert call.call_count == 1
     assert call.call_args.kwargs["timeout"].read == 10
     if streaming:
         assert closed
@@ -131,14 +149,23 @@ async def test_explicit_deadline_still_stops_model_work(monkeypatch, streaming):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_real_transport_failure_is_still_reported(streaming):
+    original = anthropic.APIConnectionError(request=MagicMock())
     provider, request, entered, release, closed, call = setup_call(
-        streaming, failure=anthropic.APIConnectionError(request=MagicMock())
+        streaming,
+        {"max_retries": 3, "fallback_on_overload": True},
+        failure=original,
     )
     task = asyncio.create_task(provider.complete(request))
     await entered.wait()
     release.set()
-    with pytest.raises(LLMError):
+    with pytest.raises(RequestOutcomeUnknownError) as exc_info:
         await task
+    assert isinstance(exc_info.value, LLMError)
+    assert str(exc_info.value) == UNKNOWN_MESSAGE
+    assert exc_info.value.retryable is False
+    assert exc_info.value.request_outcome == "unknown"
+    assert exc_info.value.effects == "may_have_occurred"
+    assert exc_info.value.__cause__ is original
     assert call.call_count == 1
     if streaming:
         assert closed
@@ -199,6 +226,7 @@ async def test_actual_sdk_request_disables_hidden_read_deadline(streaming):
 
     provider._client = client_type(
         api_key="fixture",
+        max_retries=0,
         timeout=0.001,
         http_client=transport.AsyncClient(transport=transport.MockTransport(handle)),
     )

@@ -527,9 +527,8 @@ class TestCloudflargeChallengeEvent:
         ]
         assert cf_events[0][1]["process_id"] == os.getpid()
 
-    def test_cloudflare_challenge_event_emitted_on_each_retry(self):
-        """One cloudflare_challenge event emitted per attempt (initial + retries)."""
-        # max_retries=2 → 1 initial attempt + 2 retries = 3 total attempts
+    def test_cloudflare_challenge_event_does_not_authorize_generation_retry(self):
+        """HTML detection is diagnostic, not proof that a generation is unaccepted."""
         provider, coordinator = _make_provider(
             max_concurrent=5, max_retries=2, min_retry_delay=0.005
         )
@@ -546,8 +545,8 @@ class TestCloudflargeChallengeEvent:
             for e in coordinator.hooks.events
             if e[0] == "provider:cloudflare_challenge"
         ]
-        # 1 initial + 2 retries = 3 cloudflare_challenge events
-        assert len(cf_events) == 3
+        assert len(cf_events) == 1
+        assert provider.client.messages.with_raw_response.create.await_count == 1
 
     def test_no_cloudflare_event_for_real_api_403(self):
         """A genuine API 403 (JSON body) must NOT emit cloudflare_challenge."""

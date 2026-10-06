@@ -201,18 +201,45 @@ SDK exceptions are translated to kernel errors before the retry loop sees them. 
 
 | SDK Exception | Condition | Kernel Error | Status | Retryable |
 | --- | --- | --- | --- | --- |
-| `RateLimitError` | 429 | `RateLimitError` | 429 | Yes |
-| `OverloadedError` | 529 | `ProviderUnavailableError` | 529 | Yes (10× backoff) |
-| `InternalServerError` | 5xx | `ProviderUnavailableError` | 5xx | Yes |
+| `RateLimitError` | Structured HTTP `rate_limit_error` refusal before any stream event | `RateLimitError` | 429 | Yes |
+| `OverloadedError` | Structured HTTP `overloaded_error` refusal before any stream event | `ProviderUnavailableError` | 529 | Yes (10× backoff) |
+| `InternalServerError` | Bare 5xx / ambiguous generation failure | `RequestOutcomeUnknownError` (Core `LLMError`) | 5xx | No |
 | `AuthenticationError` | 401 | `AuthenticationError` | 401 | No |
 | `BadRequestError` | prompt/context window overflow (e.g. `prompt is too long: ... tokens > ... maximum`) | `ContextLengthError` | 400 | No |
 | `BadRequestError` | safety / content filter / blocked | `ContentFilterError` | 400 | No |
 | `BadRequestError` | other | `InvalidRequestError` | 400 | No |
 | `APIStatusError` | 403 | `AccessDeniedError` | 403 | No |
 | `APIStatusError` | 404 | `NotFoundError` | 404 | No |
-| `APIStatusError` | other non-5xx | `LLMError` | — | No |
-| `asyncio.TimeoutError` | — | `LLMTimeoutError` | — | Yes |
-| Other | — | `LLMError` | — | Yes |
+| `APIStatusError` | Other status / SSE error under HTTP 200 | `RequestOutcomeUnknownError` (Core `LLMError`) | — | No |
+| SDK connection error | Exact typed connect/pool cause, SDK retry disabled, before response activity | `ProviderUnavailableError` | — | Yes |
+| `asyncio.TimeoutError` / SDK timeout | Elapsed/read/write or unknown stage | `LLMTimeoutError` | — | No |
+| Other | Reset, missing terminal stream event, malformed result, unknown stage | `RequestOutcomeUnknownError` (Core `LLMError`) | — | No |
+
+Only documented structured HTTP refusals ([Anthropic errors](https://platform.claude.com/docs/en/api/errors))
+and proved pre-send failures authorize generation retries. Bare status codes,
+HTML challenge text, generic connection wrappers and absence of answer text do
+not prove nonacceptance. HTML 403 challenges no longer automatically replay
+generation requests; read-only model listing keeps its existing policy.
+Unknown outcomes have `request_outcome="unknown"`, `effects="may_have_occurred"`
+and a fixed public message; the underlying cause remains private.
+Known pre-dispatch local failures instead report `request_outcome="not_dispatched"`
+and `effects="none"`, without a phantom usage receipt. A validated final SDK
+response followed by conversion or local postprocessing failure reports
+`request_outcome="received"` and `effects="occurred"`: receiving a result is not
+the same as successfully returning a ChatResponse. These failures are sanitized
+and nonretryable too. Only typed local URL failures establish that the SDK's
+send entry did not submit; arbitrary SDK exception text never proves that.
+
+This deliberately turns some formerly retried transient failures (including
+bare 500s) into explicit failures to avoid duplicate accepted generations.
+It does not eliminate silent waits or establish provider-side cancellation.
+Supplied SDK clients must also have `max_retries=0`; generation fails locally
+before dispatch otherwise. Generation HTTP redirects are disabled, and supplied
+clients must have `follow_redirects=False`: a redirect can otherwise replay an
+accepted POST before a later connect failure/refusal reaches the provider.
+Configured elapsed deadlines must be finite positive
+seconds or null; zero, negative, and nonfinite values are rejected rather than
+reported as unlimited.
 
 #### Backoff Formula
 
@@ -630,3 +657,52 @@ Any use of third-party trademarks or logos are subject to those third-party's po
 ### Waiting for model work
 
 Completion and streaming requests have no elapsed-time or read-idle deadline by default. They wait for completion, explicit cancellation, or a provider/transport error. Set `timeout` (seconds) to opt into a request deadline; `null` leaves model work unbounded. Connection and pool acquisition remain bounded to 5 seconds, and existing `close_timeout` cleanup limits are unchanged.
+
+The configured scalar bounds elapsed time for an attempt, not the whole turn or
+retry backoff, and also sets SDK read/write phase limits; connect/pool remain
+5 seconds. Expert `extra_request_params.timeout` can override SDK phase limits
+without overriding that configured elapsed bound. This provider does
+not implement `ChatRequest.timeout` parity. Cancellation propagates locally
+without replay; an accepted remote request may still complete or incur usage.
+
+On failure or local cancellation, `error.usage` and `llm:response.usage` retain
+only validated raw counters from consumed SDK events (uncached `input_tokens`,
+not the successful response's cache-inclusive total). Absent counters are
+unknown, not zero; partial snapshots and incomplete pricing inputs leave
+`cost_usd` null. Complete measured usage is priced only when the existing
+calculator can price every measured bucket and tier, once per attempt. Failed
+receipts report cost callback state separately: `not_invoked`, `returned`, or
+`unknown` if a callback raised (it may already have committed). Ownership starts
+at actual invocation, not conversion entry; unknown contribution is never
+automatically redelivered. These prices are estimates, not vendor invoices. Failed
+text, reasoning, and tool arguments never become a completed response. Local
+cancellation publishes status `cancelled` and one sanitized `llm:stream_aborted`
+after displayed partial output; cleanup hooks are best-effort and bounded, and
+the original caller `CancelledError` still propagates unless a newer caller
+Stop supersedes it. This is not remote rollback or
+billing cancellation.
+
+The optional `llm:progress` version 1 channel reports only `attempt_started` and
+actual parsed `response_activity`, a positive local attempt number, and effective
+limits (`mode`, `elapsed_seconds`, and connect/pool/read/write seconds or null).
+It contains no text, reasoning, arguments, headers, URLs, identifiers, or keys.
+Activity is throttled to one publication per second across one logical
+`complete()` call, including retries and model fallbacks. Physical generation
+attempts increment the same local counter without resetting that throttle.
+Only logical settlement can flush the latest pending actual observation once,
+before the enclosing call wrapper's terminal event, best-effort within a 100ms
+cooperative delivery window on success, failure, or cancellation. The provider
+drains its own delivery child; explicitly asynchronous dispatchers may finish
+their callback cleanup after provider settlement. Non-yielding or cancellation-
+suppressing hook code cannot be strictly bounded by asyncio. Internal terminal
+cleanup hook cancellation cannot impersonate caller Stop; active-call hook
+cancellation remains propagating. New caller cancellation still
+propagates with its message and count. There are no periodic heartbeats.
+SDK-hidden SSE ping/comment bytes are not reported as parsed activity.
+Silence remains pending, not evidence of a stalled model or a dead connection.
+
+Offline wire checks live in `tests/test_transport_liveness.py`. Set
+`ANTHROPIC_WAIT_SOAK_SECONDS=2100` to run the opt-in real-time silence fixture
+for both streaming and nonstreaming outside CI. These fixtures prove receiving-
+boundary handling, not real-provider billing cancellation or OS network-switch
+behavior.

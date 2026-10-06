@@ -11,12 +11,25 @@ land, in this same file.
 import asyncio
 import logging
 from typing import cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import anthropic
 import pytest
+from anthropic._exceptions import OverloadedError as AnthropicOverloadedError
 from amplifier_core import ModuleCoordinator
+from amplifier_core.llm_errors import (
+    AuthenticationError,
+    LLMTimeoutError,
+    ProviderUnavailableError,
+)
+from amplifier_core.message_models import ChatRequest, Message
 
 import amplifier_module_provider_anthropic as anthropic_module
 from amplifier_module_provider_anthropic import AnthropicProvider
+from amplifier_module_provider_anthropic._request_safety import (
+    UNKNOWN_MESSAGE,
+    RequestOutcomeUnknownError,
+)
 from tests._helpers import FakeCoordinator
 
 
@@ -275,3 +288,71 @@ def test_list_models_populates_family_latest_cache():
     provider.client.models.list = _fake_list  # type: ignore[method-assign]
     asyncio.run(provider.list_models())
     assert provider._family_latest["opus"] == "claude-opus-5"
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("authentication", AuthenticationError),
+        ("deadline", LLMTimeoutError),
+        ("generic", RequestOutcomeUnknownError),
+        ("ambiguous_500", RequestOutcomeUnknownError),
+        ("bare_429", RequestOutcomeUnknownError),
+        ("bare_529", RequestOutcomeUnknownError),
+        ("non_retryable_overload", ProviderUnavailableError),
+    ],
+)
+@patch("asyncio.sleep", new_callable=AsyncMock)
+def test_non_retryable_generation_never_restarts_or_downgrades(
+    mock_sleep, failure, expected
+):
+    """Neither the short/full retry-budget handoff nor the ladder may replay."""
+    provider = _make_provider(
+        "claude-opus-5", fallback_on_overload=True, fallback_retry_count=1
+    )
+    response = MagicMock(headers={})
+    if failure == "authentication":
+        response.status_code = 401
+        original = anthropic.AuthenticationError(
+            "bad key", response=response, body=None
+        )
+    elif failure == "deadline":
+        original = asyncio.TimeoutError("private deadline")
+    elif failure == "generic":
+        original = RuntimeError("unknown stage")
+    elif failure == "non_retryable_overload":
+        original = ProviderUnavailableError(
+            "non-retryable capacity failure",
+            provider="anthropic",
+            model="claude-opus-5",
+            status_code=529,
+            retryable=False,
+        )
+    else:
+        status, sdk_cls = {
+            "ambiguous_500": (500, anthropic.InternalServerError),
+            "bare_429": (429, anthropic.RateLimitError),
+            "bare_529": (529, AnthropicOverloadedError),
+        }[failure]
+        response.status_code = status
+        original = sdk_cls("unproved failure", response=response, body=None)
+    provider.client.messages.with_raw_response.create = AsyncMock(side_effect=original)
+
+    request = ChatRequest(messages=[Message(role="user", content="hello")])
+    with pytest.raises(expected) as exc_info:
+        asyncio.run(provider.complete(request))
+
+    assert exc_info.value.retryable is False
+    if expected in (RequestOutcomeUnknownError, LLMTimeoutError):
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.request_outcome == "unknown"
+        assert exc_info.value.effects == "may_have_occurred"
+        assert exc_info.value.__cause__ is original
+    assert provider.client.messages.with_raw_response.create.await_count == 1
+    assert provider.client.messages.with_raw_response.create.await_args.kwargs[
+        "model"
+    ] == "claude-opus-5"
+    mock_sleep.assert_not_awaited()
+    names = cast(FakeCoordinator, provider.coordinator).hooks.emitted_names()
+    assert "provider:retry" not in names
+    assert "provider:fallback_open" not in names

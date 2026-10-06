@@ -30,6 +30,10 @@ from amplifier_core.llm_errors import (
 )
 from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
+from amplifier_module_provider_anthropic._request_safety import (
+    UNKNOWN_MESSAGE,
+    RequestOutcomeUnknownError,
+)
 
 from tests._helpers import FakeCoordinator
 
@@ -59,7 +63,12 @@ def _make_anthropic_error(cls, message="error", status_code=400):
     mock_response = MagicMock()
     mock_response.status_code = status_code
     mock_response.headers = {}
-    return cls(message, response=mock_response, body=None)
+    body = (
+        {"type": "error", "error": {"type": "rate_limit_error"}}
+        if cls is anthropic.RateLimitError and status_code == 429
+        else None
+    )
+    return cls(message, response=mock_response, body=body)
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +228,7 @@ class TestBadRequestErrorTranslation:
 
 
 class TestAPIStatusErrorTranslation:
-    def test_5xx_translates_to_provider_unavailable(self):
+    def test_5xx_translates_to_unknown_outcome(self):
         provider = _make_provider()
         sdk_error = _make_anthropic_error(
             anthropic.InternalServerError,
@@ -230,16 +239,20 @@ class TestAPIStatusErrorTranslation:
             side_effect=sdk_error
         )
 
-        with pytest.raises(KernelProviderUnavailableError) as exc_info:
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
         e = exc_info.value
         assert e.provider == "anthropic"
         assert e.status_code == 500
-        assert e.retryable is True
+        assert e.retryable is False
+        assert e.request_outcome == "unknown"
+        assert e.effects == "may_have_occurred"
+        assert str(e) == UNKNOWN_MESSAGE
         assert e.__cause__ is sdk_error
+        assert provider.client.messages.with_raw_response.create.await_count == 1
 
-    def test_503_translates_to_provider_unavailable(self):
+    def test_503_translates_to_unknown_outcome(self):
         provider = _make_provider()
         mock_response = MagicMock()
         mock_response.status_code = 503
@@ -251,17 +264,22 @@ class TestAPIStatusErrorTranslation:
             side_effect=sdk_error
         )
 
-        with pytest.raises(KernelProviderUnavailableError) as exc_info:
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
         assert exc_info.value.status_code == 503
+        assert exc_info.value.retryable is False
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.__cause__ is sdk_error
+        assert provider.client.messages.with_raw_response.create.await_count == 1
 
 
 class TestTimeoutErrorTranslation:
     def test_asyncio_timeout_translates(self):
         provider = _make_provider()
+        original = asyncio.TimeoutError("private deadline detail")
         provider.client.messages.with_raw_response.create = AsyncMock(
-            side_effect=asyncio.TimeoutError()
+            side_effect=original
         )
 
         with pytest.raises(KernelLLMTimeoutError) as exc_info:
@@ -269,24 +287,34 @@ class TestTimeoutErrorTranslation:
 
         e = exc_info.value
         assert e.provider == "anthropic"
-        assert e.retryable is True
+        assert e.retryable is False
+        assert e.request_outcome == "unknown"
+        assert e.effects == "may_have_occurred"
+        assert str(e) == UNKNOWN_MESSAGE
+        assert e.__cause__ is original
+        assert provider.client.messages.with_raw_response.create.await_count == 1
 
 
 class TestGenericExceptionTranslation:
-    def test_unknown_exception_translates_to_llm_error(self):
+    def test_unknown_exception_translates_to_unknown_outcome(self):
         provider = _make_provider()
         original = RuntimeError("something unexpected")
         provider.client.messages.with_raw_response.create = AsyncMock(
             side_effect=original
         )
 
-        with pytest.raises(KernelLLMError) as exc_info:
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
         e = exc_info.value
         assert e.provider == "anthropic"
-        assert e.retryable is True
+        assert isinstance(e, KernelLLMError)
+        assert e.retryable is False
+        assert e.request_outcome == "unknown"
+        assert e.effects == "may_have_occurred"
+        assert str(e) == UNKNOWN_MESSAGE
         assert e.__cause__ is original
+        assert provider.client.messages.with_raw_response.create.await_count == 1
 
 
 class TestCauseChainPreservation:
@@ -298,7 +326,7 @@ class TestCauseChainPreservation:
             (anthropic.RateLimitError, KernelRateLimitError, 429),
             (anthropic.AuthenticationError, KernelAuthenticationError, 401),
             (anthropic.BadRequestError, KernelInvalidRequestError, 400),
-            (anthropic.InternalServerError, KernelProviderUnavailableError, 500),
+            (anthropic.InternalServerError, RequestOutcomeUnknownError, 500),
         ]
 
         for sdk_cls, kernel_cls, status in test_cases:
@@ -430,7 +458,7 @@ class TestModelPassthrough:
 
         assert exc_info.value.model == self.EXPECTED_MODEL
 
-    def test_provider_unavailable_error_includes_model(self):
+    def test_unknown_outcome_error_includes_model(self):
         provider = _make_provider()
         sdk_error = _make_anthropic_error(
             anthropic.InternalServerError,
@@ -441,7 +469,7 @@ class TestModelPassthrough:
             side_effect=sdk_error
         )
 
-        with pytest.raises(KernelProviderUnavailableError) as exc_info:
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
             asyncio.run(provider.complete(_simple_request()))
 
         assert exc_info.value.model == self.EXPECTED_MODEL
