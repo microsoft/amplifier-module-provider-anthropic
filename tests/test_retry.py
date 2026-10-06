@@ -1,7 +1,8 @@
 """Tests for Phase 2 retry refactor: catch LLMError with retryable check.
 
 Verifies:
-- Retryable errors (RateLimitError, ProviderUnavailableError, LLMTimeoutError) are retried
+- Structured HTTP rate-limit and overload refusals are retried
+- Ambiguous server errors and deadlines never replay generation
 - Non-retryable errors (AuthenticationError) raise immediately
 - retry_after > max_retry_delay still retries (server knows best)
 - Event name is provider:retry (not anthropic:rate_limit_retry)
@@ -10,6 +11,7 @@ Verifies:
 """
 
 import asyncio
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,11 +26,16 @@ import pytest
 from amplifier_core import ModuleCoordinator
 from amplifier_core.llm_errors import (
     AuthenticationError as KernelAuthenticationError,
+    LLMTimeoutError as KernelLLMTimeoutError,
     ProviderUnavailableError as KernelProviderUnavailableError,
     RateLimitError as KernelRateLimitError,
 )
 from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
+from amplifier_module_provider_anthropic._request_safety import (
+    UNKNOWN_MESSAGE,
+    RequestOutcomeUnknownError,
+)
 
 from tests._helpers import DummyResponse, FakeCoordinator
 
@@ -68,7 +75,11 @@ def _make_sdk_rate_limit_error(
     if retry_after is not None:
         headers["retry-after"] = str(retry_after)
     mock_response.headers = headers
-    return anthropic.RateLimitError("rate limited", response=mock_response, body=None)
+    return anthropic.RateLimitError(
+        "rate limited",
+        response=mock_response,
+        body={"type": "error", "error": {"type": "rate_limit_error"}},
+    )
 
 
 def _make_sdk_server_error() -> anthropic.InternalServerError:
@@ -96,7 +107,11 @@ def _make_sdk_overloaded_error(
     if retry_after is not None:
         headers["retry-after"] = str(retry_after)
     mock_response.headers = headers
-    return AnthropicOverloadedError("overloaded", response=mock_response, body=None)
+    return AnthropicOverloadedError(
+        "overloaded",
+        response=mock_response,
+        body={"type": "error", "error": {"type": "overloaded_error"}},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +144,8 @@ class TestRetryOnTransientErrors:
         assert provider.client.messages.with_raw_response.create.await_count == 3
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_retries_provider_unavailable(self, mock_sleep):
-        """ProviderUnavailableError (5xx) should be retried."""
+    def test_ambiguous_500_is_not_retried(self, mock_sleep):
+        """A bare 500 cannot prove that generation was refused."""
         provider = _make_provider(max_retries=3)
         dummy = DummyResponse()
 
@@ -145,13 +160,20 @@ class TestRetryOnTransientErrors:
             ]
         )
 
-        result = asyncio.run(provider.complete(_simple_request()))
-        assert result is not None
-        assert provider.client.messages.with_raw_response.create.await_count == 2
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
+            asyncio.run(provider.complete(_simple_request()))
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.retryable is False
+        assert exc_info.value.request_outcome == "unknown"
+        assert exc_info.value.effects == "may_have_occurred"
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert provider.client.messages.with_raw_response.create.await_count == 1
+        raw_mock.parse.assert_not_awaited()
+        mock_sleep.assert_not_awaited()
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_retries_timeout_error(self, mock_sleep):
-        """LLMTimeoutError should be retried."""
+    def test_timeout_is_not_retried(self, mock_sleep):
+        """A deadline ends the local wait, not the remote generation."""
         provider = _make_provider(max_retries=3)
         dummy = DummyResponse()
 
@@ -166,12 +188,141 @@ class TestRetryOnTransientErrors:
             ]
         )
 
-        result = asyncio.run(provider.complete(_simple_request()))
-        assert result is not None
-        assert provider.client.messages.with_raw_response.create.await_count == 2
+        with pytest.raises(KernelLLMTimeoutError) as exc_info:
+            asyncio.run(provider.complete(_simple_request()))
+        assert exc_info.value.retryable is False
+        assert exc_info.value.request_outcome == "unknown"
+        assert exc_info.value.effects == "may_have_occurred"
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert provider.client.messages.with_raw_response.create.await_count == 1
+        raw_mock.parse.assert_not_awaited()
+        mock_sleep.assert_not_awaited()
 
 
 class TestNoRetryOnNonRetryable:
+    @pytest.mark.parametrize(
+        ("sdk_cls", "status", "kind"),
+        [
+            (anthropic.RateLimitError, 429, "rate_limit_error"),
+            (AnthropicOverloadedError, 529, "overloaded_error"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "body_shape",
+        ["missing", "bare_detail", "missing_kind", "wrong_kind", "text"],
+    )
+    @patch("asyncio.sleep", new_callable=AsyncMock)
+    def test_unproved_refusal_is_not_retried(
+        self, mock_sleep, sdk_cls, status, kind, body_shape
+    ):
+        provider = _make_provider(max_retries=5)
+        bodies = {
+            "missing": None,
+            "bare_detail": {"type": kind},
+            "missing_kind": {"type": "error", "error": {}},
+            "wrong_kind": {"type": "error", "error": {"type": "api_error"}},
+            "text": "rate limit or overload text is not proof",
+        }
+        response = MagicMock(status_code=status, headers={})
+        sdk_error = sdk_cls("unproved", response=response, body=bodies[body_shape])
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            side_effect=sdk_error
+        )
+
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
+            asyncio.run(provider.complete(_simple_request()))
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.status_code == status
+        assert exc_info.value.request_outcome == "unknown"
+        assert exc_info.value.effects == "may_have_occurred"
+        assert exc_info.value.__cause__ is sdk_error
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert provider.client.messages.with_raw_response.create.await_count == 1
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("sdk_cls", "kind", "status"),
+        [
+            (anthropic.RateLimitError, "rate_limit_error", None),
+            (anthropic.RateLimitError, "rate_limit_error", 200),
+            (anthropic.RateLimitError, "rate_limit_error", 529),
+            (AnthropicOverloadedError, "overloaded_error", None),
+            (AnthropicOverloadedError, "overloaded_error", 200),
+            (AnthropicOverloadedError, "overloaded_error", 429),
+        ],
+    )
+    @patch("asyncio.sleep", new_callable=AsyncMock)
+    def test_structured_body_requires_matching_http_status(
+        self, mock_sleep, sdk_cls, kind, status
+    ):
+        provider = _make_provider(max_retries=5)
+        sdk_error = sdk_cls(
+            "unproved status",
+            response=MagicMock(status_code=status, headers={}),
+            body={"type": "error", "error": {"type": kind}},
+        )
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            side_effect=sdk_error
+        )
+
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
+            asyncio.run(provider.complete(_simple_request()))
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.status_code == status
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.__cause__ is sdk_error
+        assert provider.client.messages.with_raw_response.create.await_count == 1
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.parametrize("kind", ["rate_limit_error", "overloaded_error"])
+    @patch("asyncio.sleep", new_callable=AsyncMock)
+    def test_structured_error_after_parsed_stream_event_is_not_replayed(
+        self, mock_sleep, kind
+    ):
+        """Even a control event without answer text makes a later error ambiguous."""
+        provider = _make_provider(max_retries=5)
+        provider.use_streaming = True
+        sdk_error = (
+            _make_sdk_rate_limit_error()
+            if kind == "rate_limit_error"
+            else _make_sdk_overloaded_error()
+        )
+
+        class FailedStream:
+            get_final_message = AsyncMock()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            def __aiter__(self):
+                async def events():
+                    yield SimpleNamespace(type="message_start")
+                    raise sdk_error
+
+                return events()
+
+        stream = FailedStream()
+        provider.client.messages.stream = MagicMock(return_value=stream)
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
+            asyncio.run(provider.complete(_simple_request()))
+
+        assert str(exc_info.value) == UNKNOWN_MESSAGE
+        assert exc_info.value.retryable is False
+        assert exc_info.value.request_outcome == "unknown"
+        assert exc_info.value.effects == "may_have_occurred"
+        assert exc_info.value.__cause__ is sdk_error
+        provider.client.messages.stream.assert_called_once()
+        stream.get_final_message.assert_not_awaited()
+        mock_sleep.assert_not_awaited()
+        assert "provider:retry" not in cast(
+            FakeCoordinator, provider.coordinator
+        ).hooks.emitted_names()
+
     def test_auth_error_not_retried(self):
         """AuthenticationError (retryable=False) should raise immediately, no retry."""
         provider = _make_provider(max_retries=5)
@@ -347,10 +498,10 @@ class TestBackoffPattern:
         provider = _make_provider(max_retries=3)
         # Use errors without retry-after to trigger exponential backoff
         provider.client.messages.with_raw_response.create = AsyncMock(
-            side_effect=_make_sdk_server_error()
+            side_effect=_make_sdk_rate_limit_error()
         )
 
-        with pytest.raises(KernelProviderUnavailableError):
+        with pytest.raises(KernelRateLimitError):
             asyncio.run(provider.complete(_simple_request()))
 
         # With min_retry_delay=0.01 and no jitter:

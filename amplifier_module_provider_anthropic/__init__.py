@@ -67,6 +67,13 @@ from anthropic._exceptions import (
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 from ._cost import compute_cost
+from ._request_safety import (
+    UNKNOWN_MESSAGE,
+    RequestOutcomeUnknownError,
+    proved_pre_send,
+    proved_refusal,
+    unknown_timeout,
+)
 from ._computer_toolset import (
     COMPUTER_TOOLSET_NAME,
     PROVENANCE_MEMBER,
@@ -2667,7 +2674,11 @@ class AnthropicProvider:
         detecting it specifically is out of scope.
         """
         status_code = getattr(error, "status_code", None)
-        return isinstance(error, KernelProviderUnavailableError) and status_code == 529
+        return (
+            error.retryable
+            and isinstance(error, KernelProviderUnavailableError)
+            and status_code == 529
+        )
 
     def _resolve_effective_model(
         self, requested_model: str
@@ -3231,7 +3242,11 @@ class AnthropicProvider:
                     **current_kwargs,
                 )
             except KernelLLMError as e:
-                if use_short_retry_budget and not self._is_overload_fallback_error(e):
+                if (
+                    e.retryable
+                    and use_short_retry_budget
+                    and not self._is_overload_fallback_error(e)
+                ):
                     # Preserve the old retry behavior for non-overload failures:
                     # after the short downgrade budget is exhausted, retry the same
                     # model once more with the full configured retry policy.
@@ -4289,6 +4304,7 @@ class AnthropicProvider:
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
             nonlocal captured_rate_limit_info
+            sdk_stream_started = False
             try:
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
@@ -4347,6 +4363,7 @@ class AnthropicProvider:
                     # The very first SDK event makes an overflow nonrecoverable,
                     # even if it carries no displayable text or hook payload.
                     sdk_stream_started = False
+                    sdk_stream_finished = False
                     hooks_available = self.coordinator and hasattr(
                         self.coordinator, "hooks"
                     )
@@ -4356,6 +4373,8 @@ class AnthropicProvider:
                                 async for event in stream:
                                     sdk_stream_started = True
                                     etype = type(event).__name__
+                                    if getattr(event, "type", None) == "message_stop":
+                                        sdk_stream_finished = True
                                     idx = getattr(event, "index", None)
                                     if etype == "RawContentBlockStartEvent":
                                         if idx is None:
@@ -4461,6 +4480,10 @@ class AnthropicProvider:
                                     # accumulator and are not surfaced.
 
                                 # Stream drained. Final message is now ready.
+                                # SDK get_final_message can return its partial
+                                # snapshot after EOF without a message_stop.
+                                if not sdk_stream_finished:
+                                    raise ValueError("Incomplete generation stream")
                                 response = await stream.get_final_message()
 
                                 # Capture rate limit headers from stream response
@@ -4481,7 +4504,7 @@ class AnthropicProvider:
                                     "request_id": request_id,
                                     "error": {
                                         "type": type(e).__name__,
-                                        "msg": str(e),
+                                        "msg": UNKNOWN_MESSAGE,
                                     },
                                 },
                             )
@@ -4500,15 +4523,21 @@ class AnthropicProvider:
                     )
 
                 captured_rate_limit_info = rate_limit_info
+                if not isinstance(getattr(response, "stop_reason", None), str):
+                    raise ValueError("Missing terminal generation result")
                 return response
 
             except AnthropicRateLimitError as e:
+                if sdk_stream_started or not proved_refusal(
+                    e, status=429, kind="rate_limit_error"
+                ):
+                    raise RequestOutcomeUnknownError(
+                        model=params["model"], status_code=getattr(e, "status_code", None)
+                    ) from e
                 rate_info = self._parse_rate_limit_info(e)
                 retry_after = rate_info.get("retry_after_seconds")
-                body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
                 raise KernelRateLimitError(
-                    msg,
+                    "Anthropic refused the request due to a rate limit.",
                     provider="anthropic",
                     model=params["model"],
                     status_code=429,
@@ -4582,8 +4611,12 @@ class AnthropicProvider:
                     ) from e
 
             except AnthropicOverloadedError as e:
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
+                if sdk_stream_started or not proved_refusal(
+                    e, status=529, kind="overloaded_error"
+                ):
+                    raise RequestOutcomeUnknownError(
+                        model=params["model"], status_code=getattr(e, "status_code", None)
+                    ) from e
                 retry_after: float | None = None
                 if hasattr(e, "response") and e.response:
                     raw = e.response.headers.get("retry-after")
@@ -4593,7 +4626,7 @@ class AnthropicProvider:
                         except (ValueError, TypeError):
                             pass
                 raise KernelProviderUnavailableError(
-                    error_msg,
+                    "Anthropic refused the request due to overload.",
                     provider="anthropic",
                     model=params["model"],
                     status_code=529,
@@ -4614,7 +4647,7 @@ class AnthropicProvider:
                     if self._is_cloudflare_challenge(e):
                         logger.warning(
                             "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
-                            "with HTML body). Treating as transient — will retry."
+                            "with HTML body). Generation will not be replayed."
                         )
                         if self.coordinator and hasattr(self.coordinator, "hooks"):
                             await self.coordinator.hooks.emit(
@@ -4631,11 +4664,11 @@ class AnthropicProvider:
                             )
                         raise KernelProviderUnavailableError(
                             "Cloudflare bot challenge (transient 403 with HTML body). "
-                            "This typically resolves on retry.",
+                            "No automatic replacement request was sent.",
                             provider="anthropic",
                             model=params["model"],
                             status_code=403,
-                            retryable=True,
+                            retryable=False,
                         ) from e
                     raise KernelAccessDeniedError(
                         error_msg,
@@ -4651,12 +4684,9 @@ class AnthropicProvider:
                         status_code=404,
                     ) from e
                 if status >= 500:
-                    raise KernelProviderUnavailableError(
-                        error_msg,
-                        provider="anthropic",
+                    raise RequestOutcomeUnknownError(
                         model=params["model"],
                         status_code=status,
-                        retryable=True,
                     ) from e
                 raise KernelLLMError(
                     error_msg,
@@ -4667,69 +4697,32 @@ class AnthropicProvider:
                 ) from e
 
             except asyncio.TimeoutError as e:
-                raise KernelLLMTimeoutError(
-                    f"Request timed out after {self.timeout}s",
-                    provider="anthropic",
-                    model=params["model"],
-                    retryable=True,
-                ) from e
+                raise unknown_timeout(params["model"]) from e
 
             except KernelLLMError:
                 raise  # Already translated, don't double-wrap
 
             except Exception as e:
-                body = getattr(e, "body", None)
-                error_msg = (
-                    json.dumps(body)
-                    if body is not None
-                    else (str(e) or f"{type(e).__name__}: (no message)")
-                )
-                # GAP-016: the Anthropic SDK's own APIConnectionError carries a
-                # fixed, generic message ("Connection error.") regardless of
-                # *why* the underlying httpx/httpcore call failed -- DNS
-                # failure, TLS failure, a malformed base_url producing
-                # `UnsupportedProtocol`, etc. all look identical to a user or
-                # to logs, and are indistinguishable from real transient
-                # network flakiness. The SDK chains the real exception via
-                # `raise APIConnectionError(...) from err`, so it's available
-                # on `__cause__` -- surface it instead of silently dropping it,
-                # so "Connection error." becomes something a user can actually
-                # act on (e.g. "caused by UnsupportedProtocol: Request URL is
-                # missing an 'http://' or 'https://' protocol" directly names
-                # a misconfigured base_url instead of looking like the network
-                # is down).
-                cause = e.__cause__
-                if cause is not None:
-                    # Redact before interpolating: this path is generic, so ANY
-                    # exception with a __cause__ gets its str() spliced into a
-                    # message that reaches logs and user-facing output. A
-                    # base_url carrying embedded basic-auth
-                    # (https://user:pass@proxy.internal/) shows up verbatim in
-                    # httpx/httpcore's own exception text (e.g. the URL is
-                    # quoted back in "Request URL is missing/invalid ..."), so
-                    # redact_secrets() alone isn't enough -- it only redacts
-                    # dict values under a sensitive key, not credentials
-                    # embedded inside a plain string. Strip URL userinfo first,
-                    # then apply the same redact_secrets() treatment the raw
-                    # request/response payloads already get elsewhere in this
-                    # file.
-                    cause_text = redact_secrets(_redact_url_credentials(str(cause)))
-                    # Compare on the redacted text -- comparing on the raw text
-                    # would suppress the suffix whenever the unredacted string
-                    # happened to appear, which is not the question being asked.
-                    #
-                    # `cause_text` is checked for truthiness explicitly: an
-                    # exception with an empty str() ("" in anything is True)
-                    # would otherwise silently drop the whole suffix, taking the
-                    # useful *type name* with it -- the one piece of diagnostic
-                    # value such a cause still has.
-                    if not cause_text or cause_text not in error_msg:
-                        error_msg = f"{error_msg} (caused by {type(cause).__name__}: {cause_text})"
-                raise KernelLLMError(
-                    error_msg,
-                    provider="anthropic",
+                # Do not expose arbitrary response/cause text or infer dispatch
+                # stage from it. Custom clients with SDK retries enabled cannot
+                # prove there was no earlier accepted attempt.
+                if (
+                    not sdk_stream_started
+                    and self.client.max_retries == 0
+                    and proved_pre_send(e)
+                ):
+                    raise KernelProviderUnavailableError(
+                        "Connection or pool acquisition failed before submission.",
+                        provider="anthropic",
+                        model=params["model"],
+                        retryable=True,
+                    ) from e
+                from anthropic import APITimeoutError
+
+                if isinstance(e, APITimeoutError):
+                    raise unknown_timeout(params["model"]) from e
+                raise RequestOutcomeUnknownError(
                     model=params["model"],
-                    retryable=True,
                 ) from e
 
         async def _on_retry(attempt: int, delay: float, error: KernelLLMError):

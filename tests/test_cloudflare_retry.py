@@ -5,8 +5,8 @@ api.anthropic.com when its bot-detection is triggered.  These look nothing
 like real Anthropic API 403s (which return JSON bodies).  The provider must:
 
   1. Detect Cloudflare challenges via _is_cloudflare_challenge().
-  2. Raise a *retryable* KernelProviderUnavailableError (not AccessDeniedError).
-  3. Let retry_with_backoff handle the retry loop automatically.
+  2. Raise a non-retryable KernelProviderUnavailableError (not AccessDeniedError).
+  3. Never replay generation based on an HTML challenge.
   4. Still treat real API 403s (JSON body) as non-retryable AccessDeniedError.
 """
 
@@ -74,6 +74,12 @@ class MockStreamManager:
 
     async def __aexit__(self, *args):
         return False
+
+    def __aiter__(self):
+        async def events():
+            yield SimpleNamespace(type="message_stop")
+
+        return events()
 
     async def get_final_message(self):
         return self._api_response
@@ -157,7 +163,7 @@ class TestCloudflareDetectionIsCaseInsensitive:
     Detection used to compare raw strings against a mixed-case marker list,
     so any challenge page whose casing differed from the hardcoded literals
     was missed -- and a missed challenge is a permanent AccessDeniedError
-    raised for a condition that would have cleared on retry. The sibling
+    raised instead of the diagnostic challenge error. The sibling
     providers (openai, vllm) case-fold both sides; this pins the same
     behaviour here.
     """
@@ -209,13 +215,12 @@ class TestCloudflareDetectionIsCaseInsensitive:
 
 
 # ============================================================================
-# Integration tests: Cloudflare 403 raises retryable error
+# Integration tests: Cloudflare 403 never replays generation
 # ============================================================================
 
 
-class TestCloudflare403Retry:
-    """Verify that Cloudflare 403s are raised as retryable errors
-    while real API 403s remain non-retryable."""
+class TestCloudflare403NoGenerationRetry:
+    """Both challenge and API 403s are non-retryable for generation."""
 
     def _make_provider(self) -> tuple[AnthropicProvider, FakeCoordinator]:
         provider = AnthropicProvider(
@@ -226,8 +231,8 @@ class TestCloudflare403Retry:
         provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
         return provider, fake_coordinator
 
-    def test_cloudflare_403_raises_retryable_provider_unavailable(self):
-        """Cloudflare 403 should raise KernelProviderUnavailableError(retryable=True)."""
+    def test_cloudflare_403_raises_non_retryable_provider_unavailable(self):
+        """Cloudflare detection supplies diagnostics, not nonacceptance proof."""
         provider, coordinator = self._make_provider()
 
         cf_error = _make_api_status_error(
@@ -245,9 +250,11 @@ class TestCloudflare403Retry:
         with pytest.raises(KernelProviderUnavailableError) as exc_info:
             asyncio.run(provider.complete(request))
 
-        assert exc_info.value.retryable is True
+        assert exc_info.value.retryable is False
         assert exc_info.value.status_code == 403
         assert "Cloudflare" in str(exc_info.value)
+        assert exc_info.value.__cause__ is cf_error
+        assert provider.client.messages.with_raw_response.create.await_count == 1
 
     def test_real_api_403_raises_non_retryable_access_denied(self):
         """Real API 403 should raise KernelAccessDeniedError(retryable=False)."""
@@ -273,8 +280,8 @@ class TestCloudflare403Retry:
         assert exc_info.value.retryable is False
         assert exc_info.value.status_code == 403
 
-    def test_cloudflare_403_is_retried_then_succeeds(self):
-        """Cloudflare 403 followed by success should work via retry loop."""
+    def test_cloudflare_403_does_not_send_available_replacement(self):
+        """An available second result must never be requested after a challenge."""
         provider = AnthropicProvider(
             api_key="test-key",
             config={"use_streaming": False, "max_retries": 2},
@@ -289,7 +296,7 @@ class TestCloudflare403Retry:
             response_text=CLOUDFLARE_HTML,
         )
 
-        # First call: Cloudflare 403.  Second call: success.
+        # A second success is available only if the provider incorrectly replays.
         raw_ok = MagicMock()
         raw_ok.parse = AsyncMock(return_value=DummyResponse())
         raw_ok.headers = {}
@@ -306,20 +313,20 @@ class TestCloudflare403Retry:
         provider.client.messages.with_raw_response.create = flaky_create  # type: ignore[method-assign]
 
         request = ChatRequest(messages=[Message(role="user", content="Hello")])
-        response = asyncio.run(provider.complete(request))
+        with pytest.raises(KernelProviderUnavailableError) as exc_info:
+            asyncio.run(provider.complete(request))
+        assert exc_info.value.retryable is False
+        assert call_count == 1
+        raw_ok.parse.assert_not_awaited()
 
-        # Should succeed after retry
-        assert response is not None
-        assert call_count == 2
-
-        # Should have emitted a retry event
+        # Detection must not authorize a retry event.
         retry_events = [
             e for e in fake_coordinator.hooks.events if "retry" in e[0].lower()
         ]
-        assert len(retry_events) >= 1
+        assert retry_events == []
 
-    def test_cloudflare_403_exhausts_retries(self):
-        """Persistent Cloudflare 403 should exhaust retries and raise."""
+    def test_persistent_cloudflare_403_ignores_retry_budget(self):
+        """Persistent challenge errors fail on the first attempt."""
         provider = AnthropicProvider(
             api_key="test-key",
             config={"use_streaming": False, "max_retries": 1, "min_retry_delay": 0.01},
@@ -342,5 +349,9 @@ class TestCloudflare403Retry:
         with pytest.raises(KernelProviderUnavailableError) as exc_info:
             asyncio.run(provider.complete(request))
 
-        assert exc_info.value.retryable is True
+        assert exc_info.value.retryable is False
         assert "Cloudflare" in str(exc_info.value)
+        assert provider.client.messages.with_raw_response.create.await_count == 1
+        assert all(
+            name != "provider:retry" for name, _ in fake_coordinator.hooks.events
+        )

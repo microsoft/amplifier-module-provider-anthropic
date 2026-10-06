@@ -69,15 +69,21 @@ def _make_sdk_overloaded_error(
     if retry_after is not None:
         headers["retry-after"] = str(retry_after)
     mock_response.headers = headers
-    return AnthropicOverloadedError("overloaded", response=mock_response, body=None)
+    return AnthropicOverloadedError(
+        "overloaded",
+        response=mock_response,
+        body={"type": "error", "error": {"type": "overloaded_error"}},
+    )
 
 
-def _make_sdk_server_error() -> anthropic.InternalServerError:
+def _make_sdk_rate_limit_error() -> anthropic.RateLimitError:
     mock_response = MagicMock()
-    mock_response.status_code = 500
+    mock_response.status_code = 429
     mock_response.headers = {}
-    return anthropic.InternalServerError(
-        "server error", response=mock_response, body=None
+    return anthropic.RateLimitError(
+        "rate limited",
+        response=mock_response,
+        body={"type": "error", "error": {"type": "rate_limit_error"}},
     )
 
 
@@ -85,7 +91,10 @@ def _make_sdk_rate_limit_overloaded_error() -> anthropic.RateLimitError:
     mock_response = MagicMock()
     mock_response.status_code = 429
     mock_response.headers = {}
-    body = {"error": {"type": "overloaded_error", "message": "Overloaded"}}
+    body = {
+        "type": "error",
+        "error": {"type": "rate_limit_error", "message": "Overloaded"},
+    }
     return anthropic.RateLimitError("overloaded", response=mock_response, body=body)
 
 
@@ -420,8 +429,8 @@ class TestTemporaryFallbackOnOverload:
         )
         provider.client.messages.with_raw_response.create = AsyncMock(
             side_effect=[
-                _make_sdk_server_error(),
-                _make_sdk_server_error(),
+                _make_sdk_rate_limit_error(),
+                _make_sdk_rate_limit_error(),
                 _make_raw_success("claude-opus-4-6"),
             ]
         )
@@ -475,7 +484,7 @@ class TestTemporaryFallbackOnOverload:
         ]
 
     @patch("asyncio.sleep", new_callable=AsyncMock)
-    def test_429_overloaded_body_does_not_trigger_fallback(self, mock_sleep):
+    def test_429_overloaded_message_does_not_trigger_fallback(self, mock_sleep):
         """Inverts the pre-overhaul behavior: a 429 (rate_limit_error) is
         per-account, per Anthropic's own error docs
         (platform.claude.com/docs/en/api/errors, verified 2026-08-29) --
@@ -483,10 +492,10 @@ class TestTemporaryFallbackOnOverload:
         monthly spend cap, or reached a spend limit". A lower-tier model
         draws on the SAME org quota, so downgrading cannot help. The
         previous substring test for "overload"/"overloaded" in a 429 body
-        is removed: a 429 now always falls through to the FULL retry
+        is removed: a structured rate_limit_error falls through to the FULL retry
         budget on the SAME model (exponential backoff honoring
         retry-after), never a downgrade -- regardless of what the error
-        body's text happens to contain.
+        body's message happens to contain. The type must still prove refusal.
         """
         provider = _make_provider(
             "claude-opus-4-6",

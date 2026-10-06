@@ -201,9 +201,9 @@ SDK exceptions are translated to kernel errors before the retry loop sees them. 
 
 | SDK Exception | Condition | Kernel Error | Status | Retryable |
 | --- | --- | --- | --- | --- |
-| `RateLimitError` | 429 | `RateLimitError` | 429 | Yes |
-| `OverloadedError` | 529 | `ProviderUnavailableError` | 529 | Yes (10× backoff) |
-| `InternalServerError` | 5xx | `ProviderUnavailableError` | 5xx | Yes |
+| `RateLimitError` | Structured HTTP `rate_limit_error` refusal before any stream event | `RateLimitError` | 429 | Yes |
+| `OverloadedError` | Structured HTTP `overloaded_error` refusal before any stream event | `ProviderUnavailableError` | 529 | Yes (10× backoff) |
+| `InternalServerError` | Bare 5xx / ambiguous generation failure | `RequestOutcomeUnknownError` (Core `LLMError`) | 5xx | No |
 | `AuthenticationError` | 401 | `AuthenticationError` | 401 | No |
 | `BadRequestError` | prompt/context window overflow (e.g. `prompt is too long: ... tokens > ... maximum`) | `ContextLengthError` | 400 | No |
 | `BadRequestError` | safety / content filter / blocked | `ContentFilterError` | 400 | No |
@@ -211,8 +211,21 @@ SDK exceptions are translated to kernel errors before the retry loop sees them. 
 | `APIStatusError` | 403 | `AccessDeniedError` | 403 | No |
 | `APIStatusError` | 404 | `NotFoundError` | 404 | No |
 | `APIStatusError` | other non-5xx | `LLMError` | — | No |
-| `asyncio.TimeoutError` | — | `LLMTimeoutError` | — | Yes |
-| Other | — | `LLMError` | — | Yes |
+| SDK connection error | Exact typed connect/pool cause, SDK retry disabled, before response activity | `ProviderUnavailableError` | — | Yes |
+| `asyncio.TimeoutError` / SDK timeout | Elapsed/read/write or unknown stage | `LLMTimeoutError` | — | No |
+| Other | Reset, missing terminal stream event, malformed result, unknown stage | `RequestOutcomeUnknownError` (Core `LLMError`) | — | No |
+
+Only documented structured HTTP refusals ([Anthropic errors](https://platform.claude.com/docs/en/api/errors))
+and proved pre-send failures authorize generation retries. Bare status codes,
+HTML challenge text, generic connection wrappers and absence of answer text do
+not prove nonacceptance. HTML 403 challenges no longer automatically replay
+generation requests; read-only model listing keeps its existing policy.
+Unknown outcomes have `request_outcome="unknown"`, `effects="may_have_occurred"`
+and a fixed public message; the underlying cause remains private.
+
+This deliberately turns some formerly retried transient failures (including
+bare 500s) into explicit failures to avoid duplicate accepted generations.
+It does not eliminate silent waits or establish provider-side cancellation.
 
 #### Backoff Formula
 
@@ -630,3 +643,9 @@ Any use of third-party trademarks or logos are subject to those third-party's po
 ### Waiting for model work
 
 Completion and streaming requests have no elapsed-time or read-idle deadline by default. They wait for completion, explicit cancellation, or a provider/transport error. Set `timeout` (seconds) to opt into a request deadline; `null` leaves model work unbounded. Connection and pool acquisition remain bounded to 5 seconds, and existing `close_timeout` cleanup limits are unchanged.
+
+The configured scalar bounds elapsed time for an attempt, not the whole turn or
+retry backoff. Expert `extra_request_params.timeout` can override SDK phase
+limits without overriding that configured elapsed bound. This provider does
+not implement `ChatRequest.timeout` parity. Cancellation propagates locally
+without replay; an accepted remote request may still complete or incur usage.

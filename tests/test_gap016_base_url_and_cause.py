@@ -1,4 +1,4 @@
-"""Regression tests for GAP-016 (empty base_url) and the cause-surfacing fix.
+"""Regression tests for GAP-016 (empty base_url) and private cause preservation.
 
 An independent review found that **neither** behavioural change in this PR had
 a test: reverting either one would have left the suite green. Both contracts
@@ -11,19 +11,28 @@ than ``None``. Passed to ``AsyncAnthropic(base_url="")``, httpx raises
 ``UnsupportedProtocol``, which the SDK re-wraps as a generic
 ``APIConnectionError("Connection error.")`` on *every* call.
 
-Contract 2 -- when the SDK raises ``APIConnectionError``, its message is fixed
-("Connection error.") regardless of the real cause. The SDK chains the real
-exception via ``raise ... from err``, so surfacing ``__cause__`` is what turns
-an opaque failure into an actionable one.
+Contract 2 -- unknown-stage connection failures retain the SDK's chained cause
+for debugging, but never mirror its text into the fixed public error message
+or automatically send a replacement generation.
 """
 
 from __future__ import annotations
 
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+import anthropic
 import pytest
+from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import (
     AnthropicProvider,
     _redact_url_credentials,
 )
+from amplifier_module_provider_anthropic._request_safety import (
+    UNKNOWN_MESSAGE,
+    RequestOutcomeUnknownError,
+)
+from tests._helpers import FakeCoordinator
 
 
 class TestEmptyBaseUrlNormalisation:
@@ -61,90 +70,85 @@ class TestEmptyBaseUrlNormalisation:
         )
 
 
-class TestCauseSurfacing:
-    """Contract 2: the chained cause reaches the user-facing message."""
+class TestPrivateCausePreservation:
+    """Contract 2: exercise actual provider translation, never a mirrored helper."""
 
     @staticmethod
-    def _enrich(error_msg: str, cause: BaseException | None) -> str:
-        """Mirror of the enrichment applied in the generic exception handler.
+    def _capture_error(
+        error_msg: str, cause: BaseException | None
+    ) -> RequestOutcomeUnknownError:
+        coordinator = FakeCoordinator()
+        provider = AnthropicProvider(
+            "fixture",
+            {
+                "use_streaming": False,
+                "max_retries": 3,
+                "fallback_on_overload": True,
+            },
+            coordinator=coordinator,
+        )
+        sdk_error = anthropic.APIConnectionError(
+            message=error_msg, request=MagicMock()
+        )
+        sdk_error.__cause__ = cause
+        provider.client.messages.with_raw_response.create = AsyncMock(
+            side_effect=sdk_error
+        )
+        request = ChatRequest(messages=[Message(role="user", content="hello")])
 
-        Driving the real ``_do_complete`` would require standing up a full
-        streaming client; the contract under test is the message transform, so
-        it is exercised directly against the same logic.
-        """
-        from amplifier_core.utils import redact_secrets
-        from amplifier_module_provider_anthropic import _redact_url_credentials
+        with pytest.raises(RequestOutcomeUnknownError) as exc_info:
+            asyncio.run(provider.complete(request))
 
-        if cause is not None:
-            cause_text = redact_secrets(_redact_url_credentials(str(cause)))
-            if not cause_text or cause_text not in error_msg:
-                error_msg = (
-                    f"{error_msg} (caused by {type(cause).__name__}: {cause_text})"
-                )
-        return error_msg
+        error = exc_info.value
+        assert str(error) == UNKNOWN_MESSAGE
+        assert error.retryable is False
+        assert error.request_outcome == "unknown"
+        assert error.effects == "may_have_occurred"
+        assert error.__cause__ is sdk_error
+        assert error.__cause__.__cause__ is cause
+        assert provider.client.messages.with_raw_response.create.await_count == 1
+        assert "provider:retry" not in coordinator.hooks.emitted_names()
+        assert "provider:fallback_open" not in coordinator.hooks.emitted_names()
+        return error
 
-    def test_cause_is_named_in_the_message(self) -> None:
+    def test_cause_is_private_not_named_in_the_message(self) -> None:
         class UnsupportedProtocol(Exception):
             pass
 
         cause = UnsupportedProtocol(
             "Request URL is missing an 'http://' or 'https://' protocol"
         )
-        out = self._enrich("Connection error.", cause)
+        error = self._capture_error("Connection error.", cause)
+        assert "UnsupportedProtocol" not in str(error)
+        assert "missing an 'http://'" not in str(error)
 
-        assert "UnsupportedProtocol" in out, (
-            f"cause type not surfaced: {out!r}. Without it, a misconfigured "
-            "base_url is indistinguishable from the network being down."
-        )
-        assert "missing an 'http://'" in out
+    def test_no_cause_still_uses_fixed_message(self) -> None:
+        self._capture_error("Connection error.", None)
 
-    def test_no_cause_leaves_message_untouched(self) -> None:
-        assert self._enrich("Connection error.", None) == "Connection error."
+    def test_empty_cause_is_preserved_privately(self) -> None:
+        cause = ValueError("")
+        error = self._capture_error("Connection error.", cause)
+        assert "ValueError" not in str(error)
 
-    def test_empty_cause_still_names_the_type(self) -> None:
-        """An empty str(cause) must not silently drop the whole suffix.
-
-        ``"" in anything`` is True, so a naive substring dedup discards the
-        suffix -- taking the type name, the only remaining diagnostic value,
-        with it.
-        """
-        out = self._enrich("Connection error.", ValueError(""))
-        assert "ValueError" in out, (
-            f"empty-message cause dropped its type name: {out!r}"
-        )
-
-    def test_duplicate_cause_text_is_not_appended_twice(self) -> None:
+    def test_duplicate_cause_text_is_not_surfaced(self) -> None:
         cause = RuntimeError("already mentioned")
-        out = self._enrich("Failed: already mentioned", cause)
-        assert out.count("already mentioned") == 1
+        error = self._capture_error("Failed: already mentioned", cause)
+        assert "already mentioned" not in str(error)
 
-    def test_credentials_in_cause_are_redacted(self) -> None:
-        """The enrichment is generic, so any cause's str() reaches the log.
-
-        A base_url carrying embedded basic-auth (https://user:pass@host/) is
-        echoed verbatim by httpx/httpcore's own exception text (e.g. the URL
-        is quoted back in "Request URL is missing/invalid ..."). That would
-        otherwise leak the credentials into a user-facing error on any
-        connection failure. redact_secrets() alone can't catch this -- it
-        only redacts dict values under a sensitive key, not a substring
-        embedded inside a plain string -- so the userinfo must be stripped
-        before the cause text is interpolated.
-        """
+    def test_credentials_and_endpoint_in_cause_stay_private(self) -> None:
+        """The fixed public message must contain neither credentials nor URL."""
         secret_user, secret_pass = "svc-account", "hunter2-token"
         cause = RuntimeError(
             f"Request URL 'https://{secret_user}:{secret_pass}@proxy.internal/v1' "
             "is missing an 'http://' or 'https://' protocol"
         )
-        out = self._enrich("Connection error.", cause)
+        out = str(self._capture_error("Connection error.", cause))
 
         assert secret_user not in out and secret_pass not in out, (
             f"credentials embedded in the cause's base_url leaked into the "
-            f"enriched message: {out!r}"
+            f"public message: {out!r}"
         )
-        assert "proxy.internal" in out, (
-            "redaction should remove only the userinfo, not the rest of the "
-            f"diagnostic text: {out!r}"
-        )
+        assert "proxy.internal" not in out
 
 
 class TestRedactUrlCredentialsForms:
