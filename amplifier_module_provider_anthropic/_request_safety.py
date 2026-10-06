@@ -23,6 +23,32 @@ class RequestOutcomeUnknownError(LLMError):
         )
 
 
+class LocalRequestError(LLMError):
+    """Known local failure, without exposing arbitrary exception text."""
+
+    def __init__(self, *, model: str, received: bool = False):
+        message = (
+            "Provider received a result but local processing failed. "
+            "No automatic replacement request was sent."
+            if received else
+            "Provider request failed locally before dispatch. No request was sent."
+        )
+        super().__init__(message, provider="anthropic", model=model, retryable=False)
+        self.request_outcome = "received" if received else "not_dispatched"
+        self.effects = "occurred" if received else "none"
+
+
+def proved_local_url(error: Exception) -> bool:
+    """Only immediate typed URL failures, not wrapper text or HTTP provenance."""
+    transport = getattr(_base_client, "httpx2", None) or _base_client.httpx
+    if type(error) is transport.InvalidURL:
+        return True
+    return (
+        type(error) is APIConnectionError
+        and type(error.__cause__) is transport.UnsupportedProtocol
+    )
+
+
 def unknown_timeout(model: str) -> LLMTimeoutError:
     error = LLMTimeoutError(
         UNKNOWN_MESSAGE, provider="anthropic", model=model, retryable=False,

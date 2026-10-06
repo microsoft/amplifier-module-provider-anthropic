@@ -44,7 +44,7 @@ def effective_limits(
 
 
 class RequestObservation:
-    """No tasks, timers, raw events, identifiers, or provider payloads retained."""
+    """No tasks, timers, raw events, identifiers, or response content retained."""
 
     def __init__(self, hooks: Any, limits: dict[str, Any] | None = None):
         self.hooks = hooks
@@ -52,6 +52,9 @@ class RequestObservation:
         self.attempt = 0
         self.last_activity: float | None = None
         self.pending: tuple[int, dict[str, Any]] | None = None
+        # Latest generation boundary in this logical call; never payload/IDs.
+        self.phase = "not_dispatched"
+        self.usage: dict[str, Any] | None = None
 
     async def _emit(
         self, observation: str, attempt: int, limits: dict[str, Any]
@@ -68,7 +71,8 @@ class RequestObservation:
             })
         except Exception:
             # Optional observation must not turn success into a failed request.
-            # CancelledError is BaseException and deliberately propagates.
+            # Active-call cancellation propagates. Terminal flush runs in an
+            # owned child so an internally cancelled hook cannot impersonate Stop.
             pass
 
     async def started(self, limits: dict[str, Any] | None = None) -> None:

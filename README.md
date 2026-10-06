@@ -222,6 +222,13 @@ not prove nonacceptance. HTML 403 challenges no longer automatically replay
 generation requests; read-only model listing keeps its existing policy.
 Unknown outcomes have `request_outcome="unknown"`, `effects="may_have_occurred"`
 and a fixed public message; the underlying cause remains private.
+Known pre-dispatch local failures instead report `request_outcome="not_dispatched"`
+and `effects="none"`, without a phantom usage receipt. A validated final SDK
+response followed by conversion or local postprocessing failure reports
+`request_outcome="received"` and `effects="occurred"`: receiving a result is not
+the same as successfully returning a ChatResponse. These failures are sanitized
+and nonretryable too. Only typed local URL failures establish that the SDK's
+send entry did not submit; arbitrary SDK exception text never proves that.
 
 This deliberately turns some formerly retried transient failures (including
 bare 500s) into explicit failures to avoid duplicate accepted generations.
@@ -652,8 +659,9 @@ Any use of third-party trademarks or logos are subject to those third-party's po
 Completion and streaming requests have no elapsed-time or read-idle deadline by default. They wait for completion, explicit cancellation, or a provider/transport error. Set `timeout` (seconds) to opt into a request deadline; `null` leaves model work unbounded. Connection and pool acquisition remain bounded to 5 seconds, and existing `close_timeout` cleanup limits are unchanged.
 
 The configured scalar bounds elapsed time for an attempt, not the whole turn or
-retry backoff. Expert `extra_request_params.timeout` can override SDK phase
-limits without overriding that configured elapsed bound. This provider does
+retry backoff, and also sets SDK read/write phase limits; connect/pool remain
+5 seconds. Expert `extra_request_params.timeout` can override SDK phase limits
+without overriding that configured elapsed bound. This provider does
 not implement `ChatRequest.timeout` parity. Cancellation propagates locally
 without replay; an accepted remote request may still complete or incur usage.
 
@@ -663,10 +671,15 @@ not the successful response's cache-inclusive total). Absent counters are
 unknown, not zero; partial snapshots and incomplete pricing inputs leave
 `cost_usd` null. Complete measured usage is priced only when the existing
 calculator can price every measured bucket and tier, once per attempt. Failed
+receipts report cost callback state separately: `not_invoked`, `returned`, or
+`unknown` if a callback raised (it may already have committed). Ownership starts
+at actual invocation, not conversion entry; unknown contribution is never
+automatically redelivered. These prices are estimates, not vendor invoices. Failed
 text, reasoning, and tool arguments never become a completed response. Local
 cancellation publishes status `cancelled` and one sanitized `llm:stream_aborted`
 after displayed partial output; cleanup hooks are best-effort and bounded, and
-the original `CancelledError` still propagates. This is not remote rollback or
+the original caller `CancelledError` still propagates unless a newer caller
+Stop supersedes it. This is not remote rollback or
 billing cancellation.
 
 The optional `llm:progress` version 1 channel reports only `attempt_started` and
@@ -677,7 +690,13 @@ Activity is throttled to one publication per second across one logical
 `complete()` call, including retries and model fallbacks. Physical generation
 attempts increment the same local counter without resetting that throttle.
 Only logical settlement can flush the latest pending actual observation once,
-before the enclosing call wrapper's terminal event. There are no periodic heartbeats.
+before the enclosing call wrapper's terminal event, best-effort within a 100ms
+cooperative delivery window on success, failure, or cancellation. The provider
+drains its own delivery child; explicitly asynchronous dispatchers may finish
+their callback cleanup after provider settlement. Non-yielding or cancellation-
+suppressing hook code cannot be strictly bounded by asyncio. Internal hook
+cancellation cannot impersonate caller Stop; new caller cancellation still
+propagates with its message and count. There are no periodic heartbeats.
 SDK-hidden SSE ping/comment bytes are not reported as parsed activity.
 Silence remains pending, not evidence of a stalled model or a dead connection.
 

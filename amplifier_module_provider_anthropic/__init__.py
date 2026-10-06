@@ -71,6 +71,8 @@ from ._failed_usage import FailedUsage
 from ._request_safety import (
     UNKNOWN_MESSAGE,
     RequestOutcomeUnknownError,
+    LocalRequestError,
+    proved_local_url,
     proved_pre_send,
     proved_refusal,
     unknown_timeout,
@@ -103,15 +105,35 @@ from ._computer_toolset import (
 _WIRE_ONLY_PARAMS: tuple[str, ...] = ("temperature", "speed")
 
 
-async def _cancel_cleanup(awaitable) -> None:
-    """Best-effort local publication, bounded and subordinate to cancellation."""
+async def _terminal_delivery(awaitable) -> None:
+    """Bound optional terminal work, draining the one child we own.
+
+    Cooperative hooks only: non-yielding/cancellation-suppressing code cannot
+    be strictly bounded by asyncio. External cancellation retains its message
+    and count; an internally cancelled child is not a caller Stop.
+    """
+    child = asyncio.create_task(awaitable)
+    cancelled = None
     try:
-        async with asyncio.timeout(0.1):
-            await awaitable
-    except (Exception, asyncio.CancelledError):
-        # Preserve the ORIGINAL CancelledError, including its caller message.
-        # No detached/shielded task survives this cleanup.
-        pass
+        await asyncio.wait({child}, timeout=0.1)
+    except asyncio.CancelledError as error:
+        cancelled = error
+    finally:
+        if not child.done():
+            child.cancel()
+        # Waiting does not forward a new caller Stop into child cleanup.
+        # Retrieve the child's own failure separately, only once it is done.
+        while not child.done():
+            try:
+                await asyncio.wait({child})
+            except asyncio.CancelledError as error:
+                cancelled = error
+        try:
+            child.result()
+        except (Exception, asyncio.CancelledError):
+            pass
+    if cancelled is not None:
+        raise cancelled
 
 
 def _route_wire_only_params(params: dict[str, Any]) -> dict[str, Any]:
@@ -3163,20 +3185,48 @@ class AnthropicProvider:
             ChatResponse with content blocks, tool calls, usage
         """
         observation = RequestObservation(getattr(self.coordinator, "hooks", None))
-        cancelled = False
         try:
             return await self._complete_with_fallback(request, observation, **kwargs)
         except asyncio.CancelledError:
-            cancelled = True
             raise
+        except Exception as error:
+            if isinstance(error, KernelLLMError) and getattr(error, "_anthropic_settled", False):
+                raise
+            model = str(kwargs.get("model", self.default_model))
+            translated = error if (
+                isinstance(error, KernelLLMError)
+                and getattr(error, "request_outcome", None) == "not_dispatched"
+            ) else (
+                RequestOutcomeUnknownError(model=model)
+                if observation.phase == "dispatched" else
+                LocalRequestError(model=model, received=observation.phase == "received")
+            )
+            if observation.phase == "not_dispatched":
+                translated.request_outcome = "not_dispatched"
+                translated.effects = "none"
+                translated.retryable = False
+            if observation.phase == "received" and observation.usage is not None:
+                translated.usage = dict(observation.usage)
+            logger.error(
+                "[PROVIDER] Anthropic local failure (%s): %s",
+                type(error).__name__[:80], str(translated),
+            )
+            hooks = getattr(self.coordinator, "hooks", None)
+            if hooks is not None:
+                await _terminal_delivery(hooks.emit("llm:response", {
+                    "provider": "anthropic", "model": model, "status": "error",
+                    "error": str(translated), "request_outcome": translated.request_outcome,
+                    "effects": translated.effects,
+                    **({"usage": translated.usage} if hasattr(translated, "usage") else {}),
+                }))
+            if translated is error:
+                raise
+            raise translated from error
         finally:
             # Only this boundary knows whether retries/fallbacks are finished.
             # Await before returning/raising to the logical-call wrapper; never
             # schedule a heartbeat or delay settlement to meet the throttle.
-            if cancelled:
-                await _cancel_cleanup(observation.flush())
-            else:
-                await observation.flush()
+            await _terminal_delivery(observation.flush())
 
     async def _complete_with_fallback(
         self, request: ChatRequest, observation: RequestObservation, **kwargs
@@ -3731,7 +3781,7 @@ class AnthropicProvider:
                 }
                 if choice not in normalized_choices:
                     raise KernelInvalidRequestError(
-                        f"Unsupported tool_choice {choice!r}; use 'none', 'auto', "
+                        "Unsupported tool_choice; use 'none', 'auto', "
                         "'required', or an Anthropic wire dictionary.",
                         provider="anthropic",
                         model=effective_model,
@@ -4302,13 +4352,21 @@ class AnthropicProvider:
                 _DEPRECATED_MODELS[effective_model],
             )
         prefix_state_before_assembly = OrderedDict(self._prefix_fingerprints)
-        assembly = self._assemble_request_params(
-            request,
-            request_options=kwargs,
-            request_caps=request_caps,
-            prefix_state=OrderedDict(prefix_state_before_assembly),
-            emit_diagnostics=True,
-        )
+        try:
+            assembly = self._assemble_request_params(
+                request,
+                request_options=kwargs,
+                request_caps=request_caps,
+                prefix_state=OrderedDict(prefix_state_before_assembly),
+                emit_diagnostics=True,
+            )
+        except KernelInvalidRequestError as error:
+            # Provider-owned local validation keeps its existing specific
+            # diagnostic/type; arbitrary hook/SDK exceptions are sanitized.
+            error.request_outcome = "not_dispatched"
+            error.effects = "none"
+            error.retryable = False
+            raise
         if assembly is None:
             raise ValueError("Anthropic request assembly requires a string model")
         self._prefix_fingerprints = assembly.prefix_state
@@ -4360,17 +4418,35 @@ class AnthropicProvider:
         failed_usage = FailedUsage(params["model"])
 
         def settle_usage(error):
-            usage, cost = failed_usage.settlement()
+            if observation.phase == "not_dispatched":
+                return None
+            _, cost = failed_usage.settlement()
+            try:
+                failed_usage.contribute(self._add_cost, cost)
+            except Exception:
+                # A callback may commit then raise. Do not retry it or hide the
+                # primary failure behind an optional accounting extension.
+                pass
+            usage, _ = failed_usage.settlement()
             error.usage = dict(usage)
-            if cost is not None and not failed_usage.cost_recorded:
-                failed_usage.cost_recorded = True
-                try:
-                    self._add_cost(cost)
-                except Exception:
-                    # Accounting extensions must not replace a failed/cancelled
-                    # generation or cause a second callback/replacement POST.
-                    pass
             return usage
+
+        def received(response):
+            usage = getattr(response, "usage", None)
+            if (
+                not isinstance(getattr(response, "stop_reason", None), str)
+                or not response.stop_reason
+                or not isinstance(getattr(response, "model", None), str)
+                or not isinstance(getattr(response, "content", None), list)
+                or any(
+                    type(getattr(usage, field, None)) is not int
+                    or getattr(usage, field) < 0
+                    for field in ("input_tokens", "output_tokens")
+                )
+            ):
+                raise ValueError("Missing terminal generation result")
+            observation.phase = "received"
+            failed_usage.model = response.model
 
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
@@ -4387,6 +4463,15 @@ class AnthropicProvider:
                     "Generation requires HTTP follow_redirects=False to prevent hidden POST replay.",
                     provider="anthropic", model=params["model"], retryable=False,
                 )
+            if isinstance(self.client, AsyncAnthropic):
+                # Resolve/validate the SDK's own authentication/header config
+                # before entering its send path. This is known local evidence,
+                # unlike interpreting a later generic SDK TypeError.
+                from anthropic._models import FinalRequestOptions
+                self.client._build_headers(FinalRequestOptions.construct(
+                    method="post", url="/v1/messages",
+                    headers=sdk_params.get("extra_headers"),
+                ))
             await observation.started(limits)
             try:
                 # Use streaming API to support large context windows
@@ -4451,7 +4536,9 @@ class AnthropicProvider:
                     )
                     try:
                         async with asyncio.timeout(self.timeout):
-                            async with self.client.messages.stream(**sdk_params) as stream:
+                            manager = self.client.messages.stream(**sdk_params)
+                            observation.phase = "dispatched"
+                            async with manager as stream:
                                 async for event in stream:
                                     sdk_stream_started = True
                                     if getattr(event, "type", None) == "message_start":
@@ -4576,6 +4663,7 @@ class AnthropicProvider:
                                 if not sdk_stream_finished:
                                     raise ValueError("Incomplete generation stream")
                                 response = await stream.get_final_message()
+                                received(response)
 
                                 # Capture rate limit headers from stream response
                                 if hasattr(stream, "response") and stream.response:
@@ -4584,7 +4672,7 @@ class AnthropicProvider:
                                     )
                     except asyncio.CancelledError:
                         if partial_emitted and hooks_available:
-                            await _cancel_cleanup(self.coordinator.hooks.emit(
+                            await _terminal_delivery(self.coordinator.hooks.emit(
                                 "llm:stream_aborted",
                                 {
                                     "request_id": request_id,
@@ -4602,8 +4690,7 @@ class AnthropicProvider:
                         # clauses below translate the SDK error to a kernel
                         # error type.
                         if partial_emitted and hooks_available:
-                            try:
-                                await self.coordinator.hooks.emit(
+                            await _terminal_delivery(self.coordinator.hooks.emit(
                                     "llm:stream_aborted",
                                     {
                                         "request_id": request_id,
@@ -4612,16 +4699,16 @@ class AnthropicProvider:
                                             "msg": UNKNOWN_MESSAGE,
                                         },
                                     },
-                                )
-                            except Exception:
-                                pass
+                            ))
                         raise
                 else:
                     # Pass the timeout on the request too: this avoids hidden SDK
                     # deadlines and its max_tokens-based non-streaming estimate,
                     # including when a client is supplied by the host.
+                    pending_response = self.client.messages.with_raw_response.create(**sdk_params)
+                    observation.phase = "dispatched"
                     raw_response = await asyncio.wait_for(
-                        self.client.messages.with_raw_response.create(**sdk_params),
+                        pending_response,
                         timeout=self.timeout,
                     )
                     response = await raw_response.parse()
@@ -4630,25 +4717,13 @@ class AnthropicProvider:
                         getattr(response, "usage", None),
                         complete=isinstance(reason, str) and bool(reason),
                     )
+                    received(response)
                     await observation.activity()
                     rate_limit_info = self._extract_rate_limit_headers(
                         raw_response.headers
                     )
 
                 captured_rate_limit_info = rate_limit_info
-                usage = getattr(response, "usage", None)
-                if (
-                    not isinstance(getattr(response, "stop_reason", None), str)
-                    or not response.stop_reason
-                    or not isinstance(getattr(response, "model", None), str)
-                    or not isinstance(getattr(response, "content", None), list)
-                    or any(
-                        type(getattr(usage, field, None)) is not int
-                        or getattr(usage, field) < 0
-                        for field in ("input_tokens", "output_tokens")
-                    )
-                ):
-                    raise ValueError("Missing terminal generation result")
                 return response
 
             except AnthropicRateLimitError as e:
@@ -4824,12 +4899,20 @@ class AnthropicProvider:
                 ) from e
 
             except asyncio.TimeoutError as e:
+                if observation.phase != "dispatched":
+                    raise LocalRequestError(
+                        model=params["model"], received=observation.phase == "received"
+                    ) from e
                 raise unknown_timeout(params["model"]) from e
 
             except KernelLLMError as e:
                 # Unexpected retryable Core errors from a custom client/hook
                 # have no dispatch evidence. Our translations raised in except
                 # clauses do not pass through this handler.
+                if observation.phase == "not_dispatched":
+                    raise LocalRequestError(model=params["model"]) from e
+                if observation.phase == "received":
+                    raise LocalRequestError(model=params["model"], received=True) from e
                 if e.retryable:
                     raise RequestOutcomeUnknownError(model=params["model"]) from e
                 raise
@@ -4838,6 +4921,13 @@ class AnthropicProvider:
                 # Do not expose arbitrary response/cause text or infer dispatch
                 # stage from it. Custom clients with SDK retries enabled cannot
                 # prove there was no earlier accepted attempt.
+                if observation.phase == "received":
+                    raise LocalRequestError(model=params["model"], received=True) from e
+                if observation.phase == "not_dispatched" or (
+                    not sdk_stream_started and proved_local_url(e)
+                ):
+                    observation.phase = "not_dispatched"
+                    raise LocalRequestError(model=params["model"]) from e
                 if (
                     not sdk_stream_started
                     and self.client.max_retries == 0
@@ -4888,6 +4978,21 @@ class AnthropicProvider:
                 )
 
         async def _do_complete_guarded():
+            try:
+                return await _do_complete_guarded_inner()
+            except KernelLLMError as error:
+                if observation.phase == "not_dispatched":
+                    error.request_outcome = "not_dispatched"
+                    error.effects = "none"
+                    if error.retryable:
+                        raise LocalRequestError(model=params["model"]) from error
+                raise
+            except Exception as error:
+                if observation.phase == "not_dispatched":
+                    raise LocalRequestError(model=params["model"]) from error
+                raise
+
+        async def _do_complete_guarded_inner():
             """Semaphore-gated wrapper around _do_complete with concurrency logging.
 
             Acquires the process-wide concurrency semaphore before each API call
@@ -4899,6 +5004,7 @@ class AnthropicProvider:
             - each fresh attempt must re-acquire before hitting the network
             """
             global _active_requests, _waiting_requests
+            observation.phase = "not_dispatched"
             sem = await _get_process_semaphore(self._max_concurrent_requests)
             if sem is not None:
                 _waiting_requests += 1
@@ -5031,13 +5137,12 @@ class AnthropicProvider:
                         f"[PROVIDER] Rate limit: {tokens_remaining:,}/{tokens_limit:,} tokens remaining ({pct_used:.1f}% used)"
                     )
 
-            # Build ChatResponse first
-            # The converter owns success cost publication. Do not invoke that
-            # callback again if subsequent conversion/publication fails.
-            failed_usage.cost_recorded = True
+            # Conversion only owns contribution once it invokes the callback.
             chat_response = self._convert_to_chat_response(
-                response, native_computer_adapter=assembly.native_computer_adapter
+                response, native_computer_adapter=assembly.native_computer_adapter,
+                failed_usage=failed_usage,
             )
+            observation.usage, _ = failed_usage.settlement()
 
             # Emit from canonical fields
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -5075,7 +5180,7 @@ class AnthropicProvider:
         except asyncio.CancelledError as e:
             usage = settle_usage(e)
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await _cancel_cleanup(self.coordinator.hooks.emit(
+                await _terminal_delivery(self.coordinator.hooks.emit(
                     "llm:response",
                     {
                         "provider": "anthropic",
@@ -5088,14 +5193,23 @@ class AnthropicProvider:
                 ))
             raise
         except KernelLLMError as e:
+            if observation.phase == "received" and not isinstance(e, LocalRequestError):
+                translated = LocalRequestError(model=params["model"], received=True)
+                translated.__cause__ = e
+                e = translated
+            elif observation.phase == "not_dispatched":
+                e.request_outcome = "not_dispatched"
+                e.effects = "none"
+                e.retryable = False
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
             logger.error("[PROVIDER] Anthropic API error: %s", error_msg)
             usage = settle_usage(e)
+            e._anthropic_settled = True
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
+                await _terminal_delivery(self.coordinator.hooks.emit(
                     "llm:response",
                     {
                         "provider": "anthropic",
@@ -5103,21 +5217,31 @@ class AnthropicProvider:
                         "status": "error",
                         "duration_ms": elapsed_ms,
                         "error": error_msg,
-                        "usage": usage,
+                        **({"usage": usage} if usage is not None else {}),
+                        "request_outcome": getattr(e, "request_outcome", None),
+                        "effects": getattr(e, "effects", None),
                     },
-                )
-            raise
+                ))
+            raise e
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = UNKNOWN_MESSAGE
-            logger.error("[PROVIDER] Anthropic response processing error: %s", error_msg)
-            translated = RequestOutcomeUnknownError(model=params["model"])
+            translated = (
+                RequestOutcomeUnknownError(model=params["model"])
+                if observation.phase == "dispatched" else
+                LocalRequestError(model=params["model"], received=observation.phase == "received")
+            )
+            error_msg = str(translated)
+            logger.error(
+                "[PROVIDER] Anthropic response processing error (%s): %s",
+                type(e).__name__[:80], error_msg,
+            )
             usage = settle_usage(translated)
+            translated._anthropic_settled = True
 
             # Emit error event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
+                await _terminal_delivery(self.coordinator.hooks.emit(
                     "llm:response",
                     {
                         "provider": "anthropic",
@@ -5125,9 +5249,11 @@ class AnthropicProvider:
                         "status": "error",
                         "duration_ms": elapsed_ms,
                         "error": error_msg,
-                        "usage": usage,
+                        **({"usage": usage} if usage is not None else {}),
+                        "request_outcome": translated.request_outcome,
+                        "effects": translated.effects,
                     },
-                )
+                ))
             raise translated from e
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
@@ -6431,6 +6557,7 @@ class AnthropicProvider:
         response: Any,
         *,
         native_computer_adapter: NativeComputerAdapter | None = None,
+        failed_usage: FailedUsage | None = None,
     ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
@@ -6629,7 +6756,10 @@ class AnthropicProvider:
             speed=getattr(response.usage, "speed", None),
         )
         usage = usage.model_copy(update={"cost_usd": cost})
-        self._add_cost(cost)
+        if failed_usage is None:
+            self._add_cost(cost)
+        else:
+            failed_usage.contribute(self._add_cost, cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 

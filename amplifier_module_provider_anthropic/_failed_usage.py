@@ -19,7 +19,19 @@ class FailedUsage:
         self.values: dict[str, Any] = {}
         self.complete = False
         self.invalid = False
-        self.cost_recorded = False
+        self.cost_callback_state = "not_invoked"
+
+    def contribute(self, callback, cost) -> None:
+        """Ownership starts at invocation, not conversion entry.
+
+        A raising callback may already have committed externally. Never redeliver
+        it automatically; its contribution outcome remains explicitly unknown.
+        """
+        if cost is None or self.cost_callback_state != "not_invoked":
+            return
+        self.cost_callback_state = "unknown"
+        callback(cost)
+        self.cost_callback_state = "returned"
 
     def capture(self, usage: Any, *, complete: bool = False) -> None:
         # exclude_unset is essential: SDK model defaults are not wire evidence.
@@ -85,4 +97,5 @@ class FailedUsage:
             "output_tokens": values.get("output_tokens"),
             "usage_complete": self.complete,
             "cost_usd": str(cost) if cost is not None else None,
+            "cost_callback_state": self.cost_callback_state,
         }, cost
