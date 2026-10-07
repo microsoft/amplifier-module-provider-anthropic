@@ -39,7 +39,65 @@ Provides access to Anthropic's Claude models (Claude 4 series: Sonnet, Opus, Hai
 - `claude-sonnet-5` - Claude Sonnet 5 (previous default; still supported)
 - `claude-opus-5` - Claude Opus 5 (most capable)
 - `claude-opus-5-5` - Claude Opus 5.5 (adaptive thinking; $4/$20 input/output per MTok)
-- `claude-haiku-4-5` - Claude Haiku 4.5 (fastest, cheapest)
+- `claude-haiku-4-5` - Claude Haiku 4.5 (previous Haiku; manual thinking)
+- `claude-haiku-5-5` - Claude Haiku 5.5 (adaptive thinking; exact fixed model ID)
+
+### Haiku 5.5 support boundary
+
+Haiku 5.5 supports text, vision, ordinary function tools, streaming, a native
+1M context ceiling, 128K normal output, and a 512-token cache minimum. The
+existing `enable_1m_context` policy remains opt-in: without it the provider
+advertises a 200K context budget; it does not change the vendor's native limit.
+The Sonnet 5.5 global default and all explicit model/effort pins remain unchanged.
+No dated Haiku 5.5 alias is assumed.
+
+Thinking defaults to adaptive **on**, with the vendor's **medium** effort when
+effort is omitted. `low`, `medium`, `high`, `xhigh`, and `max` reach
+`output_config.effort` without a manual budget. `extended_thinking: false`
+sends genuine `thinking: {type: disabled}` at `high` or below; `xhigh`/`max`
+with disabled thinking fails locally. Manual `thinking_type: enabled`,
+`thinking_budget_tokens`, and Sonnet's `between_tools` mode are unsupported.
+Normal sampling is omitted. Expert overrides reintroducing sampling or forbidden
+thinking controls fail before transport. Assistant prefill also fails locally:
+use structured outputs or system instructions and append a user turn, rather
+than changing signed history.
+
+Forced `required`/`any` and named **ordinary function** tool choices are permitted
+and suppress thinking for that turn; a later auto/default turn resumes adaptive
+thinking. Ordered thinking (including empty signed blocks), tool calls/results,
+and images are retained. Synthetic offline signatures prove storage fidelity,
+not vendor/account replay acceptance.
+
+The model's native computer capability is `computer_toolset_20260801`, **not**
+Haiku 4.5's legacy computer type. Native declarations fail locally in this
+provider path pending separate adapter/executor qualification; ordinary function
+tools, even one named `computer`, are unaffected. Capability metadata does not
+claim installed executor readiness.
+
+#### Haiku pricing is unavailable, not zero
+
+Published first-party USD/MTok rates, checked **2026-10-07**:
+
+| Prompt length | Input | Output | Cache write 5m / 1h | Cache read |
+| --- | ---: | ---: | ---: | ---: |
+| Up to 100,000 tokens | $0.10 | $0.50 | $0.125 / $0.20 | $0.01 |
+| Above 100,000 tokens | $0.50 | $2.50 | $0.625 / $1.00 | $0.05 |
+
+The cached/server-added threshold predicate and full-versus-excess charging
+remain unverified. Consequently **all Haiku 5.5 scalar costs are `None`**, not
+a guessed lower-tier amount or a legacy Haiku rate. Response metadata and the
+`llm:response` event expose
+`anthropic_cost_unavailable: haiku55_prompt_tier_unverified`; JSON cost is `null`.
+Aggregators that sum only known costs may show an unchanged or incomplete total:
+that is not proof of a free call. Costs do not determine model discovery ranking.
+Sonnet 5.5's documented fixed ID uses its reduced $0.10/MTok cache-read rate;
+existing per-TTL write accounting and legacy model prices remain unchanged.
+
+Sources: [Haiku overview](https://platform.claude.com/docs/en/models/haiku-5-5/overview),
+[migration](https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide),
+[thinking](https://platform.claude.com/docs/en/build-with-claude/thinking),
+and [pricing](https://platform.claude.com/docs/en/about-claude/pricing).
+Haiku 4.5's manual-thinking behavior is unchanged.
 
 ### Opus 5.5 support boundary
 
@@ -116,9 +174,9 @@ default.**
 | --- | --- | --- |
 | `low` | Minimal thinking, most token-efficient | All thinking-capable models |
 | `medium` | Balanced | All thinking-capable models |
-| `high` | Default intensity (same as omitting `effort`) | All thinking-capable models |
-| `xhigh` | Extended capability for long-horizon agentic/coding work | Opus 4.7+ |
-| `max` | Maximum capability, no token constraints | Opus 4.8+ |
+| `high` | High intensity (not the omitted default on Haiku 5.5 or Opus 5.5) | All thinking-capable models |
+| `xhigh` | Extended capability for long-horizon agentic/coding work | Opus 4.7+, Haiku 5.5 |
+| `max` | Maximum capability, no effort-based token constraint | Opus 4.8+, Haiku 5.5 (normal output caps still apply) |
 
 **Precedence** (highest wins): per-call `effort` kwarg → `request.reasoning_effort`
 (set by the orchestrator) → this `effort` config default. Note the per-call
@@ -129,8 +187,8 @@ chain is what enables thinking.
 - Invalid values (e.g. `ultra`, `EXTRA HIGH`) are normalised (trimmed/lowercased)
   and, if still unrecognised, ignored with a warning — they never silently turn
   thinking on.
-- `output_config.effort` is currently only emitted for models the capability
-  matrix marks as supporting it (**Opus 4.7+** today). On other thinking-capable
+- `output_config.effort` is only emitted for models the capability
+  matrix marks as supporting it (including **Opus 4.7+ and Haiku 5.5**). On other thinking-capable
   models the extended-thinking mapping still applies. Broadening this to
   Sonnet 4.6 and Opus 4.5/4.6 (which Anthropic also supports) is tracked as a
   follow-up.
@@ -473,12 +531,15 @@ providers:
 ### 1M Token Context Window
 
 1M context is **generally available, on by default, and billed at standard
-pricing** on every model that has it (Opus 5/4.8/4.7/4.6, Sonnet 5/4.6, Fable
+pricing** on the previously supported models that have it (Opus 5/4.8/4.7/4.6, Sonnet 5/4.6, Fable
 5/5.1, Mythos 5/Preview). No beta header is required, and there is no
 long-context price premium
 ([Anthropic: Context windows](https://platform.claude.com/en/docs/build-with-claude/context-windows),
 verified 2026-08-29). Those models cap output at **128K tokens** per request
 regardless of context size.
+
+Haiku 5.5 also has a native 1M window, but has prompt-length pricing tiers;
+see its unavailable-cost boundary above.
 
 The `enable_1m_context` config key does **not** change what the API accepts.
 It only sets the context window this provider *advertises* to Amplifier's
