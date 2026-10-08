@@ -236,10 +236,19 @@ def test_explicit_unavailable_metadata_mock_is_not_replaced(
     asyncio.run(run())
 
 
-def _child(tmp_path, source, *args):
+def _child(
+    tmp_path,
+    source,
+    *args,
+    cwd=None,
+    env=None,
+    default_basetemp=False,
+    receipt_path=None,
+):
     case = tmp_path / "test_guard_case.py"
     case.write_text(source)
-    receipt = tmp_path / "receipt.json"
+    receipt = receipt_path or tmp_path / "receipt.json"
+    temp_args = [] if default_basetemp else ["--basetemp", str(tmp_path / "child-temp")]
     result = subprocess.run(
         [
             sys.executable,
@@ -250,17 +259,115 @@ def _child(tmp_path, source, *args):
             str(receipt),
             str(case),
             "-q",
-            "--basetemp",
-            str(tmp_path / "child-temp"),
+            *temp_args,
             *args,
         ],
         # No credentials, user configs, proxies, PYTHONPATH or pytest flags.
-        env={},
+        env={} if env is None else env,
+        cwd=cwd,
         capture_output=True,
         text=True,
         timeout=60,
     )
     return result, json.loads(receipt.read_text())
+
+
+def test_runner_default_basetemp_works_without_ai_working(tmp_path):
+    assert not (tmp_path / "ai_working").exists()
+    result, receipt = _child(
+        tmp_path,
+        """
+def test_first_run(tmp_path):
+    from pathlib import Path
+    assert tmp_path.is_dir()
+    assert tmp_path.parent == Path("ai_working/tmp/offline-pytest").resolve()
+""",
+        cwd=tmp_path,
+        default_basetemp=True,
+    )
+    assert result.returncode == receipt["exit_code"] == 0, result.stdout + result.stderr
+    assert receipt["attempts"] == []
+    assert receipt["shutdown_accounted"]
+    assert len(receipt["selected"]) == 1
+    assert all(report["outcome"] == "passed" for report in receipt["reports"])
+
+
+@pytest.mark.parametrize("polluted", [False, True])
+def test_runner_provides_fresh_home_for_posix_and_windows_resolution(
+    tmp_path, polluted
+):
+    private_home = tmp_path / "synthetic-private-home"
+    settings = private_home / ".amplifier" / "settings.yaml"
+    settings.parent.mkdir(parents=True)
+    settings.write_text("synthetic_private_setting: must-not-be-loaded\n")
+    result, receipt = _child(
+        tmp_path,
+        """
+def test_owned_home():
+    import ntpath, os
+    from pathlib import Path
+    home = Path.home()
+    assert home.is_absolute() and home.is_dir()
+    assert str(home) == os.environ["HOME"] == os.environ["USERPROFILE"]
+    assert home.parent == Path.cwd() and home.name.startswith("offline-home-")
+    assert list(home.iterdir()) == []
+    # Execute the stdlib Windows resolver even on POSIX. This is not Windows
+    # execution proof; native Path.home() is also checked on each hosted OS.
+    assert ntpath.expanduser("~") == str(home)
+    assert os.environ["HOMEDRIVE"] + os.environ["HOMEPATH"] == str(home)
+    assert not (home / ".amplifier" / "settings.yaml").exists()
+    assert all(name not in os.environ for name in (
+        "AMPLIFIER_HOME", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA",
+        "ANTHROPIC_API_KEY", "HTTP_PROXY", "PYTHONPATH", "PYTEST_ADDOPTS"
+    ))
+    # Windows also supports drive/path resolution when USERPROFILE is absent.
+    del os.environ["USERPROFILE"]
+    assert ntpath.expanduser("~") == str(home)
+""",
+        cwd=tmp_path,
+        env=(
+            {
+                "HOME": str(private_home),
+                "USERPROFILE": str(private_home),
+                "HOMEDRIVE": "Z:",
+                "HOMEPATH": "\\synthetic-private-home",
+                "AMPLIFIER_HOME": str(settings.parent),
+                "XDG_CONFIG_HOME": str(private_home),
+                "APPDATA": str(private_home),
+                "LOCALAPPDATA": str(private_home),
+                "ANTHROPIC_API_KEY": "synthetic-offline-credential",
+                "HTTP_PROXY": "http://synthetic.invalid",
+                "PYTHONPATH": str(private_home),
+                "PYTEST_ADDOPTS": "--required-live",
+            }
+            if polluted
+            else {}
+        ),
+    )
+    assert result.returncode == receipt["exit_code"] == 0, result.stdout + result.stderr
+    assert receipt["attempts"] == []
+    assert receipt["preimports"] == receipt["postimports"]
+    assert settings.read_text() == "synthetic_private_setting: must-not-be-loaded\n"
+    assert not list(tmp_path.glob("offline-home-*"))
+    assert str(private_home) not in json.dumps(receipt)
+
+
+def test_runner_home_survives_receipt_inside_pytest_deletion_tree(tmp_path):
+    result, receipt = _child(
+        tmp_path,
+        """
+def test_home_survives(tmp_path):
+    from pathlib import Path
+    assert tmp_path.is_dir()
+    assert Path.home().is_dir()
+    assert Path.home().parent == Path.cwd()
+    assert list(Path.home().iterdir()) == []
+""",
+        cwd=tmp_path,
+        receipt_path=tmp_path / "child-temp" / "receipt.json",
+    )
+    assert result.returncode == receipt["exit_code"] == 0, result.stdout + result.stderr
+    assert receipt["attempts"] == []
 
 
 @pytest.mark.parametrize("phase", ["collection", "runtest"])
@@ -361,6 +468,32 @@ def test_shutdown():
         except PermissionError:
             pass
     atexit.register(late_request)
+""",
+    )
+    assert result.returncode == receipt["exit_code"] == 1
+    assert receipt["shutdown_accounted"]
+    assert [a["event"] for a in receipt["attempts"]] == ["socket.getaddrinfo"]
+    assert receipt["attempts"][0]["phase_or_nodeid"] == "shutdown"
+
+
+def test_guard_retains_swallowed_weakref_finalizer_attempt_and_fails_exit(tmp_path):
+    result, receipt = _child(
+        tmp_path,
+        """
+_retained = []
+
+def test_finalizer():
+    import socket, weakref
+    class Retained:
+        pass
+    obj = Retained()
+    _retained.append(obj)
+    def late_request():
+        try:
+            socket.getaddrinfo("synthetic.invalid", 443)
+        except PermissionError:
+            pass
+    weakref.finalize(obj, late_request)
 """,
     )
     assert result.returncode == receipt["exit_code"] == 1

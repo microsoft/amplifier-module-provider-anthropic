@@ -8,8 +8,12 @@ Offline contracts execute without real keys. Provision with
 `uv sync --all-extras --dev`, then
 `uv pip install "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@a34b770ca604b88230449ac728d41dc23a2863a9"`.
 Run `uv run python -I -S tests/run_offline.py -q`. The runner sanitizes inherited
-credentials and installs a Python audit deny-and-record hook **before** site
-initialization, real Core/Foundation imports and pytest collection. Audited
+credentials, supplies a fresh owned test home (including Windows profile
+variables), and creates the default pytest temp parent on a clean checkout.
+The test home is separate from pytest's temp tree, removed at shutdown, and
+does not reuse inherited home/config locations. The runner installs a Python
+audit deny-and-record hook **before** site initialization, real Core/Foundation
+imports and pytest collection. Audited
 DNS/socket attempts and unguarded subprocesses fail the run, even when provider
 fallback catches the exception. This is isolation for **trusted tests**, not a
 tamper-proof security sandbox for hostile Python, forks or native code outside

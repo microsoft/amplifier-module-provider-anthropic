@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import socket
 import sys
+import tempfile
 import traceback
 
 
@@ -123,6 +124,8 @@ def main():
     # it unmet. It does not disable the guard or authorize a vendor request.
 
     snapshot, set_phase = install_network_guard()
+    destination = Path(options.receipt)
+    destination.parent.mkdir(parents=True, exist_ok=True)
     receipt = {
         "network_guard": "Python audit hook, installed before site and third-party imports",
         "executable": sys.executable,
@@ -167,6 +170,17 @@ def main():
 
     atexit.register(shutdown_accounting)
     try:
+        # Register accounting first: TemporaryDirectory initializes weakref's
+        # shared atexit dispatcher, including later dependency/test finalizers.
+        # Cwd is outside pytest's deletion tree (pytest rejects cwd/ancestors as
+        # basetemp), even when the caller puts the receipt inside that tree.
+        home = tempfile.TemporaryDirectory(prefix="offline-home-", dir=Path.cwd())
+        atexit.register(home.cleanup)
+        home_path = str(Path(home.name).resolve())
+        drive, path = os.path.splitdrive(home_path)
+        os.environ.update(
+            HOME=home_path, USERPROFILE=home_path, HOMEDRIVE=drive, HOMEPATH=path
+        )
         # -S defers .pth/sitecustomize execution until sanitation and denial are
         # live. site.main() performs normal venv/site setup; no sys.path hacks.
         import site
@@ -231,7 +245,10 @@ def main():
 
         set_phase("collection")
         if not any(arg.startswith("--basetemp") for arg in pytest_args):
-            pytest_args.append("--basetemp=ai_working/tmp/offline-pytest")
+            basetemp = Path("ai_working/tmp/offline-pytest")
+            # Pytest creates basetemp itself, but not missing parent directories.
+            basetemp.parent.mkdir(parents=True, exist_ok=True)
+            pytest_args.append(f"--basetemp={basetemp}")
         code = int(
             pytest.main(
                 [
