@@ -13,9 +13,13 @@ variables), and creates the default pytest temp parent on a clean checkout.
 The test home is separate from pytest's temp tree and does not reuse inherited
 home/config locations. It stays alive through later dependency finalizers;
 shutdown then removes it and their home-scoped cache writes before final
-accounting. The runner installs a Python
+accounting. After isolation and environment sanitation, Windows first performs
+the real stdlib OS-version query to populate its own platform cache. Its
+completion and process count are separate bootstrap facts, not vendor requests
+or a zero-process guarantee; no OS identity or command output is recorded.
+The runner then installs a Python
 audit deny-and-record hook **before** site initialization, real Core/Foundation
-imports and pytest collection. Audited
+imports and pytest collection. From that boundary, audited
 DNS/socket attempts and unguarded subprocesses fail the run, even when provider
 fallback catches the exception. The sole INET connect exception is Windows'
 exact stdlib socketpair implementation connecting its own IPv4 stream socket to

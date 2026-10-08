@@ -242,6 +242,29 @@ def imported_identity():
     }
 
 
+def bootstrap_stdlib_platform():
+    """Populate genuine Windows OS metadata before site/dependency execution."""
+    result = {"windows_os_metadata": False, "process_count": 0}
+    if sys.platform != "win32":
+        return result
+    import platform
+
+    active = True
+
+    def observe(event, args):
+        if active and event == "subprocess.Popen":
+            result["process_count"] += 1
+
+    sys.addaudithook(observe)
+    try:
+        # CPython3.11's real win32_ver may query `ver`; no fabricated cache/value.
+        platform.uname()
+        result["windows_os_metadata"] = True
+    finally:
+        active = False
+    return result
+
+
 def main():
     # Re-exec in isolated mode before any third-party imports. Allow only OS
     # execution/locale essentials, not inherited keys, proxies or pytest flags.
@@ -266,10 +289,12 @@ def main():
     # --required-live is useful as a negative gate probe here: sanitation leaves
     # it unmet. It does not disable the guard or authorize a vendor request.
 
+    bootstrap = bootstrap_stdlib_platform()
     snapshot, set_phase, permitted_snapshot = install_network_guard()
     destination = Path(options.receipt)
     destination.parent.mkdir(parents=True, exist_ok=True)
     receipt = {
+        "bootstrap": bootstrap,
         "network_guard": "Python audit hook, installed before site and third-party imports",
         "executable": sys.executable,
         "isolated": bool(sys.flags.isolated),

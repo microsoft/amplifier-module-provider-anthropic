@@ -777,6 +777,33 @@ def _child(
     return result, json.loads(receipt.read_text())
 
 
+def test_platform_bootstrap_keeps_post_bootstrap_child_denial(tmp_path):
+    result, receipt = _child(
+        tmp_path,
+        """
+def test_platform_and_denial():
+    import platform, subprocess, sys
+    assert platform.system()
+    try:
+        subprocess.run([sys.executable, "-c", "raise SystemExit(99)"],
+                       executable=sys.executable, timeout=10)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("Ordinary child escaped the post-bootstrap guard")
+""",
+    )
+    assert result.returncode == 1
+    assert receipt["bootstrap"]["windows_os_metadata"] is (sys.platform == "win32")
+    assert isinstance(receipt["bootstrap"]["process_count"], int)
+    assert receipt["bootstrap"]["process_count"] >= 0
+    if sys.platform != "win32":
+        assert receipt["bootstrap"]["process_count"] == 0
+    assert [attempt["event"] for attempt in receipt["attempts"]] == ["subprocess.Popen"]
+    assert all(report["outcome"] == "passed" for report in receipt["reports"])
+    assert receipt["shutdown_accounted"]
+
+
 def test_runner_default_basetemp_works_without_ai_working(tmp_path):
     assert not (tmp_path / "ai_working").exists()
     result, receipt = _child(
