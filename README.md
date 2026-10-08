@@ -4,9 +4,26 @@ Claude model integration for Amplifier via Anthropic API.
 
 ## Prerequisites
 
-Offline structural and behavioral contracts now execute without real keys.
-Scoped fixtures use a nonfunctional credential and mock only the SDK catalog
-page, preserving real mount and provider mapping checks. Run `uv run pytest -q`.
+Offline contracts execute without real keys. Provision with
+`uv sync --all-extras --dev`, then
+`uv pip install "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@a34b770ca604b88230449ac728d41dc23a2863a9"`.
+Run `uv run python -I -S tests/run_offline.py -q`. The runner sanitizes inherited
+credentials and installs a Python audit deny-and-record hook **before** site
+initialization, real Core/Foundation imports and pytest collection. Audited
+DNS/socket attempts and unguarded subprocesses fail the run, even when provider
+fallback catches the exception. This guards Python/SDK networking, not arbitrary
+native code outside Python's audit surface. Receipts are written to
+`ai_working/tmp/offline-receipt.json`; they contain local source paths and are
+private diagnostics, not public CI artifacts.
+Messages-only unit mocks receive explicitly synthetic, unspecified Models
+metadata; explicit SDK transports and metadata/error mocks remain authoritative.
+Inherited mount contracts use scoped nonfunctional credentials.
+
+The real image-understanding test is a separate **required live gate**, not a
+synthetic test. Offline inventory deselects it and records it as **UNMET**.
+After separate authorization for a paid vendor call and credential provisioning,
+run `uv run pytest --required-live -q`. Missing credentials fail closed, rather
+than silently skipping. Offline green does not satisfy that live requirement.
 Family discovery sorts semantic versions before snapshots, so multi-digit minor
 releases cannot be hidden from routing by lexical menu filtering.
 
