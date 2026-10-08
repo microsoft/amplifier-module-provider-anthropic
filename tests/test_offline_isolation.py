@@ -1354,9 +1354,9 @@ def test_constructor():
     asyncio.run(provider.client.close())
 """,
     )
-    assert result.returncode == 0, (
-        result.stdout + result.stderr,
+    assert result.returncode == 0, result.stdout + result.stderr + "\n" + json.dumps(
         [(attempt["event"], attempt["stack"]) for attempt in receipt["attempts"]],
+        indent=2,
     )
     assert receipt["attempts"] == []
     assert receipt["preimports"] == receipt["postimports"]
@@ -1382,9 +1382,10 @@ def test_cold_unmocked():
     )
     assert result.returncode == 1
     assert receipt["attempts"]
-    assert all(a["event"] == "socket.getaddrinfo" for a in receipt["attempts"]), [
-        (attempt["event"], attempt["stack"]) for attempt in receipt["attempts"]
-    ]
+    assert all(a["event"] == "socket.getaddrinfo" for a in receipt["attempts"]), json.dumps(
+        [(attempt["event"], attempt["stack"]) for attempt in receipt["attempts"]],
+        indent=2,
+    )
     assert any(
         r["when"] == "call" and r["outcome"] == "passed" for r in receipt["reports"]
     )
