@@ -88,8 +88,12 @@ remain unverified. Consequently **all Haiku 5.5 scalar costs are `None`**, not
 a guessed lower-tier amount or a legacy Haiku rate. Response metadata and the
 `llm:response` event expose
 `anthropic_cost_unavailable: haiku55_prompt_tier_unverified`; JSON cost is `null`.
-Aggregators that sum only known costs may show an unchanged or incomplete total:
-that is not proof of a free call. Costs do not determine model discovery ranking.
+The provider's registered `session.cost` contribution reports `cost_usd: null`
+after any unknown-cost call, including when later calls have known costs. Its
+known subtotal is not reported as a complete total. External consumers that sum
+only known costs may still show an unchanged or incomplete total: provider
+accounting alone does not establish consumer/UI completeness or a free call.
+Costs do not determine model discovery ranking.
 Sonnet 5.5's documented fixed ID uses its reduced $0.10/MTok cache-read rate;
 existing per-TTL write accounting and legacy model prices remain unchanged.
 

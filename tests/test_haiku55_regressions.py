@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock
 import httpx2
 import pytest
 from anthropic import AsyncAnthropic
-from amplifier_core.llm_errors import InvalidRequestError
+from amplifier_core import ModuleCoordinator
+from amplifier_core.llm_errors import ContextLengthError, InvalidRequestError, ProviderUnavailableError
 from amplifier_core.message_models import (
     ChatRequest,
     ImageBlock,
@@ -21,9 +22,10 @@ from amplifier_core.message_models import (
     ToolSpec,
 )
 
-from amplifier_module_provider_anthropic import AnthropicProvider, _RuntimeModelInfo
+from amplifier_module_provider_anthropic import AnthropicProvider, _RuntimeModelInfo, mount
 from amplifier_module_provider_anthropic._cost import compute_cost
 from tests._helpers import FakeCoordinator
+import amplifier_module_provider_anthropic as provider_module
 
 MODEL = "claude-haiku-5-5"
 
@@ -509,6 +511,515 @@ def test_real_sdk_create_count_models_usage_and_json(model):
     asyncio.run(run())
 
 
+def recording_client(seen, *, zero_usage=False):
+    """Real SDK transport; every endpoint is synthetic and recorded."""
+    def handler(req):
+        body = json.loads(req.content) if req.content else {}
+        seen.append((req.method, req.url.path, body))
+        if req.url.path.startswith("/v1/models"):
+            model = req.url.path.rsplit("/", 1)[-1]
+            return httpx2.Response(200, json={
+                "id": model, "type": "model", "display_name": model,
+                "created_at": "2026-10-07T00:00:00Z",
+                "max_input_tokens": 1_000_000, "max_tokens": 64_000,
+            })
+        if req.url.path.endswith("/count_tokens"):
+            return httpx2.Response(200, json={"input_tokens": 321})
+        response = sdk_body(body.get("model", MODEL))
+        if zero_usage:
+            response["usage"] = {"input_tokens": 0, "output_tokens": 0}
+        return httpx2.Response(200, json=response)
+
+    return AsyncAnthropic(
+        api_key="offline-placeholder", max_retries=0,
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+    )
+
+
+@pytest.mark.parametrize("models,zero", [
+    (["claude-sonnet-5-5", MODEL, "claude-sonnet-5-5"], False),
+    ([MODEL, "claude-sonnet-5-5"], False),
+    ([MODEL], False),
+    (["claude-sonnet-5-5", MODEL], True),
+])
+def test_public_mount_cost_contribution_stays_unknown(models, zero):
+    async def run():
+        coordinator = ModuleCoordinator()
+        cleanup = await mount(coordinator, {
+            "api_key": "offline-placeholder", "default_model": MODEL,
+            "use_streaming": False, "enable_prompt_caching": False, "max_retries": 0,
+        })
+        p = coordinator.get("providers", "anthropic")
+        seen = []
+        p._client = recording_client(seen, zero_usage=zero)
+        try:
+            assert await coordinator.collect_contributions("session.cost") == []
+            unknown = False
+            subtotal = Decimal("0")
+            for model in models:
+                response = await p.complete(request(), model=model)
+                if model == MODEL:
+                    unknown = True
+                    assert response.usage.cost_usd is None
+                    assert response.metadata["anthropic_cost_unavailable"] == (
+                        "haiku55_prompt_tier_unverified"
+                    )
+                else:
+                    assert response.usage.cost_usd is not None
+                    subtotal += response.usage.cost_usd
+                contributions = await coordinator.collect_contributions("session.cost")
+                assert contributions == [{"cost_usd": None if unknown else str(subtotal)}]
+                assert json.loads(json.dumps(contributions)) == contributions
+        finally:
+            await cleanup()
+    asyncio.run(run())
+
+
+def missing_history(*, prefill=False):
+    rows = [
+        Message(role="system", content="synthetic system", metadata={"nested": [1]}),
+        Message(role="user", content="hello", metadata={"nested": {"value": [2]}}),
+        Message(role="assistant", content=[
+            ThinkingBlock(thinking="", signature="synthetic-empty-original"),
+            TextBlock(text="checking"),
+            ThinkingBlock(thinking="synthetic", signature="synthetic-interleaved"),
+            ToolCallBlock(id="call_missing", name="lookup", input={"nested": [3]}),
+        ]),
+        Message(role="user", content="continue"),
+    ]
+    if prefill:
+        rows.append(Message(role="assistant", content=[
+            ThinkingBlock(thinking="", signature="synthetic-prefill-original"),
+            TextBlock(text="{"),
+        ]))
+    return request(messages=rows, tools=[tool()], metadata={"nested": {"value": [4]}})
+
+
+@pytest.mark.parametrize("operation", ["complete", "request_budget"])
+@pytest.mark.parametrize("source", ["direct", "expert", "nested-expert"])
+@pytest.mark.parametrize("config,options", [
+    ({"thinking_budget_tokens": 4096}, {}),
+    ({}, {"thinking_budget_tokens": "invalid"}),
+    ({}, {"thinking_type": "enabled"}),
+    ({}, {"thinking_type": "between_tools"}),
+    ({"extended_thinking": False}, {"effort": "max"}),
+    ({"extended_thinking": False}, {"effort": "xhigh"}),
+    ({"extra_request_params": {"thinking": None}}, {}),
+    ({"extra_request_params": {"thinking": {"type": "between_tools"}}}, {}),
+    ({"extra_request_params": {"thinking": {"type": "adaptive", "budget_tokens": 1}}}, {}),
+    ({"extra_request_params": {"temperature": 0.2}}, {}),
+    ({"extra_request_params": {"extra_body": {"top_p": 0.9}}}, {}),
+    ({"extra_request_params": {"top_k": 2}}, {}),
+    ({"extra_request_params": {"budget_tokens": 1024}}, {}),
+    ({"extra_request_params": {"output_config": {"effort": "unsupported"}}}, {}),
+    ({"extra_request_params": {"tools": [{"type": "computer_toolset_20260801"}]}}, {}),
+    ({"extra_request_params": {"extra_body": {"tools": [{"type": "computer_20250124"}]}}}, {}),
+    ({"extra_request_params": {"messages": [{"role": "assistant", "content": "{"}]}}, {}),
+])
+def test_invalid_public_envelope_has_zero_transport_and_no_repair(
+    operation, source, config, options
+):
+    async def run():
+        config_copy = deepcopy(config)
+        extra = config_copy.setdefault("extra_request_params", {})
+        if source == "expert":
+            extra["model"] = MODEL
+        elif source == "nested-expert":
+            extra.setdefault("extra_body", {})["model"] = MODEL
+        p = provider(
+            default_model=MODEL if source == "direct" else "claude-haiku-4-5",
+            **config_copy,
+        )
+        req = missing_history()
+        before = req.model_dump_json()
+        config_before = deepcopy(p.config)
+        options_before = deepcopy(options)
+        prefix_before = deepcopy(p._prefix_fingerprints)
+        seen = []
+        p._client = recording_client(seen)
+        try:
+            with pytest.raises(InvalidRequestError, match="claude-haiku-5-5"):
+                if operation == "complete":
+                    await p.complete(req, **options)
+                else:
+                    await p.request_budget(req, context_estimate=100, request_options=options)
+            assert seen == []  # Includes Models GET, not only generation/count.
+            assert req.model_dump_json() == before
+            assert p.config == config_before and options == options_before
+            assert p._repaired_tool_ids == set()
+            assert p._prefix_fingerprints == prefix_before
+            assert p._extra_params_warned_keys == set()
+            assert p._runtime_model_info_cache == {}
+            assert p.coordinator.hooks.events == []
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("source", ["direct", "expert", "nested-expert"])
+def test_signed_prefill_refused_before_client_or_caller_mutation(
+    streaming, missing, source, monkeypatch
+):
+    seen = []
+    created = []
+    def offline_factory(*args, **kwargs):
+        created.append(True)
+        return recording_client(seen)
+    monkeypatch.setattr(provider_module, "AsyncAnthropic", offline_factory)
+    extra = (
+        {"model": MODEL} if source == "expert" else
+        {"extra_body": {"model": MODEL}} if source == "nested-expert" else {}
+    )
+    p = provider(
+        use_streaming=streaming,
+        default_model=MODEL if source == "direct" else "claude-haiku-4-5",
+        extra_request_params=extra,
+    )
+    req = missing_history(prefill=True)
+    if not missing:
+        req.messages.insert(3, Message(
+            role="tool", tool_call_id="call_missing", content="synthetic result",
+        ))
+    before = req.model_dump_json()
+    async def run():
+        try:
+            with pytest.raises(InvalidRequestError, match="prefill.*structured"):
+                await p.complete(req)
+            assert p._client is None and created == []
+            assert seen == []
+            assert req.model_dump_json() == before
+            assert not p._repaired_tool_ids
+            assert p.coordinator.hooks.events == []
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+def test_accepted_haiku_repairs_a_copy_on_each_public_call():
+    async def run():
+        p = provider()
+        seen = []
+        p._client = recording_client(seen)
+        req = missing_history()
+        before = req.model_dump_json()
+        try:
+            for _ in range(2):
+                await p.request_budget(req, context_estimate=200_000)
+                await p.complete(req)
+                assert req.model_dump_json() == before
+                body = [body for _, path, body in seen if path == "/v1/messages"][-1]
+                blocks = body["messages"][1]["content"]
+                assert blocks[0] == {
+                    "type": "thinking", "thinking": "", "signature": "synthetic-empty-original",
+                }
+                assert blocks[2]["signature"] == "synthetic-interleaved"
+                result = body["messages"][2]["content"][0]
+                assert result["type"] == "tool_result"
+                assert result["tool_use_id"] == "call_missing"
+                assert "SYSTEM ERROR" in result["content"]
+                count = [body for _, path, body in seen if path.endswith("/count_tokens")][-1]
+                assert count["messages"] == body["messages"]
+            assert p._repaired_tool_ids == set()
+            assert len([e for e, _ in p.coordinator.hooks.events
+                        if e == "provider:tool_sequence_repaired"]) == 2
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("legacy", ["claude-haiku-4-5", "claude-sonnet-5-5"])
+def test_request_local_repairs_do_not_suppress_later_legacy_repair(legacy):
+    async def run():
+        p = provider()
+        seen = []
+        p._client = recording_client(seen)
+        req = missing_history()
+        before = req.model_dump_json()
+        try:
+            await p.complete(req)
+            assert req.model_dump_json() == before
+            await p.complete(req, model=legacy)
+            bodies = [body for _, path, body in seen if path == "/v1/messages"]
+            for body in bodies:
+                assert body["messages"][2]["content"][0]["tool_use_id"] == "call_missing"
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mutate", [False, True])
+def test_repaired_haiku_overflow_is_bound_to_unchanged_public_request(mutate):
+    async def run():
+        p = provider()
+        def handler(req):
+            if req.method == "GET":
+                return httpx2.Response(404, json={"error": {"type": "not_found_error"}})
+            return httpx2.Response(
+                400, headers={"request-id": "synthetic-overflow"},
+                json={"type": "error", "error": {
+                    "type": "invalid_request_error",
+                    "message": "prompt is too long: 208310 tokens > 200000 maximum",
+                }},
+            )
+        p._client = AsyncAnthropic(
+            api_key="offline-placeholder", max_retries=0,
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+        )
+        req = missing_history()
+        before = req.model_dump_json()
+        try:
+            with pytest.raises(ContextLengthError) as raised:
+                await p.complete(req)
+            assert req.model_dump_json() == before
+            if mutate:
+                req.messages[1].content = "changed"
+            decision = p.recover_context_overflow(req, raised.value, context_estimate=200_000)
+            if mutate:
+                assert decision is None
+            else:
+                assert decision is not None
+                assert decision["estimated_input_tokens"] == 208310
+                assert 0 < decision["context_token_budget"] < 200_000
+            assert p.recover_context_overflow(
+                req, raised.value, context_estimate=200_000,
+            ) is None
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_valid_expert_haiku_uses_runtime_caps_and_canonical_count_dispatch(nested):
+    async def run():
+        wire = {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "synthetic override"}],
+            "system": [{"type": "text", "text": "synthetic system"}],
+            "tools": [{"name": "computer", "input_schema": {"type": "object", "properties": {}}}],
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "low"},
+            "max_tokens": 900_000,
+        }
+        extra = {"extra_body": wire} if nested else wire
+        p = provider(default_model="claude-haiku-4-5", extra_request_params=extra)
+        seen = []
+        p._client = recording_client(seen)
+        req = request(max_output_tokens=123)
+        before = req.model_dump_json()
+        extra_before = deepcopy(extra)
+        try:
+            # Cold count stays pure; dispatch still retrieves real SDK metadata.
+            cold = await p.request_budget(req, context_estimate=200_000)
+            assert cold["max_output_tokens"] == 123
+            assert cold["estimated_input_tokens"] == 321 + 4096
+            await p.complete(req)
+            warm = await p.request_budget(request(), context_estimate=200_000)
+            assert warm["input_limit_tokens"] == 1_000_000
+            assert warm["max_output_tokens"] == 64_000
+            await p.complete(request())
+            assert [path for method, path, _ in seen if method == "GET"] == [
+                "/v1/models/claude-haiku-5-5",
+            ]
+            bodies = [body for _, path, body in seen if path == "/v1/messages"]
+            counts = [body for _, path, body in seen if path.endswith("/count_tokens")]
+            for body, count, cap in zip(bodies, counts, [123, 64_000], strict=True):
+                assert body["max_tokens"] == cap
+                assert "max_tokens" not in count
+                for key in ("model", "messages", "system", "tools", "thinking", "output_config"):
+                    assert body[key] == count[key] == wire[key]
+            assert req.model_dump_json() == before and extra == extra_before
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+def test_public_forced_tool_then_adaptive_preserves_signed_history():
+    async def run():
+        p = provider()
+        seen = []
+        p._client = recording_client(seen)
+        first = request(tools=[tool()], tool_choice="required", reasoning_effort="max")
+        followup = missing_history()
+        followup.messages.insert(3, Message(
+            role="tool", tool_call_id="call_missing", content="synthetic result",
+        ))
+        originals = [req.model_dump_json() for req in (first, followup)]
+        try:
+            await p.complete(first)
+            await p.complete(followup)
+            bodies = [body for _, path, body in seen if path == "/v1/messages"]
+            assert "thinking" not in bodies[0]
+            assert bodies[0]["output_config"] == {"effort": "max"}
+            assert bodies[1]["thinking"]["type"] == "adaptive"
+            assert bodies[1]["messages"][1]["content"][0]["signature"] == "synthetic-empty-original"
+            assert [req.model_dump_json() for req in (first, followup)] == originals
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["complete", "request_budget"])
+@pytest.mark.parametrize("config", [
+    {"thinking_budget_tokens": 1},
+    {"extra_request_params": {"top_k": 2}},
+    {"extra_request_params": {"thinking": None}},
+    {"extra_request_params": {"tools": [{"type": "computer_toolset_20260801"}]}},
+])
+def test_other_cold_refusals_never_construct_client(operation, config, monkeypatch):
+    created = []
+    seen = []
+    def offline_factory(*args, **kwargs):
+        created.append(True)
+        return recording_client(seen)
+    monkeypatch.setattr(provider_module, "AsyncAnthropic", offline_factory)
+    p = provider(**config)
+    async def run():
+        try:
+            with pytest.raises(InvalidRequestError):
+                if operation == "complete":
+                    await p.complete(missing_history())
+                else:
+                    await p.request_budget(missing_history(), context_estimate=100)
+            assert p._client is None and created == [] and seen == []
+            assert not p._repaired_tool_ids and not p.coordinator.hooks.events
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["complete", "request_budget"])
+def test_refusal_with_populated_cache_state_is_side_effect_free(operation):
+    async def run():
+        p = provider(enable_prompt_caching=True)
+        seen = []
+        p._client = recording_client(seen)
+        try:
+            await p.complete(request())
+            assert p._prefix_fingerprints
+            prefix_before = deepcopy(p._prefix_fingerprints)
+            runtime_before = deepcopy(p._runtime_model_info_cache)
+            seen.clear()
+            p.coordinator.hooks.events.clear()
+            req = missing_history(prefill=True)
+            before = req.model_dump_json()
+            with pytest.raises(InvalidRequestError, match="prefill"):
+                if operation == "complete":
+                    await p.complete(req)
+                else:
+                    await p.request_budget(req, context_estimate=100)
+            assert req.model_dump_json() == before
+            assert p._prefix_fingerprints == prefix_before
+            assert p._runtime_model_info_cache == runtime_before
+            assert not seen and not p.coordinator.hooks.events and not p._repaired_tool_ids
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("tool_type", [
+    "computer_20241022", "computer_20250124", "computer_20251124", "computer_toolset_20260801",
+])
+def test_native_request_tools_refused_without_transport(tool_type):
+    async def run():
+        p = provider()
+        seen = []
+        p._client = recording_client(seen)
+        native = tool()
+        setattr(native, "type", tool_type)
+        req = request(tools=[native])
+        before = req.model_dump_json()
+        try:
+            for operation in ("complete", "request_budget"):
+                with pytest.raises(InvalidRequestError, match="executor qualification"):
+                    if operation == "complete":
+                        await p.complete(req)
+                    else:
+                        await p.request_budget(req, context_estimate=100)
+                assert seen == [] and req.model_dump_json() == before
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("model,config,expected", [
+    (
+        "claude-haiku-4-5", {"extended_thinking": True, "thinking_type": "enabled"},
+        {"type": "enabled", "budget_tokens": 32_000},
+    ),
+    (
+        "claude-sonnet-5-5", {"extra_request_params": {"thinking": {"type": "between_tools"}}},
+        {"type": "between_tools"},
+    ),
+    (
+        MODEL, {"extended_thinking": False}, {"type": "disabled"},
+    ),
+])
+def test_public_sibling_thinking_modes_remain_distinct(model, config, expected):
+    async def run():
+        p = provider(default_model=model, **config)
+        seen = []
+        p._client = recording_client(seen)
+        try:
+            await p.complete(request(tools=[tool()]))
+            body = [body for _, path, body in seen if path == "/v1/messages"][-1]
+            assert body["thinking"] == expected
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("outcome", ["refusal", "overload"])
+@pytest.mark.parametrize("overload_fallback", [False, True])
+def test_effective_expert_haiku_stays_on_terminal_fallback_rung(
+    nested, outcome, overload_fallback, monkeypatch
+):
+    monkeypatch.setattr(provider_module, "_fallback_windows", {})
+    async def run():
+        extra = {"extra_body": {"model": MODEL}} if nested else {"model": MODEL}
+        p = provider(
+            default_model="claude-sonnet-5-5", extra_request_params=extra,
+            fallback_on_overload=overload_fallback, fallback_retry_count=0,
+        )
+        seen = []
+        def handler(req):
+            body = json.loads(req.content) if req.content else {}
+            seen.append((req.method, req.url.path, body))
+            if req.method == "GET":
+                return httpx2.Response(404, json={"error": {"type": "not_found_error"}})
+            if outcome == "overload":
+                return httpx2.Response(529, json={"type": "error", "error": {
+                    "type": "overloaded_error", "message": "synthetic overload",
+                }})
+            return httpx2.Response(200, json=sdk_body(stop="refusal"))
+        p._client = AsyncAnthropic(
+            api_key="offline-placeholder", max_retries=0,
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+        )
+        req = missing_history()
+        req.messages.insert(3, Message(
+            role="tool", tool_call_id="call_missing", content="synthetic result",
+        ))
+        before = req.model_dump_json()
+        try:
+            if outcome == "overload":
+                with pytest.raises(ProviderUnavailableError):
+                    await p.complete(req)
+            else:
+                assert (await p.complete(req)).finish_reason == "refusal"
+            bodies = [body for _, path, body in seen if path == "/v1/messages"]
+            assert len(bodies) == 1
+            assert bodies[0]["model"] == MODEL
+            assert bodies[0]["messages"][1]["content"][0]["signature"] == "synthetic-empty-original"
+            assert req.model_dump_json() == before
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize(
     "stop,blocks",
     [
@@ -537,7 +1048,7 @@ def test_real_sdk_create_count_models_usage_and_json(model):
         ("refusal", [{"type": "text", "text": "cannot comply"}]),
     ],
 )
-def test_real_sdk_stream_order_signatures_private_text_and_stop(stop, blocks):
+def test_real_sdk_stream_order_signatures_private_text_and_stop(stop, blocks, streaming):
     events = []
     initial = sdk_body(content=[], stop=None)
     events.append({"type": "message_start", "message": initial})
@@ -585,7 +1096,7 @@ def test_real_sdk_stream_order_signatures_private_text_and_stop(stop, blocks):
     )
 
     async def run():
-        p = provider(use_streaming=True, refusal_fallback_enabled=False)
+        p = provider(use_streaming=streaming, refusal_fallback_enabled=False)
         p._client = AsyncAnthropic(
             api_key="offline-placeholder",
             max_retries=0,
@@ -593,8 +1104,12 @@ def test_real_sdk_stream_order_signatures_private_text_and_stop(stop, blocks):
                 transport=httpx2.MockTransport(
                     lambda req: httpx2.Response(
                         200,
-                        headers={"content-type": "text/event-stream"},
-                        content=sse.encode(),
+                        **(
+                            {
+                                "headers": {"content-type": "text/event-stream"},
+                                "content": sse.encode(),
+                            } if streaming else {"json": sdk_body(content=blocks, stop=stop)}
+                        ),
                     )
                 )
             ),

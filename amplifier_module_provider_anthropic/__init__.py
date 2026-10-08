@@ -783,12 +783,15 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     """
     config = config or {}
 
-    _totals: dict = {"cost_usd": None, "has_data": False}
+    _totals: dict = {"cost_usd": None, "has_data": False, "unknown_cost": False}
 
     def _add_cost(cost) -> None:
+        _totals["has_data"] = True
         if cost is not None:
             _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + cost
-            _totals["has_data"] = True
+        else:
+            # Keep the known subtotal private; it is not a complete session cost.
+            _totals["unknown_cost"] = True
 
     # Get API key from config or environment
     api_key = config.get("api_key")
@@ -807,7 +810,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         lambda: (
             {
                 "cost_usd": str(_totals["cost_usd"])
-                if _totals["cost_usd"] is not None
+                if _totals["cost_usd"] is not None and not _totals["unknown_cost"]
                 else None
             }
             if _totals["has_data"]
@@ -3050,7 +3053,7 @@ class AnthropicProvider:
             pass  # Never crash on I/O errors
 
     def _find_missing_tool_results(
-        self, messages: list[Message]
+        self, messages: list[Message], *, include_repaired: bool = False
     ) -> list[tuple[int, str, str, dict]]:
         """Find tool calls without matching results.
 
@@ -3058,8 +3061,9 @@ class AnthropicProvider:
         a corresponding tool result message. Returns missing pairs WITH their
         source message index so they can be inserted in the correct position.
 
-        Excludes tool call IDs that have already been repaired with synthetic
-        results to prevent infinite detection loops.
+        By default excludes IDs already repaired to prevent legacy detection
+        loops. Request-local repairs must include them because the caller's
+        canonical history deliberately never contains the synthetic results.
 
         Returns:
             List of (msg_index, call_id, tool_name, tool_arguments) tuples for unpaired calls.
@@ -3085,7 +3089,8 @@ class AnthropicProvider:
         return [
             (msg_idx, call_id, name, args)
             for call_id, (msg_idx, name, args) in tool_calls.items()
-            if call_id not in tool_results and call_id not in self._repaired_tool_ids
+            if call_id not in tool_results
+            and (include_repaired or call_id not in self._repaired_tool_ids)
         ]
 
     def _create_synthetic_result(self, call_id: str, tool_name: str) -> Message:
@@ -3154,8 +3159,17 @@ class AnthropicProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
+        # Reject the effective Haiku envelope before repair, hooks, or transport.
+        validation_options = dict(kwargs)
+        if self._fallback_on_overload:
+            validation_options["model"], _ = self._resolve_effective_model(
+                str(kwargs.get("model", self.default_model))
+            )
+        is_haiku55 = self._prevalidate_haiku55_request(request, validation_options)
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
-        missing = self._find_missing_tool_results(request.messages)
+        missing = self._find_missing_tool_results(
+            request.messages, include_repaired=is_haiku55
+        )
 
         if missing:
             logger.warning(
@@ -3164,28 +3178,11 @@ class AnthropicProvider:
                 f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
             )
 
-            # Group missing results by source assistant message index
-            # We need to insert synthetic results IMMEDIATELY after each assistant message
-            # that contains tool_use blocks (not at the end of the list)
-            from collections import defaultdict
-
-            by_msg_idx: dict[int, list[tuple[str, str]]] = defaultdict(list)
-            for msg_idx, call_id, tool_name, _ in missing:
-                by_msg_idx[msg_idx].append((call_id, tool_name))
-
-            # Insert synthetic results in reverse order of message index
-            # (so earlier insertions don't shift later indices)
-            for msg_idx in sorted(by_msg_idx.keys(), reverse=True):
-                synthetics = []
-                for call_id, tool_name in by_msg_idx[msg_idx]:
-                    synthetics.append(self._create_synthetic_result(call_id, tool_name))
-                    # Track this ID so we don't detect it as missing again in future iterations
-                    self._repaired_tool_ids.add(call_id)
-
-                # Insert all synthetic results immediately after the assistant message
-                insert_pos = msg_idx + 1
-                for i, synthetic in enumerate(synthetics):
-                    request.messages.insert(insert_pos + i, synthetic)
+            if not is_haiku55:
+                # Preserve legacy repair/suppression semantics. Haiku's sole
+                # assembler instead repairs a private copy for count/dispatch.
+                self._insert_synthetic_tool_results(request, missing)
+                self._repaired_tool_ids.update(call_id for _, call_id, _, _ in missing)
 
             # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3206,11 +3203,15 @@ class AnthropicProvider:
             return await self._apply_refusal_fallback(
                 response,
                 request,
-                str(kwargs.get("model", self.default_model)),
+                "claude-haiku-5-5" if is_haiku55
+                else str(kwargs.get("model", self.default_model)),
                 **kwargs,
             )
 
-        requested_model = str(kwargs.get("model", self.default_model))
+        requested_model = (
+            "claude-haiku-5-5" if is_haiku55
+            else str(kwargs.get("model", self.default_model))
+        )
         attempted_models: set[str] = set()
         full_retry_budget_used: set[str] = set()
 
@@ -3486,7 +3487,12 @@ class AnthropicProvider:
         """
         if not self.extra_request_params:
             return
+        haiku55 = self._is_haiku55_request({"model": params.get("model")})
         for key, value in self.extra_request_params.items():
+            if haiku55 and key == "extra_body":
+                # Merge explicit wire fields last below. Replacing this dict
+                # mid-loop can otherwise drop forbidden sampling/budget keys.
+                continue
             if key in _TYPED_REQUEST_PARAMS:
                 if (
                     emit_warnings
@@ -3510,6 +3516,11 @@ class AnthropicProvider:
                     value
                 )  # user-wins: overwrite, NOT setdefault
                 params["extra_body"] = extra_body
+        if haiku55 and self.extra_request_params.get("extra_body"):
+            params["extra_body"] = {
+                **dict(params.get("extra_body") or {}),
+                **copy.deepcopy(self.extra_request_params["extra_body"]),
+            }
 
     @staticmethod
     def _fingerprint(value: Any) -> str | None:
@@ -3616,6 +3627,46 @@ class AnthropicProvider:
             params.pop("extra_body", None)
         params["max_tokens"] = min(params["max_tokens"], 128000)
 
+    def _is_haiku55_request(self, options: Mapping[str, Any]) -> bool:
+        """Resolve model shadowing exactly as the SDK's merged wire does."""
+        model = self.extra_request_params.get(
+            "model", options.get("model", self.default_model)
+        )
+        extra_body = self.extra_request_params.get("extra_body")
+        if isinstance(extra_body, dict):
+            model = extra_body.get("model", model)
+        return model == "claude-haiku-5-5"
+
+    def _prevalidate_haiku55_request(
+        self, request: ChatRequest, options: Mapping[str, Any]
+    ) -> bool:
+        """Reuse the sole assembler/validator without client or state commits."""
+        if not self._is_haiku55_request(options):
+            return False
+        caps = self._apply_runtime_capability_overrides(
+            self._get_capabilities("claude-haiku-5-5"),
+            self._runtime_model_info_cache.get("claude-haiku-5-5"),
+        )
+        self._assemble_request_params(
+            request, request_options=options, request_caps=caps,
+            repair_tool_results=False,
+        )
+        return True
+
+    def _insert_synthetic_tool_results(
+        self, request: ChatRequest, missing: list[tuple[int, str, str, dict]]
+    ) -> None:
+        """Insert into a prepared request; bookkeeping stays with the caller."""
+        by_msg_idx: dict[int, list[tuple[str, str]]] = {}
+        for msg_idx, call_id, tool_name, _ in missing:
+            by_msg_idx.setdefault(msg_idx, []).append((call_id, tool_name))
+        for msg_idx in sorted(by_msg_idx, reverse=True):
+            synthetics = [
+                self._create_synthetic_result(call_id, tool_name)
+                for call_id, tool_name in by_msg_idx[msg_idx]
+            ]
+            request.messages[msg_idx + 1:msg_idx + 1] = synthetics
+
     def _assemble_request_params(
         self,
         request: ChatRequest,
@@ -3624,6 +3675,7 @@ class AnthropicProvider:
         request_caps: ModelCapabilities,
         prefix_state: OrderedDict[str, tuple[list[str], int | None]] | None = None,
         emit_diagnostics: bool = False,
+        repair_tool_results: bool = True,
     ) -> _RequestAssembly | None:
         """Synchronously assemble the sole Anthropic wire representation.
 
@@ -3634,6 +3686,28 @@ class AnthropicProvider:
         """
         options = dict(request_options)
         effective_model = options.get("model", self.default_model)
+        if self._is_haiku55_request(options):
+            # Expert model overrides must use Haiku controls, not the original
+            # model's sampling/manual-thinking defaults.
+            effective_model = options["model"] = "claude-haiku-5-5"
+            request_caps = self._apply_runtime_capability_overrides(
+                self._get_capabilities(effective_model),
+                self._runtime_model_info_cache.get(effective_model),
+            )
+            if repair_tool_results:
+                missing = self._find_missing_tool_results(
+                    request.messages, include_repaired=True
+                )
+                if missing:
+                    # Validate the ORIGINAL final envelope first: repairing an
+                    # assistant-ending tool call must not make prefill valid.
+                    self._assemble_request_params(
+                        request, request_options=options, request_caps=request_caps,
+                        prefix_state=OrderedDict(prefix_state) if prefix_state is not None else None,
+                        repair_tool_results=False,
+                    )
+                    request = request.model_copy(deep=True)
+                    self._insert_synthetic_tool_results(request, missing)
         if not isinstance(effective_model, str):
             return None
         try:
@@ -4155,8 +4229,9 @@ class AnthropicProvider:
         _route_wire_only_params(params)
         self._validate_haiku55_request(params, options)
         if params.get("model") == "claude-haiku-5-5":
+            params["max_tokens"] = min(params["max_tokens"], model_ceiling)
             if request.max_output_tokens is not None:
-                params["max_tokens"] = min(request.max_output_tokens, 128000)
+                params["max_tokens"] = min(request.max_output_tokens, model_ceiling, 128000)
             thinking_enabled = params.get("thinking", {}).get("type") == "adaptive"
         return _RequestAssembly(
             params=params,
@@ -4171,9 +4246,14 @@ class AnthropicProvider:
     @staticmethod
     def _count_tokens_params(params: Mapping[str, Any]) -> dict[str, Any]:
         """Project assembled dispatch params to the count endpoint's schema."""
+        keys = _COUNT_TOKENS_PARAM_KEYS
+        if params.get("model") == "claude-haiku-5-5":
+            # Both supported SDK versions accept output_config on count_tokens.
+            # Keep Haiku's effective effort/format envelope aligned with dispatch.
+            keys = keys | {"output_config"}
         return {
             key: params[key]
-            for key in _COUNT_TOKENS_PARAM_KEYS
+            for key in keys
             if key in params
         }
 
@@ -4204,7 +4284,11 @@ class AnthropicProvider:
         ):
             return None
         options = dict(request_options or {})
-        caps = self._budget_capabilities_for(options.get("model", self.default_model))
+        budget_model = (
+            "claude-haiku-5-5" if self._is_haiku55_request(options)
+            else options.get("model", self.default_model)
+        )
+        caps = self._budget_capabilities_for(budget_model)
         if caps is None:
             return None
         assembly = self._assemble_request_params(
@@ -4295,7 +4379,10 @@ class AnthropicProvider:
             return None
         if self._fingerprint(options) != feedback.options_fingerprint:
             return None
-        caps = self._budget_capabilities_for(options.get("model", self.default_model))
+        caps = self._budget_capabilities_for(
+            "claude-haiku-5-5" if self._is_haiku55_request(options)
+            else options.get("model", self.default_model)
+        )
         if caps is None:
             return None
         assembly = self._assemble_request_params(
@@ -4352,6 +4439,8 @@ class AnthropicProvider:
         )
 
         effective_model = kwargs.get("model", self.default_model)
+        if self._prevalidate_haiku55_request(request, kwargs):
+            effective_model = "claude-haiku-5-5"
         request_caps = await self._get_request_capabilities(effective_model)
         if (
             effective_model in _DEPRECATED_MODELS
