@@ -1,4 +1,4 @@
-"""Regressions for synthetic fixture scope and irreversible offline guard."""
+"""Regressions for synthetic fixture scope and trusted-test network denial."""
 
 import asyncio
 import json
@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx2
 import pytest
 from anthropic import AsyncAnthropic
+from anthropic._base_client import AsyncHttpxClientWrapper
+from httpx2._utils import URLPattern
 
 from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
@@ -121,6 +123,91 @@ def test_explicit_transport_metadata_and_errors_remain_authoritative(
                 assert cold.base_context_window == 654321
                 assert cold.max_output_tokens == 4321
                 assert cold.supports_adaptive_thinking
+            else:
+                assert cold == provider._get_capabilities(MODEL)
+                assert provider._runtime_model_info_cache[MODEL] is None
+        finally:
+            await provider.client.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("status", [200, 404, 500])
+@pytest.mark.parametrize(
+    "override", ["supplied_wrapper", "replaced_client", "replaced_transport", "mount"]
+)
+def test_same_type_http_overrides_remain_authoritative(
+    status, override, monkeypatch, offline_messages_metadata
+):
+    async def run():
+        provider = AnthropicProvider("synthetic-offline-credential", {})
+        transport = httpx2.AsyncHTTPTransport()
+        send = AsyncMock(
+            return_value=httpx2.Response(
+                status,
+                json=(
+                    {
+                        "id": MODEL,
+                        "type": "model",
+                        "display_name": "Synthetic caller-owned metadata",
+                        "created_at": "1970-01-01T00:00:00Z",
+                        "lifecycle": "active",
+                        "max_input_tokens": 654321,
+                        "max_tokens": 4321,
+                    }
+                    if status == 200
+                    else {
+                        "type": "error",
+                        "error": {"type": "not_found_error", "message": "Synthetic"},
+                    }
+                ),
+            )
+        )
+        # Exercise the actual SDK metadata request without Python networking.
+        monkeypatch.setattr(transport, "handle_async_request", send)
+        if override == "supplied_wrapper":
+            await provider.client.close()
+            provider._client = AsyncAnthropic(
+                api_key="synthetic-offline-credential",
+                max_retries=0,
+                http_client=AsyncHttpxClientWrapper(
+                    transport=transport, trust_env=False
+                ),
+            )
+        elif override == "replaced_client":
+            await provider.client._client.aclose()
+            provider.client._client = AsyncHttpxClientWrapper(
+                transport=transport, trust_env=False
+            )
+        elif override == "replaced_transport":
+            await provider.client._client._transport.aclose()
+            provider.client._client._transport = transport
+        else:
+            provider.client._client._mounts[URLPattern("https://api.anthropic.com")] = (
+                transport
+            )
+        provider.client.messages.with_raw_response.create = AsyncMock()
+        try:
+            assert type(provider.client._client) is AsyncHttpxClientWrapper
+            selected_transport = provider.client._client._transport_for_url(
+                provider.client.base_url.join(f"models/{MODEL}")
+            )
+            assert selected_transport is transport
+            assert type(selected_transport) is httpx2.AsyncHTTPTransport
+            cold = await provider._get_request_capabilities(MODEL)
+            warm = await provider._get_request_capabilities(MODEL)
+            assert cold == warm
+            send.assert_awaited_once()
+            request = send.call_args.args[0]
+            assert (request.method, request.url.path) == (
+                "GET",
+                f"/v1/models/{MODEL}",
+            )
+            assert offline_messages_metadata == []
+            if status == 200:
+                assert cold.base_context_window == 654321
+                assert cold.max_output_tokens == 4321
+                assert provider._runtime_model_info_cache[MODEL] is not None
             else:
                 assert cold == provider._get_capabilities(MODEL)
                 assert provider._runtime_model_info_cache[MODEL] is None
@@ -282,7 +369,7 @@ def test_shutdown():
     assert receipt["attempts"][0]["phase_or_nodeid"] == "shutdown"
 
 
-def test_guard_cannot_be_removed_by_patching_public_audit_functions(tmp_path):
+def test_guard_still_records_after_public_audit_functions_are_mocked(tmp_path):
     result, receipt = _child(
         tmp_path,
         """

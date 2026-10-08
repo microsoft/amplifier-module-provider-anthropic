@@ -11,12 +11,15 @@ Run `uv run python -I -S tests/run_offline.py -q`. The runner sanitizes inherite
 credentials and installs a Python audit deny-and-record hook **before** site
 initialization, real Core/Foundation imports and pytest collection. Audited
 DNS/socket attempts and unguarded subprocesses fail the run, even when provider
-fallback catches the exception. This guards Python/SDK networking, not arbitrary
-native code outside Python's audit surface. Receipts are written to
+fallback catches the exception. This is isolation for **trusted tests**, not a
+tamper-proof security sandbox for hostile Python, forks or native code outside
+Python's audit surface. Receipts are written to
 `ai_working/tmp/offline-receipt.json`; they contain local source paths and are
 private diagnostics, not public CI artifacts.
 Messages-only unit mocks receive explicitly synthetic, unspecified Models
-metadata; explicit SDK transports and metadata/error mocks remain authoritative.
+metadata only with the SDK-constructed default HTTP client and unchanged
+transports. Explicit caller clients (even the same SDK wrapper/transport types),
+SDK transport overrides and metadata/error mocks remain authoritative.
 Inherited mount contracts use scoped nonfunctional credentials.
 
 The real image-understanding test is a separate **required live gate**, not a

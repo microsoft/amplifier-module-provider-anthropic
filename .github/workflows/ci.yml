@@ -36,6 +36,6 @@ jobs:
       - name: Install test integration dependency
         run: uv pip install "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@a34b770ca604b88230449ac728d41dc23a2863a9"
 
-      - name: Run guarded offline inventory
+      - name: Run trusted offline inventory (required live vision remains UNMET)
         # Real vision remains a separate UNMET gate, never a synthetic pass.
         run: uv run python -I -S tests/run_offline.py -q

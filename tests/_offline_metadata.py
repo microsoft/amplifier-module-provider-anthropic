@@ -8,9 +8,10 @@ leave the provider's existing static fallback policy in charge.
 from datetime import datetime, timezone
 from functools import wraps
 from unittest.mock import Mock
+from weakref import WeakKeyDictionary
 
 import httpx2
-from anthropic._base_client import AsyncHttpxClientWrapper
+from anthropic._base_client import AsyncAPIClient, AsyncHttpxClientWrapper
 from anthropic.resources.models import AsyncModels
 from anthropic.types import ModelInfo
 
@@ -32,18 +33,36 @@ def _messages_are_mocked(client):
 
 def install_metadata_stub(monkeypatch):
     """Patch only the cold SDK interface left open by messages-only mocks."""
+    original_init = AsyncAPIClient.__init__
     original = AsyncModels.retrieve
+    default_clients = WeakKeyDictionary()
     calls = []
+
+    @wraps(original_init)
+    def initialize(client, *args, **kwargs):
+        original_init(client, *args, **kwargs)
+        if kwargs.get("http_client") is None:
+            http_client = client._client
+            default_clients[client] = (
+                http_client,
+                http_client._transport,
+                dict(http_client._mounts),
+            )
 
     @wraps(original)
     async def retrieve(resource, model_id, *args, **kwargs):
         client = resource._client
         http_client = client._client
+        defaults = default_clients.get(client)
         transport = http_client._transport_for_url(
             client.base_url.join(f"models/{model_id}")
         )
         if (
-            type(http_client) is AsyncHttpxClientWrapper
+            defaults is not None
+            and http_client is defaults[0]
+            and http_client._transport is defaults[1]
+            and http_client._mounts == defaults[2]
+            and type(http_client) is AsyncHttpxClientWrapper
             and type(transport) is httpx2.AsyncHTTPTransport
             and _messages_are_mocked(client)
         ):
@@ -60,5 +79,7 @@ def install_metadata_stub(monkeypatch):
             )
         return await original(resource, model_id, *args, **kwargs)
 
+    # Class equality alone cannot distinguish an explicit same-type override.
+    monkeypatch.setattr(AsyncAPIClient, "__init__", initialize)
     monkeypatch.setattr(AsyncModels, "retrieve", retrieve)
     return calls

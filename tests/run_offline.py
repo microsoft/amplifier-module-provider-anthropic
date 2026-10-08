@@ -1,12 +1,13 @@
-"""Run the offline inventory with an irreversible pre-import network guard.
+"""Run trusted offline tests with a pre-import Python network guard.
 
 Provision dev dependencies plus amplifier-foundation, then:
     uv run python -I -S tests/run_offline.py -q
 
 Pytest arguments follow this script's optional --receipt PATH. The receipt
 contains the complete selected/deselected inventory, skips, warnings, imported
-source identities and denied OS network attempts. Offline success never meets
-the separate required real-vision gate.
+source identities and denied audited Python network attempts. This is test
+isolation, not a tamper-proof security sandbox for hostile Python or native code.
+Offline success never meets the separate required real-vision gate.
 """
 
 import argparse
@@ -23,7 +24,7 @@ import traceback
 
 
 def install_network_guard():
-    """Keep attempts in a private closure; no fixture can clear or waive them."""
+    """Retain audited attempts separately from provider/test exception handling."""
     attempts = []
     phase = ["preimports"]
 
@@ -41,7 +42,7 @@ def install_network_guard():
         if event == "subprocess.Popen":
             command = args[1]
             # Permit only this guarded runner in an isolated no-site child.
-            # Ordinary children cannot escape the parent's Python audit hook.
+            # Other subprocesses do not inherit this Python audit hook.
             expected = [sys.executable, "-I", "-S", str(Path(__file__).resolve())]
             unguarded_child = not (
                 isinstance(command, (list, tuple))
@@ -64,7 +65,7 @@ def install_network_guard():
                     ],
                 }
             )
-            raise PermissionError("Offline suite denied OS network attempt")
+            raise PermissionError("Offline suite denied audited Python operation")
 
     sys.addaudithook(audit)
 
@@ -155,7 +156,7 @@ def main():
             destination.write_text(json.dumps(receipt, indent=2) + "\n")
             if receipt["attempts"]:
                 print(
-                    "FAIL: denied OS attempts retained through shutdown.",
+                    "FAIL: denied audited Python attempts retained through shutdown.",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -244,6 +245,7 @@ def main():
             )
         )
         receipt["postimports"] = imported_identity()
+        print("UNMET: required real vision; offline success does not qualify it.")
     except Exception as exc:
         code = 1
         receipt["error"] = f"{type(exc).__name__}: {exc}"
@@ -254,7 +256,7 @@ def main():
         if receipt["attempts"]:
             code = 1
             print(
-                f"FAIL: {len(receipt['attempts'])} denied OS network attempts "
+                f"FAIL: {len(receipt['attempts'])} denied audited Python attempts "
                 "(including swallowed exceptions).",
                 file=sys.stderr,
             )
