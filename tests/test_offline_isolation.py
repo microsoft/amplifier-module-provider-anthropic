@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import ExitStack
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -689,6 +690,56 @@ def test_explicit_unavailable_metadata_mock_is_not_replaced(
     asyncio.run(run())
 
 
+def _child_environment(env=None):
+    isolated = {} if env is None else dict(env)
+    if sys.platform == "win32":
+        # Windows needs its OS bootstrap directory even for isolated Python.
+        # Do not inherit credentials, proxies, PATH or the parent's private HOME.
+        isolated = {
+            name: value for name, value in isolated.items()
+            if name.upper() != "SYSTEMROOT"
+        }
+        system_root = next(
+            (value for name, value in os.environ.items()
+             if name.upper() == "SYSTEMROOT" and value),
+            None,
+        )
+        if system_root is not None:
+            isolated["SYSTEMROOT"] = system_root
+    return isolated
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux", "darwin"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_owned_child_environment_keeps_only_windows_bootstrap(monkeypatch, platform, explicit):
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(os, "environ", {
+        "SystemRoot": r"C:\Windows",
+        "ANTHROPIC_API_KEY": "synthetic-parent-only",
+        "HTTP_PROXY": "http://synthetic.invalid",
+        "PATH": "synthetic-parent-path",
+        "HOME": "synthetic-parent-home",
+    })
+    supplied = {"CONTROLLED": "synthetic", "systemroot": "synthetic-wrong"} if explicit else None
+    original = None if supplied is None else dict(supplied)
+    expected = {} if supplied is None else dict(supplied)
+    if platform == "win32":
+        expected.pop("systemroot", None)
+        expected["SYSTEMROOT"] = r"C:\Windows"
+    assert _child_environment(supplied) == expected
+    assert supplied == original
+
+
+@pytest.mark.parametrize("system_root", [None, ""])
+def test_owned_child_environment_does_not_invent_windows_bootstrap(monkeypatch, system_root):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(os, "environ", {} if system_root is None else {"SYSTEMROOT": system_root})
+    assert _child_environment() == {}
+    assert _child_environment({"systemroot": "synthetic-wrong", "CONTROLLED": "synthetic"}) == {
+        "CONTROLLED": "synthetic"
+    }
+
+
 def _child(
     tmp_path,
     source,
@@ -717,7 +768,7 @@ def _child(
         ],
         executable=sys.executable,
         # No credentials, user configs, proxies, PYTHONPATH or pytest flags.
-        env={} if env is None else env,
+        env=_child_environment(env),
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -1142,7 +1193,7 @@ def test_native_audit():
     sys.addaudithook(observer)
     command = [sys.executable, "-I", "-S", runner, "--receipt", str(destination),
                str(case), "-q", "--basetemp", str(Path.cwd() / "nested-temp")]
-    result = subprocess.run(command, executable=sys.executable, env={},
+    result = subprocess.run(command, executable=sys.executable, env=__BOOTSTRAP_ENV__,
                             capture_output=True, text=True, timeout=60)
     Path("native-audit.json").write_text(json.dumps(observed))
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1153,7 +1204,9 @@ def test_native_audit():
     }], observed
     receipt = json.loads(destination.read_text())
     assert receipt["attempts"] == [] and receipt["shutdown_accounted"]
-""".replace("__RUNNER_PATH__", repr(str(RUNNER.resolve()))),
+""".replace("__RUNNER_PATH__", repr(str(RUNNER.resolve()))).replace(
+            "__BOOTSTRAP_ENV__", repr(_child_environment())
+        ),
         cwd=tmp_path,
     )
     assert result.returncode == receipt["exit_code"] == 0, result.stdout + result.stderr
@@ -1271,13 +1324,13 @@ def test_sanitized():
             str(tmp_path / "sanitized-temp"),
         ],
         executable=sys.executable,
-        env={
+        env=_child_environment({
             "ANTHROPIC_API_KEY": "synthetic-offline-credential",
             "ANTHROPIC_BASE_URL": "https://synthetic.invalid",
             "HTTP_PROXY": "http://synthetic.invalid",
             "PYTHONPATH": "synthetic-nonexistent-path",
             "PYTEST_ADDOPTS": "--required-live",
-        },
+        }),
         capture_output=True,
         text=True,
         timeout=60,
@@ -1348,7 +1401,7 @@ def test_required_live_missing_key_fails_instead_of_skipping(tmp_path):
             str(tmp_path / "live-gate-temp"),
         ],
         executable=sys.executable,
-        env={},
+        env=_child_environment(),
         capture_output=True,
         text=True,
         timeout=60,
