@@ -19,19 +19,73 @@ from httpx2._utils import URLPattern
 from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
 from tests._helpers import DummyResponse, FakeCoordinator
-from tests.run_offline import _internal_socketpair_connect, _stdlib_socketpair_codes
+from tests.run_offline import (
+    _guarded_runner_command,
+    _internal_socketpair_connect,
+    _socketpair_connect_verdict,
+    _stdlib_socketpair_codes,
+)
 
 
 MODEL = "claude-haiku-5-5"
 RUNNER = Path(__file__).with_name("run_offline.py")
 
 
+@pytest.fixture
+def simulated_socket():
+    """Pure Windows socket facts, with no dependence on native SO_ACCEPTCONN."""
+    ports = iter(range(31000, 32000))
+    acceptconn = object()
+
+    class Socket:
+        def __init__(self, family=socket.AF_INET, kind=socket.SOCK_STREAM):
+            self.family, self.type = family, kind
+            self.open = True
+            self.listening = False
+            self.address = ("0.0.0.0", 0)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def bind(self, address):
+            self.address = (address[0], next(ports))
+
+        def listen(self):
+            self.listening = True
+
+        def fileno(self):
+            return 7 if self.open else -1
+
+        def close(self):
+            self.open = False
+
+        def getsockopt(self, level, option):
+            assert level == socket.SOL_SOCKET and option is acceptconn
+            return int(self.listening)
+
+        def getsockname(self):
+            return self.address
+
+    return SimpleNamespace(
+        socket=Socket,
+        AF_INET=socket.AF_INET,
+        AF_INET6=socket.AF_INET6,
+        SOCK_STREAM=socket.SOCK_STREAM,
+        SOCK_DGRAM=socket.SOCK_DGRAM,
+        SOL_SOCKET=socket.SOL_SOCKET,
+        SO_ACCEPTCONN=acceptconn,
+    )
+
+
 @pytest.mark.parametrize(
     "platform, expected",
     [("win32", True), ("linux", False), ("darwin", False), ("cygwin", False)],
 )
-def test_socketpair_predicate_is_windows_only(platform, expected):
-    # Pure predicate using real, unconnected sockets; not native Windows proof.
+def test_socketpair_predicate_is_windows_only(platform, expected, simulated_socket):
+    # Pure predicate with explicit socket facts; not native Windows proof.
     codes = _stdlib_socketpair_codes()
     assert codes
     for name in ("socketpair", "_fallback_socketpair"):
@@ -39,7 +93,8 @@ def test_socketpair_predicate_is_windows_only(platform, expected):
         code = getattr(function, "__code__", None)
         if code is not None:
             assert any(code is captured for captured in codes)
-    with socket.socket() as lsock, socket.socket() as csock:
+    socket_module = simulated_socket
+    with socket_module.socket() as lsock, socket_module.socket() as csock:
         lsock.bind(("127.0.0.1", 0))
         lsock.listen()
         for code in codes:
@@ -48,7 +103,11 @@ def test_socketpair_predicate_is_windows_only(platform, expected):
             )
             assert (
                 _internal_socketpair_connect(
-                    (csock, lsock.getsockname()), caller, platform=platform, codes=codes
+                    (csock, lsock.getsockname()),
+                    caller,
+                    platform=platform,
+                    codes=codes,
+                    socket_module=socket_module,
                 )
                 is expected
             )
@@ -82,7 +141,8 @@ def test_socketpair_predicate_is_windows_only(platform, expected):
         "wrong_address_shape",
     ],
 )
-def test_socketpair_predicate_fails_closed(fault):
+def test_socketpair_predicate_fails_closed(fault, simulated_socket):
+    socket = simulated_socket
     codes = _stdlib_socketpair_codes()
     with ExitStack() as cleanup:
 
@@ -151,20 +211,110 @@ def test_socketpair_predicate_fails_closed(fault):
         elif fault == "wrong_address_shape":
             address = (*address, 0, 0)
         assert not _internal_socketpair_connect(
-            (csock, address), caller, platform="win32", codes=codes
+            (csock, address),
+            caller,
+            platform="win32",
+            codes=codes,
+            socket_module=socket,
         )
+        expected_clause = {
+            "wrong_code": "direct_code_identity",
+            "ancestor_only": "direct_code_identity",
+            "missing_caller": "direct_code_identity",
+            "equal_but_not_identical_code": "direct_code_identity",
+            "filename_impostor": "direct_code_identity",
+            "no_codes": "direct_code_identity",
+            "wrong_socket": "client_identity",
+            "missing_csock": "client_identity",
+            "same_socket": "distinct_sockets",
+            "missing_listener": "listener_type",
+            "non_socket_listener": "listener_type",
+            "closed_client": "client_open",
+            "closed_listener": "listener_open",
+            "not_listening": "listener_listening",
+            "wildcard_listener": "listener_address",
+            "unrelated_listener": "exact_address",
+            "udp_client": "client_stream",
+            "udp_listener": "listener_stream",
+            "ipv6_client": "client_family",
+            "ipv6_listener": "listener_family",
+            "wrong_host": "exact_address",
+            "wrong_port": "exact_address",
+            "wrong_address_shape": "exact_address",
+        }[fault]
+        assert _socketpair_connect_verdict(
+            (csock, address),
+            caller,
+            platform="win32",
+            codes=codes,
+            socket_module=socket,
+        ) == {
+            "allowed": False,
+            "clause": expected_clause,
+            "exception": "AttributeError" if fault == "missing_caller" else None,
+        }
 
 
-def test_stdlib_fallback_direct_caller_predicate_before_connect():
+@pytest.mark.parametrize("capability", ["absent", "raises", "false"])
+def test_socketpair_missing_listener_capability_fails_closed(
+    capability, simulated_socket
+):
+    lsock, csock = simulated_socket.socket(), simulated_socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen()
+    if capability == "absent":
+        del simulated_socket.SO_ACCEPTCONN
+    elif capability == "raises":
+
+        def unavailable(*args):
+            raise OSError("Synthetic private exception text must not be retained")
+
+        lsock.getsockopt = unavailable
+    else:
+        lsock.listening = False
+    codes = _stdlib_socketpair_codes()
+    caller = SimpleNamespace(f_code=codes[0], f_locals={"lsock": lsock, "csock": csock})
+    verdict = _socketpair_connect_verdict(
+        (csock, lsock.getsockname()),
+        caller,
+        platform="win32",
+        codes=codes,
+        socket_module=simulated_socket,
+    )
+    assert verdict == {
+        "allowed": False,
+        "clause": "listener_listening",
+        "exception": {"absent": "AttributeError", "raises": "OSError", "false": None}[
+            capability
+        ],
+    }
+
+
+def _native_listener_capability(lsock):
+    # Independent native observation, not a relaxed predicate or inferred cause.
+    try:
+        return bool(lsock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)), None
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        return False, type(exc).__name__
+
+
+def test_stdlib_fallback_direct_caller_predicate_before_connect(record_property):
     # Observe the actual stdlib frame at its C connect boundary, then abort
     # BEFORE audit/syscall. No stdlib patches or network policy changes.
     # Linux 3.11 has only native socketpair; later Linux has a callable fallback.
     fallback = getattr(socket, "_fallback_socketpair", None)
     if fallback is None and sys.platform != "win32":
+        assert any(
+            socket.socketpair.__code__ is code for code in _stdlib_socketpair_codes()
+        )
         with ExitStack() as cleanup:
             for sock in socket.socketpair():
                 cleanup.enter_context(sock)
                 assert sock.family == socket.AF_UNIX
+        record_property(
+            "native_socketpair_predicate",
+            {"platform": sys.platform, "fallback": "absent", "native_pair": "AF_UNIX"},
+        )
         return
     function = fallback or socket.socketpair
     observed = []
@@ -175,13 +325,18 @@ def test_stdlib_fallback_direct_caller_predicate_before_connect():
     def profile(frame, event, arg):
         if event == "c_call" and getattr(arg, "__name__", None) == "connect":
             csock = arg.__self__
-            args = (csock, frame.f_locals["lsock"].getsockname())
+            lsock = frame.f_locals["lsock"]
+            args = (csock, lsock.getsockname())
+            capability, exception = _native_listener_capability(lsock)
+            verdict = _socketpair_connect_verdict(
+                args, frame, platform="win32", codes=_stdlib_socketpair_codes()
+            )
             observed.append(
                 (
                     frame.f_code is function.__code__,
-                    _internal_socketpair_connect(
-                        args, frame, platform="win32", codes=_stdlib_socketpair_codes()
-                    ),
+                    capability,
+                    exception,
+                    verdict,
                     _internal_socketpair_connect(
                         args, frame, platform="linux", codes=_stdlib_socketpair_codes()
                     ),
@@ -196,7 +351,128 @@ def test_stdlib_fallback_direct_caller_predicate_before_connect():
             function(socket.AF_INET)
     finally:
         sys.setprofile(previous)
-    assert observed == [(True, True, False)]
+    assert len(observed) == 1, observed
+    identity, capability, exception, verdict, ordinary = observed[0]
+    record_property(
+        "native_socketpair_predicate",
+        {
+            "platform": sys.platform,
+            "code_identity": identity,
+            "listener_capability": capability,
+            "capability_exception": exception,
+            "verdict": verdict,
+            "ordinary_allowed": ordinary,
+        },
+    )
+    assert identity and not ordinary, observed
+    if sys.platform == "win32":
+        assert capability and exception is None, observed
+    assert verdict == (
+        {"allowed": True, "clause": "accepted", "exception": None}
+        if capability
+        else {"allowed": False, "clause": "listener_listening", "exception": exception}
+    ), observed
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux", "darwin"])
+@pytest.mark.parametrize("shape", ["list", "tuple", "serialized"])
+@pytest.mark.parametrize("paths", ["native", "spaces"])
+def test_guarded_runner_audit_representation(platform, shape, paths):
+    expected = (
+        [sys.executable, "-I", "-S", str(RUNNER.resolve())]
+        if paths == "native"
+        else [
+            r"C:\Program Files\Python\python.exe",
+            "-I",
+            "-S",
+            r"C:\Owned tests\run_offline.py",
+        ]
+    )
+    argv = [*expected, "--receipt", "space and tab\tpath\\", '-k=literal"quote', ""]
+    command = (
+        tuple(argv)
+        if shape == "tuple"
+        else subprocess.list2cmdline(argv)
+        if shape == "serialized"
+        else argv
+    )
+    assert _guarded_runner_command(
+        expected[0], command, platform=platform, expected=expected
+    ) is (shape != "serialized" or platform == "win32")
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "none_executable",
+        "different_executable",
+        "basename_executable",
+        "wrong_argv_executable",
+        "missing_isolated",
+        "missing_no_site",
+        "wrong_runner",
+        "runner_suffix",
+        "runner_quote_boundary",
+        "shell_prefix",
+        "python_c",
+        "python_m",
+        "unterminated_quote",
+        "extra_space",
+        "tab_boundary",
+        "redundant_quotes",
+        "nul",
+        "bytes",
+    ],
+)
+def test_guarded_runner_serialized_audit_fails_closed(fault):
+    expected = [
+        r"C:\Program Files\Python\python.exe",
+        "-I",
+        "-S",
+        r"C:\Owned tests\run_offline.py",
+    ]
+    executable = expected[0]
+    argv = [*expected, "-q"]
+    command = subprocess.list2cmdline(argv)
+    if fault == "none_executable":
+        executable = None
+    elif fault == "different_executable":
+        executable += ".other"
+    elif fault == "basename_executable":
+        executable = "python.exe"
+    elif fault == "wrong_argv_executable":
+        argv[0] = "python.exe"
+        command = subprocess.list2cmdline(argv)
+    elif fault in {"missing_isolated", "missing_no_site"}:
+        argv.remove("-I" if fault == "missing_isolated" else "-S")
+        command = subprocess.list2cmdline(argv)
+    elif fault in {"wrong_runner", "runner_suffix"}:
+        argv[3] += ".unguarded"
+        command = subprocess.list2cmdline(argv)
+    elif fault == "runner_quote_boundary":
+        command = subprocess.list2cmdline(expected)[:-1] + ' extra.py" -q'
+    elif fault == "shell_prefix":
+        command = "cmd.exe /c " + command
+    elif fault in {"python_c", "python_m"}:
+        argv[3:4] = (
+            ["-c", "raise SystemExit(99)"] if fault == "python_c" else ["-m", "pytest"]
+        )
+        command = subprocess.list2cmdline(argv)
+    elif fault == "unterminated_quote":
+        command += ' "unfinished'
+    elif fault == "extra_space":
+        command = subprocess.list2cmdline(expected) + "  -q"
+    elif fault == "tab_boundary":
+        command = subprocess.list2cmdline(expected) + "\t-q"
+    elif fault == "redundant_quotes":
+        command = subprocess.list2cmdline(expected) + ' "-q"'
+    elif fault == "nul":
+        command += "\0"
+    elif fault == "bytes":
+        command = command.encode()
+    assert not _guarded_runner_command(
+        executable, command, platform="win32", expected=expected
+    )
 
 
 def test_messages_only_cold_metadata_is_explicit_and_cached(
@@ -439,6 +715,7 @@ def _child(
             *temp_args,
             *args,
         ],
+        executable=sys.executable,
         # No credentials, user configs, proxies, PYTHONPATH or pytest flags.
         env={} if env is None else env,
         cwd=cwd,
@@ -798,6 +1075,91 @@ def test_child_denied():
     assert [a["event"] for a in receipt["attempts"]] == ["subprocess.Popen"]
 
 
+@pytest.mark.parametrize(
+    "fault", ["missing_isolated", "wrong_runner", "shell", "malformed"]
+)
+def test_guard_denies_malformed_child_before_execution(tmp_path, fault):
+    result, receipt = _child(
+        tmp_path,
+        f"""
+def test_no_execution():
+    import subprocess, sys
+    from pathlib import Path
+    from tests.run_offline import __file__ as runner
+    witness = Path.cwd() / "unguarded-executed"
+    payload = "from pathlib import Path; Path(" + repr(str(witness)) + ").touch()"
+    command = [sys.executable, "-I", "-S", str(Path(runner).resolve()), "-q"]
+    shell = False
+    fault = {fault!r}
+    if fault == "missing_isolated":
+        command.remove("-I")
+    elif fault == "wrong_runner":
+        command[3:] = ["-c", payload]
+    elif fault == "shell":
+        command = subprocess.list2cmdline([sys.executable, "-c", payload])
+        shell = True
+    else:
+        command = subprocess.list2cmdline(command) + ' "unfinished'
+    try:
+        subprocess.run(command, executable=sys.executable, shell=shell, timeout=10)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("Malformed child was not refused before execution")
+    assert not witness.exists()
+""",
+        cwd=tmp_path,
+    )
+    assert result.returncode == receipt["exit_code"] == 1, result.stdout + result.stderr
+    assert [a["event"] for a in receipt["attempts"]] == ["subprocess.Popen"]
+    assert all(r["outcome"] == "passed" for r in receipt["reports"])
+    assert not (tmp_path / "unguarded-executed").exists()
+
+
+def test_owned_launch_uses_exact_native_audit_representation(tmp_path):
+    result, receipt = _child(
+        tmp_path,
+        """
+def test_native_audit():
+    import json, subprocess, sys
+    from pathlib import Path
+    from tests.run_offline import __file__ as runner
+    runner = str(Path(runner).resolve())
+    case = Path.cwd() / "test_nested.py"
+    case.write_text("def test_nested(): pass\\n")
+    destination = Path.cwd() / "nested-receipt.json"
+    observed = []
+    def observer(event, args):
+        if event == "subprocess.Popen":
+            observed.append({
+                "executable_is_exact": args[0] == sys.executable,
+                "command_type": type(args[1]).__name__,
+                "canonical_command": args[1] == subprocess.list2cmdline(command)
+                    if sys.platform == "win32" else args[1] == command,
+            })
+    sys.addaudithook(observer)
+    command = [sys.executable, "-I", "-S", runner, "--receipt", str(destination),
+               str(case), "-q", "--basetemp", str(Path.cwd() / "nested-temp")]
+    result = subprocess.run(command, executable=sys.executable, env={},
+                            capture_output=True, text=True, timeout=60)
+    Path("native-audit.json").write_text(json.dumps(observed))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert observed == [{
+        "executable_is_exact": True,
+        "command_type": "str" if sys.platform == "win32" else "list",
+        "canonical_command": True,
+    }], observed
+    receipt = json.loads(destination.read_text())
+    assert receipt["attempts"] == [] and receipt["shutdown_accounted"]
+""",
+        cwd=tmp_path,
+    )
+    assert result.returncode == receipt["exit_code"] == 0, result.stdout + result.stderr
+    assert receipt["attempts"] == []
+    observed = json.loads((tmp_path / "native-audit.json").read_text())
+    assert observed[0]["executable_is_exact"] and observed[0]["canonical_command"]
+
+
 def test_guard_blocks_reverse_dns_before_resolution(tmp_path):
     result, receipt = _child(
         tmp_path,
@@ -906,6 +1268,7 @@ def test_sanitized():
             "--basetemp",
             str(tmp_path / "sanitized-temp"),
         ],
+        executable=sys.executable,
         env={
             "ANTHROPIC_API_KEY": "synthetic-offline-credential",
             "ANTHROPIC_BASE_URL": "https://synthetic.invalid",
@@ -982,6 +1345,7 @@ def test_required_live_missing_key_fails_instead_of_skipping(tmp_path):
             "--basetemp",
             str(tmp_path / "live-gate-temp"),
         ],
+        executable=sys.executable,
         env={},
         capture_output=True,
         text=True,

@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -36,31 +37,117 @@ def _stdlib_socketpair_codes():
     )
 
 
-def _internal_socketpair_connect(args, caller, *, platform, codes):
-    """Allow only Windows' stdlib IPv4 self-pipe connect to its own listener."""
+def _socketpair_connect_verdict(args, caller, *, platform, codes, socket_module=socket):
+    """Safe clause/type diagnostics; never include addresses or exception text.
+
+    socket_module is a pure-test seam. The installed guard always uses stdlib.
+    """
+    clause = "platform"
     try:
-        if platform != "win32" or not any(caller.f_code is code for code in codes):
-            return False
+        if platform != "win32":
+            return {"allowed": False, "clause": clause, "exception": None}
+        clause = "direct_code_identity"
+        if not any(caller.f_code is code for code in codes):
+            return {"allowed": False, "clause": clause, "exception": None}
+        clause = "audit_arguments"
         csock, address = args
         lsock = caller.f_locals.get("lsock")
-        if (
-            caller.f_locals.get("csock") is not csock
-            or type(csock) is not socket.socket
-            or type(lsock) is not socket.socket
-            or csock is lsock
-            or csock.family != socket.AF_INET
-            or lsock.family != socket.AF_INET
-            or csock.type != socket.SOCK_STREAM
-            or lsock.type != socket.SOCK_STREAM
-            or csock.fileno() < 0
-            or lsock.fileno() < 0
-            or not lsock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
-        ):
-            return False
+        # Evaluate sequentially: the first rejecting check or exception is known.
+        checks = (
+            ("client_identity", lambda: caller.f_locals.get("csock") is csock),
+            ("client_type", lambda: type(csock) is socket_module.socket),
+            ("listener_type", lambda: type(lsock) is socket_module.socket),
+            ("distinct_sockets", lambda: csock is not lsock),
+            ("client_family", lambda: csock.family == socket_module.AF_INET),
+            ("listener_family", lambda: lsock.family == socket_module.AF_INET),
+            ("client_stream", lambda: csock.type == socket_module.SOCK_STREAM),
+            ("listener_stream", lambda: lsock.type == socket_module.SOCK_STREAM),
+            ("client_open", lambda: csock.fileno() >= 0),
+            ("listener_open", lambda: lsock.fileno() >= 0),
+            (
+                "listener_listening",
+                lambda: bool(
+                    lsock.getsockopt(
+                        socket_module.SOL_SOCKET, socket_module.SO_ACCEPTCONN
+                    )
+                ),
+            ),
+        )
+        for clause, check in checks:
+            if not check():
+                return {"allowed": False, "clause": clause, "exception": None}
+        clause = "listener_address"
         own_address = lsock.getsockname()
-        return own_address[0] == "127.0.0.1" and address == own_address
-    except (AttributeError, OSError, TypeError, ValueError):
+        if own_address[0] != "127.0.0.1":
+            return {"allowed": False, "clause": clause, "exception": None}
+        clause = "exact_address"
+        if address != own_address:
+            return {"allowed": False, "clause": clause, "exception": None}
+        return {"allowed": True, "clause": "accepted", "exception": None}
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        return {"allowed": False, "clause": clause, "exception": type(exc).__name__}
+
+
+def _internal_socketpair_connect(
+    args, caller, *, platform, codes, socket_module=socket
+):
+    """Allow only Windows' stdlib IPv4 self-pipe connect to its own listener."""
+    return _socketpair_connect_verdict(
+        args, caller, platform=platform, codes=codes, socket_module=socket_module
+    )["allowed"]
+
+
+def _canonical_windows_argv(command):
+    """Decode only round-trippable subprocess.list2cmdline output, not a shell."""
+    if "\0" in command:
+        return None
+    argv = []
+    index = 0
+    while index < len(command):
+        while index < len(command) and command[index] in " \t":
+            index += 1
+        if index == len(command):
+            break
+        argument = []
+        quoted = False
+        while index < len(command):
+            if command[index] in " \t" and not quoted:
+                break
+            slashes = 0
+            while index < len(command) and command[index] == "\\":
+                slashes += 1
+                index += 1
+            if index < len(command) and command[index] == '"':
+                argument.append("\\" * (slashes // 2))
+                if slashes % 2:
+                    argument.append('"')
+                else:
+                    quoted = not quoted
+                index += 1
+            else:
+                argument.append("\\" * slashes)
+                if index < len(command):
+                    if command[index] in " \t" and not quoted:
+                        break
+                    argument.append(command[index])
+                    index += 1
+        if quoted:
+            return None
+        argv.append("".join(argument))
+    return argv if subprocess.list2cmdline(argv) == command else None
+
+
+def _guarded_runner_command(executable, command, *, platform, expected):
+    """Exact executable/isolated-runner argv; Windows also audits serialized argv."""
+    if executable != expected[0]:
+        # Owned launch sites pass executable explicitly, including on Windows.
         return False
+    if platform == "win32" and isinstance(command, str):
+        prefix = subprocess.list2cmdline(expected)
+        if command != prefix and not command.startswith(prefix + " "):
+            return False
+        command = _canonical_windows_argv(command)
+    return isinstance(command, (list, tuple)) and list(command[:4]) == expected
 
 
 def install_network_guard():
@@ -74,12 +161,15 @@ def install_network_guard():
     permitted = {"internal_socketpair_connect": 0}
 
     def audit(event, args):
-        if event == "socket.connect" and _internal_socketpair_connect(
-            args, sys._getframe(1), platform=platform, codes=socketpair_codes
-        ):
-            # No target, payload or vendor attribution: this is stdlib plumbing.
-            permitted["internal_socketpair_connect"] += 1
-            return
+        socketpair_verdict = None
+        if event == "socket.connect":
+            socketpair_verdict = _socketpair_connect_verdict(
+                args, sys._getframe(1), platform=platform, codes=socketpair_codes
+            )
+            if socketpair_verdict["allowed"]:
+                # No target, payload or vendor attribution: this is stdlib plumbing.
+                permitted["internal_socketpair_connect"] += 1
+                return
         dns = event in {
             "socket.getaddrinfo",
             "socket.gethostbyname",
@@ -95,10 +185,8 @@ def install_network_guard():
             # Permit only this guarded runner in an isolated no-site child.
             # Other subprocesses do not inherit this Python audit hook.
             expected = [sys.executable, "-I", "-S", str(Path(__file__).resolve())]
-            unguarded_child = not (
-                isinstance(command, (list, tuple))
-                and list(command[:4]) == expected
-                and args[0] == sys.executable
+            unguarded_child = not _guarded_runner_command(
+                args[0], command, platform=platform, expected=expected
             )
         if dns or inet or unguarded_child:
             attempts.append(
@@ -116,6 +204,8 @@ def install_network_guard():
                     ],
                 }
             )
+            if socketpair_verdict is not None:
+                attempts[-1]["socketpair_predicate"] = socketpair_verdict
             raise PermissionError("Offline suite denied audited Python operation")
 
     sys.addaudithook(audit)
@@ -288,6 +378,12 @@ def main():
                         "detail": str(report.longrepr) if report.longrepr else None,
                     }
                 )
+                if report.when == "call":
+                    for name, value in report.user_properties:
+                        if name == "native_socketpair_predicate":
+                            receipt["reports"][-1]["native_socketpair_predicate"] = (
+                                value
+                            )
 
             def pytest_warning_recorded(self, warning_message, when, nodeid):
                 receipt["warnings"].append(

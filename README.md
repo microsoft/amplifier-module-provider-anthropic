@@ -22,7 +22,12 @@ exact stdlib socketpair implementation connecting its own IPv4 stream socket to
 its live loopback listener's exact address (needed for asyncio's self-pipe).
 Receipts count this as `internal_socketpair_connect`, not a vendor request.
 Ordinary loopback connects, DNS and datagram sends remain denied; Linux predicate
-or fallback checks do not establish native Windows qualification.
+or fallback checks do not establish native Windows qualification. Pure Windows
+predicate tests use explicit socket facts; native fallback observations retain
+safe rejecting-clause/exception-type diagnostics and fail closed on missing
+listener capabilities. Guarded children use an explicit exact Python executable;
+Windows serialized audit commands must round-trip canonically with the same
+isolated no-site runner prefix. Shell or ambiguous commands remain denied.
 This is isolation for **trusted tests**, not a
 tamper-proof security sandbox for hostile Python, forks or native code outside
 Python's audit surface. Receipts are written to
