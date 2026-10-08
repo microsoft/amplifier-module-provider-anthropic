@@ -1079,13 +1079,15 @@ def test_child_denied():
     "fault", ["missing_isolated", "wrong_runner", "shell", "malformed"]
 )
 def test_guard_denies_malformed_child_before_execution(tmp_path, fault):
+    # Isolated temp-directory collection does not guarantee the tests namespace.
+    # Pass the already-known runner path, without changing import or guard rules.
     result, receipt = _child(
         tmp_path,
         f"""
 def test_no_execution():
     import subprocess, sys
     from pathlib import Path
-    from tests.run_offline import __file__ as runner
+    runner = {str(RUNNER.resolve())!r}
     witness = Path.cwd() / "unguarded-executed"
     payload = "from pathlib import Path; Path(" + repr(str(witness)) + ").touch()"
     command = [sys.executable, "-I", "-S", str(Path(runner).resolve()), "-q"]
@@ -1123,7 +1125,7 @@ def test_owned_launch_uses_exact_native_audit_representation(tmp_path):
 def test_native_audit():
     import json, subprocess, sys
     from pathlib import Path
-    from tests.run_offline import __file__ as runner
+    runner = __RUNNER_PATH__
     runner = str(Path(runner).resolve())
     case = Path.cwd() / "test_nested.py"
     case.write_text("def test_nested(): pass\\n")
@@ -1151,7 +1153,7 @@ def test_native_audit():
     }], observed
     receipt = json.loads(destination.read_text())
     assert receipt["attempts"] == [] and receipt["shutdown_accounted"]
-""",
+""".replace("__RUNNER_PATH__", repr(str(RUNNER.resolve()))),
         cwd=tmp_path,
     )
     assert result.returncode == receipt["exit_code"] == 0, result.stdout + result.stderr
