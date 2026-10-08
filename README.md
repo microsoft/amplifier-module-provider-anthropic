@@ -10,8 +10,10 @@ Offline contracts execute without real keys. Provision with
 Run `uv run python -I -S tests/run_offline.py -q`. The runner sanitizes inherited
 credentials, supplies a fresh owned test home (including Windows profile
 variables), and creates the default pytest temp parent on a clean checkout.
-The test home is separate from pytest's temp tree, removed at shutdown, and
-does not reuse inherited home/config locations. The runner installs a Python
+The test home is separate from pytest's temp tree and does not reuse inherited
+home/config locations. It stays alive through later dependency finalizers;
+shutdown then removes it and their home-scoped cache writes before final
+accounting. The runner installs a Python
 audit deny-and-record hook **before** site initialization, real Core/Foundation
 imports and pytest collection. Audited
 DNS/socket attempts and unguarded subprocesses fail the run, even when provider

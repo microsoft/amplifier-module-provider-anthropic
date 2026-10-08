@@ -370,6 +370,62 @@ def test_home_survives(tmp_path):
     assert receipt["attempts"] == []
 
 
+@pytest.mark.parametrize("deny", [False, True])
+def test_runner_home_lives_through_retained_finalizers_then_is_removed(tmp_path, deny):
+    result, receipt = _child(
+        tmp_path,
+        f"""
+_retained = []
+
+def test_retained_finalizers():
+    import json, socket, weakref
+    from pathlib import Path
+    class Retained:
+        pass
+    home = Path.home()
+    witness = Path.cwd() / "finalizer-home.json"
+    assert home.is_dir()
+    assert not witness.exists()
+    def write_cache():
+        existed = home.is_dir()
+        cache = home / ".cache" / "synthetic-dependency" / "entry"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text("synthetic finalizer cache")
+        witness.write_text(json.dumps({{
+            "home": str(home), "existed": existed, "cache": cache.read_text()
+        }}))
+    writer = Retained()
+    _retained.append(writer)
+    weakref.finalize(writer, write_cache)
+    if {deny!r}:
+        def denied_request():
+            try:
+                socket.getaddrinfo("synthetic.invalid", 443)
+            except PermissionError:
+                pass
+        requester = Retained()
+        _retained.append(requester)
+        weakref.finalize(requester, denied_request)
+""",
+        cwd=tmp_path,
+    )
+    assert result.returncode == receipt["exit_code"] == int(deny), (
+        result.stdout + result.stderr
+    )
+    assert receipt["shutdown_accounted"]
+    assert all(report["outcome"] == "passed" for report in receipt["reports"])
+    witness = json.loads((tmp_path / "finalizer-home.json").read_text())
+    assert witness["existed"], "HOME was removed before the retained finalizer ran"
+    assert witness["cache"] == "synthetic finalizer cache"
+    assert not Path(witness["home"]).exists(), "Finalizer cache escaped HOME cleanup"
+    assert not list(tmp_path.glob("offline-home-*"))
+    if deny:
+        assert [a["event"] for a in receipt["attempts"]] == ["socket.getaddrinfo"]
+        assert receipt["attempts"][0]["phase_or_nodeid"] == "shutdown"
+    else:
+        assert receipt["attempts"] == []
+
+
 @pytest.mark.parametrize("phase", ["collection", "runtest"])
 def test_guard_fails_independently_after_every_swallowed_dns_attempt(tmp_path, phase):
     attempts = """

@@ -145,12 +145,17 @@ def main():
         "warnings": [],
     }
     code = 1
+    home = None
 
     def shutdown_accounting():
         # Registered BEFORE site/dependencies, so their later atexit callbacks
         # run first. A swallowed shutdown attempt must not escape the receipt
         # or the process's exit status.
         try:
+            # Retain home through main's return and later dependency finalizers;
+            # its earlier weakref finalizer normally already cleaned it here.
+            if home is not None:
+                home.cleanup()
             receipt["attempts"] = snapshot()
             receipt["shutdown_accounted"] = True
             receipt["exit_code"] = 1 if receipt["attempts"] else code
@@ -172,10 +177,11 @@ def main():
     try:
         # Register accounting first: TemporaryDirectory initializes weakref's
         # shared atexit dispatcher, including later dependency/test finalizers.
+        # Its earlier finalizer runs AFTER theirs. A separate atexit cleanup
+        # would run before that dispatcher and remove HOME too soon.
         # Cwd is outside pytest's deletion tree (pytest rejects cwd/ancestors as
         # basetemp), even when the caller puts the receipt inside that tree.
         home = tempfile.TemporaryDirectory(prefix="offline-home-", dir=Path.cwd())
-        atexit.register(home.cleanup)
         home_path = str(Path(home.name).resolve())
         drive, path = os.path.splitdrive(home_path)
         os.environ.update(
