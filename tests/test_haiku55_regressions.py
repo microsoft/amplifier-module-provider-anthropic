@@ -18,6 +18,7 @@ from amplifier_core.message_models import (
     Message,
     TextBlock,
     ThinkingBlock,
+    ToolCall,
     ToolCallBlock,
     ToolSpec,
 )
@@ -726,6 +727,219 @@ def test_accepted_haiku_repairs_a_copy_on_each_public_call():
                         if e == "provider:tool_sequence_repaired"]) == 2
         finally:
             await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("history", ["scalar", "canonical", "partial", "multiple_turns"])
+@pytest.mark.parametrize("caching", [False, True])
+def test_public_compatibility_repairs_follow_canonical_projection(history, caching):
+    async def run():
+        p = provider(enable_prompt_caching=caching)
+        seen = []
+        p._client = recording_client(seen)
+        calls = [ToolCall(id="compat_1", name="lookup", arguments={"value": 1})]
+        content = "legacy text"
+        if history == "canonical":
+            content = [
+                ThinkingBlock(thinking="", signature="synthetic-canonical"),
+                ToolCallBlock(id="compat_1", name="lookup", input={"canonical": True}),
+                TextBlock(text="ordered text"),
+            ]
+            calls.append(ToolCall(id="compat_1", name="stale_name", arguments={}))
+        if history == "partial":
+            calls.extend([
+                ToolCall(id="compat_2", name="lookup", arguments={"value": 2}),
+                ToolCall(id="compat_2", name="stale_name", arguments={}),
+            ])
+        messages = [
+            Message(role="user", content="hello"),
+            Message(role="assistant", content=content, tool_calls=calls),
+        ]
+        if history == "partial":
+            messages.append(Message(
+                role="tool", tool_call_id="compat_1", content="existing result",
+            ))
+        messages.append(Message(role="user", content="continue"))
+        if history == "multiple_turns":
+            messages.extend([
+                Message(role="assistant", content="next", tool_calls=[
+                    ToolCall(id="compat_2", name="lookup", arguments={"value": 2}),
+                ]),
+                Message(role="user", content="continue again"),
+            ])
+        req = request(messages=messages, tools=[tool()], max_output_tokens=123)
+        before = req.model_dump_json()
+        try:
+            if caching:
+                await p.complete(request())
+                assert p._prefix_fingerprints
+                seen.clear()
+                p.coordinator.hooks.events.clear()
+            for _ in range(2):
+                events_before = deepcopy(p.coordinator.hooks.events)
+                prefix_before = deepcopy(p._prefix_fingerprints)
+                runtime_before = deepcopy(p._runtime_model_info_cache)
+                budget = await p.request_budget(req, context_estimate=200_000)
+                assert budget["max_output_tokens"] == 123
+                assert p.coordinator.hooks.events == events_before
+                assert p._prefix_fingerprints == prefix_before
+                assert p._runtime_model_info_cache == runtime_before
+                assert not p._repaired_tool_ids
+                await p.complete(req)
+                assert req.model_dump_json() == before
+                count = [b for _, path, b in seen if path.endswith("/count_tokens")][-1]
+                body = [b for _, path, b in seen if path == "/v1/messages"][-1]
+                assert count["messages"] == body["messages"]
+                assert body["max_tokens"] == 123 and "max_tokens" not in count
+                wire = body["messages"]
+                for index, message in enumerate(wire):
+                    if message["role"] != "assistant":
+                        continue
+                    uses = [b for b in message["content"] if b["type"] == "tool_use"]
+                    ids = [b["id"] for b in uses]
+                    assert len(ids) == len(set(ids))
+                    assert wire[index + 1]["role"] == "user"
+                    results = wire[index + 1]["content"]
+                    assert isinstance(results, list)
+                    assert {r["tool_use_id"] for r in results} == set(ids)
+                    assert len(results) == len(ids)
+                    for result in results:
+                        assert result["type"] == "tool_result"
+                        if history == "partial" and result["tool_use_id"] == "compat_1":
+                            assert result["content"] == "existing result"
+                        else:
+                            assert "SYSTEM ERROR" in result["content"]
+                            assert "Tool: lookup" in result["content"]
+                if history == "canonical":
+                    assert [{k: v for k, v in b.items() if k != "cache_control"}
+                            for b in wire[1]["content"]] == [
+                        {"type": "thinking", "thinking": "", "signature": "synthetic-canonical"},
+                        {"type": "tool_use", "id": "compat_1", "name": "lookup",
+                         "input": {"canonical": True}},
+                        {"type": "text", "text": "ordered text"},
+                    ]
+                else:
+                    assert wire[1]["content"][0] == {"type": "text", "text": "legacy text"}
+            assert not p._repaired_tool_ids
+            repairs = [payload for event, payload in p.coordinator.hooks.events
+                       if event == "provider:tool_sequence_repaired"]
+            assert len(repairs) == 2
+            assert all(r["repair_count"] == (2 if history == "multiple_turns" else 1)
+                       for r in repairs)
+        finally:
+            await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("explicit_model", [False, True])
+@pytest.mark.parametrize("change", [
+    "none", "request", "compatibility", "options", "model", "wire", "foreign", "copy",
+])
+def test_public_overflow_binds_caller_options_not_fallback_injection(
+    fallback, explicit_model, change, monkeypatch,
+):
+    monkeypatch.setattr(provider_module, "_fallback_windows", {})
+    async def run():
+        p = provider(fallback_on_overload=fallback)
+        seen = []
+        def handler(req):
+            body = json.loads(req.content) if req.content else {}
+            seen.append((req.method, req.url.path, body))
+            if req.method == "GET":
+                return httpx2.Response(404, json={"error": {"type": "not_found_error"}})
+            return httpx2.Response(
+                400, headers={"request-id": "synthetic-input-overflow"},
+                json={"type": "error", "error": {
+                    "type": "invalid_request_error",
+                    "message": "prompt is too long: 208310 tokens > 200000 maximum",
+                }},
+            )
+        p._client = AsyncAnthropic(
+            api_key="offline-placeholder", max_retries=0,
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+        )
+        req = request(messages=[
+            Message(role="user", content="hello"),
+            Message(role="assistant", content="legacy", tool_calls=[
+                ToolCall(id="compat_1", name="lookup", arguments={}),
+            ]),
+            Message(role="user", content="continue"),
+        ], tools=[tool()])
+        options = {"model": MODEL} if explicit_model else {}
+        before = req.model_dump_json()
+        original_messages = deepcopy(req.messages)
+        other = provider()
+        try:
+            with pytest.raises(ContextLengthError) as raised:
+                await p.complete(req, **options)
+            assert req.model_dump_json() == before
+            assert options == ({"model": MODEL} if explicit_model else {})
+            assert len([b for _, path, b in seen if path == "/v1/messages"]) == 1
+            error = raised.value
+            assert error.__cause__.request_id == "synthetic-input-overflow"
+            target = req
+            recovering = p
+            if change == "request":
+                req.messages[0].content = "changed"
+            elif change == "compatibility":
+                req.messages[1].tool_calls[0].arguments["changed"] = True
+            elif change == "options":
+                # Even an identical wire model cannot erase a caller-option change.
+                if explicit_model:
+                    options.clear()
+                else:
+                    options["model"] = MODEL
+            elif change == "model":
+                if explicit_model:
+                    options["model"] = "claude-haiku-4-5"
+                else:
+                    p.default_model = "claude-haiku-4-5"
+            elif change == "wire":
+                p.extra_request_params = {"system": [{"type": "text", "text": "changed"}]}
+            elif change == "foreign":
+                recovering = other
+            elif change == "copy":
+                target = req.model_copy(deep=True)
+            decision = recovering.recover_context_overflow(
+                target, error, context_estimate=200_000, request_options=options,
+            )
+            if change == "none":
+                assert decision == {
+                    "estimated_input_tokens": 208310,
+                    "input_limit_tokens": 200000,
+                    "context_token_budget": 188087,
+                    "max_output_tokens": 128000,
+                }
+            else:
+                assert decision is None
+            assert recovering.recover_context_overflow(
+                target, error, context_estimate=200_000, request_options=options,
+            ) is None
+            if change in {"request", "compatibility", "options", "model", "wire"}:
+                # A refused consumed feedback cannot be revived by restoring the
+                # original payload/options, even when that wire matches again.
+                req.messages = original_messages
+                p.default_model = MODEL
+                p.extra_request_params = {}
+                options = {"model": MODEL} if explicit_model else {}
+                assert req.model_dump_json() == before
+                assert p.recover_context_overflow(
+                    req, error, context_estimate=200_000, request_options=options,
+                ) is None
+            elif change in {"foreign", "copy"}:
+                # An identity mismatch refuses without stealing the owner's
+                # one-shot recovery from the original request.
+                assert p.recover_context_overflow(
+                    req, error, context_estimate=200_000, request_options=options,
+                ) is not None
+                assert p.recover_context_overflow(
+                    req, error, context_estimate=200_000, request_options=options,
+                ) is None
+            assert len([b for _, path, b in seen if path == "/v1/messages"]) == 1
+        finally:
+            await p.close()
+            await other.close()
     asyncio.run(run())
 
 

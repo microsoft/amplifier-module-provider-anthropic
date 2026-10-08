@@ -3053,7 +3053,8 @@ class AnthropicProvider:
             pass  # Never crash on I/O errors
 
     def _find_missing_tool_results(
-        self, messages: list[Message], *, include_repaired: bool = False
+        self, messages: list[Message], *, include_repaired: bool = False,
+        include_compatibility: bool = False,
     ) -> list[tuple[int, str, str, dict]]:
         """Find tool calls without matching results.
 
@@ -3064,6 +3065,8 @@ class AnthropicProvider:
         By default excludes IDs already repaired to prevent legacy detection
         loops. Request-local repairs must include them because the caller's
         canonical history deliberately never contains the synthetic results.
+        Haiku also uses the wire projection to include compatibility tool_calls,
+        with the converter's canonical precedence and duplicate suppression.
 
         Returns:
             List of (msg_index, call_id, tool_name, tool_arguments) tuples for unpaired calls.
@@ -3073,8 +3076,18 @@ class AnthropicProvider:
         tool_results = set()  # {call_id}
 
         for idx, msg in enumerate(messages):
+            if msg.role == "assistant" and include_compatibility:
+                projected = self._convert_messages(
+                    [msg.model_dump()], emit_warnings=False
+                )[0]["content"]
+                if isinstance(projected, list):
+                    for block in projected:
+                        if block.get("type") == "tool_use":
+                            tool_calls[block["id"]] = (
+                                idx, block["name"], block["input"]
+                            )
             # Check assistant messages for ToolCallBlock in content
-            if msg.role == "assistant" and isinstance(msg.content, list):
+            elif msg.role == "assistant" and isinstance(msg.content, list):
                 for block in msg.content:
                     if hasattr(block, "type") and block.type == "tool_call":
                         tool_calls[block.id] = (idx, block.name, block.input)
@@ -3168,7 +3181,8 @@ class AnthropicProvider:
         is_haiku55 = self._prevalidate_haiku55_request(request, validation_options)
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(
-            request.messages, include_repaired=is_haiku55
+            request.messages, include_repaired=is_haiku55,
+            include_compatibility=is_haiku55,
         )
 
         if missing:
@@ -3258,6 +3272,7 @@ class AnthropicProvider:
                 response = await self._complete_chat_request(
                     request,
                     retry_config=retry_config,
+                    _overflow_request_options=kwargs if is_haiku55 else None,
                     **current_kwargs,
                 )
             except KernelLLMError as e:
@@ -3696,7 +3711,7 @@ class AnthropicProvider:
             )
             if repair_tool_results:
                 missing = self._find_missing_tool_results(
-                    request.messages, include_repaired=True
+                    request.messages, include_repaired=True, include_compatibility=True
                 )
                 if missing:
                     # Validate the ORIGINAL final envelope first: repairing an
@@ -4421,6 +4436,7 @@ class AnthropicProvider:
         self,
         request: ChatRequest,
         retry_config: RetryConfig | None = None,
+        _overflow_request_options: Mapping[str, Any] | None = None,
         **kwargs,
     ) -> ChatResponse:
         """Handle ChatRequest format with developer message conversion.
@@ -4475,7 +4491,12 @@ class AnthropicProvider:
         # copying it; the staged prefix state lets recovery validate the exact
         # rejected assembly even though dispatch has committed its new state.
         overflow_request_fingerprint = self._fingerprint(request.model_dump())
-        overflow_options_fingerprint = self._fingerprint(kwargs)
+        # The fallback wrapper injects a resolved model into dispatch kwargs.
+        # Bind Haiku feedback to the public caller's options instead; recovery
+        # still reassembles and compares the exact rejected wire/model envelope.
+        overflow_options_fingerprint = self._fingerprint(
+            kwargs if _overflow_request_options is None else _overflow_request_options
+        )
         overflow_assembly_fingerprint = self._fingerprint(params)
 
         logger.info(
