@@ -1,10 +1,13 @@
 """Regressions for synthetic fixture scope and trusted-test network denial."""
 
 import asyncio
+from contextlib import ExitStack
 import json
 from pathlib import Path
+import socket
 import subprocess
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx2
@@ -16,10 +19,184 @@ from httpx2._utils import URLPattern
 from amplifier_core.message_models import ChatRequest, Message
 from amplifier_module_provider_anthropic import AnthropicProvider
 from tests._helpers import DummyResponse, FakeCoordinator
+from tests.run_offline import _internal_socketpair_connect, _stdlib_socketpair_codes
 
 
 MODEL = "claude-haiku-5-5"
 RUNNER = Path(__file__).with_name("run_offline.py")
+
+
+@pytest.mark.parametrize(
+    "platform, expected",
+    [("win32", True), ("linux", False), ("darwin", False), ("cygwin", False)],
+)
+def test_socketpair_predicate_is_windows_only(platform, expected):
+    # Pure predicate using real, unconnected sockets; not native Windows proof.
+    codes = _stdlib_socketpair_codes()
+    assert codes
+    for name in ("socketpair", "_fallback_socketpair"):
+        function = getattr(socket, name, None)
+        code = getattr(function, "__code__", None)
+        if code is not None:
+            assert any(code is captured for captured in codes)
+    with socket.socket() as lsock, socket.socket() as csock:
+        lsock.bind(("127.0.0.1", 0))
+        lsock.listen()
+        for code in codes:
+            caller = SimpleNamespace(
+                f_code=code, f_locals={"lsock": lsock, "csock": csock}
+            )
+            assert (
+                _internal_socketpair_connect(
+                    (csock, lsock.getsockname()), caller, platform=platform, codes=codes
+                )
+                is expected
+            )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "wrong_code",
+        "ancestor_only",
+        "missing_caller",
+        "equal_but_not_identical_code",
+        "filename_impostor",
+        "no_codes",
+        "wrong_socket",
+        "missing_csock",
+        "same_socket",
+        "missing_listener",
+        "non_socket_listener",
+        "closed_client",
+        "closed_listener",
+        "not_listening",
+        "wildcard_listener",
+        "unrelated_listener",
+        "udp_client",
+        "udp_listener",
+        "ipv6_client",
+        "ipv6_listener",
+        "wrong_host",
+        "wrong_port",
+        "wrong_address_shape",
+    ],
+)
+def test_socketpair_predicate_fails_closed(fault):
+    codes = _stdlib_socketpair_codes()
+    with ExitStack() as cleanup:
+
+        def make_socket(family=socket.AF_INET, kind=socket.SOCK_STREAM):
+            return cleanup.enter_context(socket.socket(family, kind))
+
+        lsock, csock = make_socket(), make_socket()
+        lsock.bind(("0.0.0.0" if fault == "wildcard_listener" else "127.0.0.1", 0))
+        if fault != "not_listening":
+            lsock.listen()
+        address = lsock.getsockname()
+        caller = SimpleNamespace(
+            f_code=codes[0], f_locals={"lsock": lsock, "csock": csock}
+        )
+        if fault == "wrong_code":
+            caller.f_code = test_socketpair_predicate_fails_closed.__code__
+        elif fault == "ancestor_only":
+            caller.f_back = SimpleNamespace(f_code=codes[0], f_locals=caller.f_locals)
+            caller.f_code = test_socketpair_predicate_fails_closed.__code__
+        elif fault == "missing_caller":
+            caller = None
+        elif fault == "equal_but_not_identical_code":
+            caller.f_code = codes[0].replace()
+            assert caller.f_code == codes[0] and caller.f_code is not codes[0]
+        elif fault == "filename_impostor":
+            caller.f_code = test_socketpair_predicate_fails_closed.__code__.replace(
+                co_filename=codes[0].co_filename, co_name=codes[0].co_name
+            )
+        elif fault == "no_codes":
+            codes = ()
+        elif fault == "wrong_socket":
+            csock = make_socket()
+        elif fault == "missing_csock":
+            caller.f_locals.pop("csock")
+        elif fault == "same_socket":
+            csock = lsock
+            caller.f_locals["csock"] = csock
+        elif fault == "missing_listener":
+            caller.f_locals.pop("lsock")
+        elif fault == "non_socket_listener":
+            caller.f_locals["lsock"] = object()
+        elif fault == "closed_client":
+            csock.close()
+        elif fault == "closed_listener":
+            lsock.close()
+        elif fault == "unrelated_listener":
+            other = make_socket()
+            other.bind(("127.0.0.1", 0))
+            other.listen()
+            caller.f_locals["lsock"] = other
+        elif fault in {"udp_client", "ipv6_client"}:
+            csock = make_socket(
+                socket.AF_INET6 if fault == "ipv6_client" else socket.AF_INET,
+                socket.SOCK_DGRAM if fault == "udp_client" else socket.SOCK_STREAM,
+            )
+            caller.f_locals["csock"] = csock
+        elif fault in {"udp_listener", "ipv6_listener"}:
+            caller.f_locals["lsock"] = make_socket(
+                socket.AF_INET6 if fault == "ipv6_listener" else socket.AF_INET,
+                socket.SOCK_DGRAM if fault == "udp_listener" else socket.SOCK_STREAM,
+            )
+        elif fault == "wrong_host":
+            address = ("127.0.0.2", address[1])
+        elif fault == "wrong_port":
+            address = (address[0], 0)
+        elif fault == "wrong_address_shape":
+            address = (*address, 0, 0)
+        assert not _internal_socketpair_connect(
+            (csock, address), caller, platform="win32", codes=codes
+        )
+
+
+def test_stdlib_fallback_direct_caller_predicate_before_connect():
+    # Observe the actual stdlib frame at its C connect boundary, then abort
+    # BEFORE audit/syscall. No stdlib patches or network policy changes.
+    # Linux 3.11 has only native socketpair; later Linux has a callable fallback.
+    fallback = getattr(socket, "_fallback_socketpair", None)
+    if fallback is None and sys.platform != "win32":
+        with ExitStack() as cleanup:
+            for sock in socket.socketpair():
+                cleanup.enter_context(sock)
+                assert sock.family == socket.AF_UNIX
+        return
+    function = fallback or socket.socketpair
+    observed = []
+
+    class ProbeComplete(Exception):
+        pass
+
+    def profile(frame, event, arg):
+        if event == "c_call" and getattr(arg, "__name__", None) == "connect":
+            csock = arg.__self__
+            args = (csock, frame.f_locals["lsock"].getsockname())
+            observed.append(
+                (
+                    frame.f_code is function.__code__,
+                    _internal_socketpair_connect(
+                        args, frame, platform="win32", codes=_stdlib_socketpair_codes()
+                    ),
+                    _internal_socketpair_connect(
+                        args, frame, platform="linux", codes=_stdlib_socketpair_codes()
+                    ),
+                )
+            )
+            raise ProbeComplete
+
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(profile)
+        with pytest.raises(ProbeComplete):
+            function(socket.AF_INET)
+    finally:
+        sys.setprofile(previous)
+    assert observed == [(True, True, False)]
 
 
 def test_messages_only_cold_metadata_is_explicit_and_cached(
@@ -476,6 +653,131 @@ def test_literal_ip():
     )
     assert result.returncode == 1
     assert [a["event"] for a in receipt["attempts"]] == ["socket.connect"]
+
+
+def test_runner_socketpair_and_event_loops_are_internal_not_vendor_requests(tmp_path):
+    result, receipt = _child(
+        tmp_path,
+        """
+_retained = []
+
+def test_internal_plumbing():
+    import asyncio, socket, weakref
+    def pair():
+        left, right = socket.socketpair()
+        try:
+            left.send(b"internal")
+            assert right.recv(8) == b"internal"
+        finally:
+            left.close()
+            right.close()
+    async def ready():
+        return True
+    pair()
+    assert asyncio.run(ready())
+    assert asyncio.run(ready())
+    class Retained:
+        pass
+    obj = Retained()
+    _retained.append(obj)
+    weakref.finalize(obj, pair)
+""",
+    )
+    assert result.returncode == receipt["exit_code"] == 0, result.stdout + result.stderr
+    assert receipt["attempts"] == []
+    assert receipt["shutdown_accounted"]
+    count = receipt["permitted_operations"]["internal_socketpair_connect"]
+    if sys.platform == "win32":
+        assert count >= 4  # one pair, two loops, and the shutdown pair
+    else:
+        assert count == 0
+
+
+@pytest.mark.parametrize("operation", ["connect", "connect_ex", "sendto", "sendmsg"])
+def test_guard_still_denies_ordinary_loopback_and_datagrams(tmp_path, operation):
+    result, receipt = _child(
+        tmp_path,
+        f"""
+def test_denied_operation():
+    import socket
+    with socket.socket() as lsock, socket.socket() as csock:
+        lsock.bind(("127.0.0.1", 0))
+        lsock.listen()
+        address = lsock.getsockname()
+        try:
+            operation = {operation!r}
+            if operation == "connect":
+                csock.connect(address)
+            elif operation == "connect_ex":
+                csock.connect_ex(address)
+            else:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+                    if operation == "sendto":
+                        udp.sendto(b"denied", address)
+                    elif hasattr(udp, "sendmsg"):
+                        udp.sendmsg([b"denied"], [], 0, address)
+                    else:
+                        # Windows has no sendmsg method; exercise its audit
+                        # event without claiming a native sendmsg syscall.
+                        import sys
+                        sys.audit("socket.sendmsg", udp, address)
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("Ordinary loopback/datagram escaped")
+""",
+    )
+    assert result.returncode == receipt["exit_code"] == 1
+    event = "socket.connect" if operation == "connect_ex" else f"socket.{operation}"
+    assert [a["event"] for a in receipt["attempts"]] == [event]
+    assert receipt["shutdown_accounted"]
+
+
+@pytest.mark.parametrize("operation", ["gethostbyname", "gethostbyaddr"])
+def test_guard_still_denies_other_dns_operations(tmp_path, operation):
+    result, receipt = _child(
+        tmp_path,
+        f"""
+def test_dns_denied():
+    import socket
+    try:
+        socket.{operation}("127.0.0.1")
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("DNS escaped")
+""",
+    )
+    assert result.returncode == receipt["exit_code"] == 1
+    assert [a["event"] for a in receipt["attempts"]] == [f"socket.{operation}"]
+
+
+def test_guard_denies_socketpair_filename_impostor(tmp_path):
+    result, receipt = _child(
+        tmp_path,
+        """
+def test_impostor():
+    import socket
+    source = '''
+def socketpair():
+    with socket.socket() as lsock, socket.socket() as csock:
+        lsock.bind(("127.0.0.1", 0))
+        lsock.listen()
+        try:
+            csock.connect(lsock.getsockname())
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("Filename impostor escaped")
+'''
+    namespace = {"socket": socket}
+    exec(compile(source, socket.__file__, "exec"), namespace)
+    namespace["socketpair"]()
+""",
+    )
+    assert result.returncode == receipt["exit_code"] == 1
+    assert [a["event"] for a in receipt["attempts"]] == ["socket.connect"]
+    assert any(f["function"] == "socketpair" for f in receipt["attempts"][0]["stack"])
 
 
 def test_guard_denies_unguarded_child_before_it_can_run(tmp_path):

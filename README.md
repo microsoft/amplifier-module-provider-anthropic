@@ -17,7 +17,13 @@ accounting. The runner installs a Python
 audit deny-and-record hook **before** site initialization, real Core/Foundation
 imports and pytest collection. Audited
 DNS/socket attempts and unguarded subprocesses fail the run, even when provider
-fallback catches the exception. This is isolation for **trusted tests**, not a
+fallback catches the exception. The sole INET connect exception is Windows'
+exact stdlib socketpair implementation connecting its own IPv4 stream socket to
+its live loopback listener's exact address (needed for asyncio's self-pipe).
+Receipts count this as `internal_socketpair_connect`, not a vendor request.
+Ordinary loopback connects, DNS and datagram sends remain denied; Linux predicate
+or fallback checks do not establish native Windows qualification.
+This is isolation for **trusted tests**, not a
 tamper-proof security sandbox for hostile Python, forks or native code outside
 Python's audit surface. Receipts are written to
 `ai_working/tmp/offline-receipt.json`; they contain local source paths and are

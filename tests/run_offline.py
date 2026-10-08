@@ -22,14 +22,64 @@ import socket
 import sys
 import tempfile
 import traceback
+from types import CodeType
+
+
+def _stdlib_socketpair_codes():
+    """Capture normal stdlib Python implementations, not filenames or wrappers."""
+    return tuple(
+        code
+        for name in ("socketpair", "_fallback_socketpair")
+        if isinstance(
+            code := getattr(getattr(socket, name, None), "__code__", None), CodeType
+        )
+    )
+
+
+def _internal_socketpair_connect(args, caller, *, platform, codes):
+    """Allow only Windows' stdlib IPv4 self-pipe connect to its own listener."""
+    try:
+        if platform != "win32" or not any(caller.f_code is code for code in codes):
+            return False
+        csock, address = args
+        lsock = caller.f_locals.get("lsock")
+        if (
+            caller.f_locals.get("csock") is not csock
+            or type(csock) is not socket.socket
+            or type(lsock) is not socket.socket
+            or csock is lsock
+            or csock.family != socket.AF_INET
+            or lsock.family != socket.AF_INET
+            or csock.type != socket.SOCK_STREAM
+            or lsock.type != socket.SOCK_STREAM
+            or csock.fileno() < 0
+            or lsock.fileno() < 0
+            or not lsock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+        ):
+            return False
+        own_address = lsock.getsockname()
+        return own_address[0] == "127.0.0.1" and address == own_address
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
 
 
 def install_network_guard():
     """Retain audited attempts separately from provider/test exception handling."""
     attempts = []
     phase = ["preimports"]
+    # main calls us after isolated no-site re-exec and normal stdlib import,
+    # before site/dependencies. Keep those exact identities for this guard.
+    platform = sys.platform
+    socketpair_codes = _stdlib_socketpair_codes()
+    permitted = {"internal_socketpair_connect": 0}
 
     def audit(event, args):
+        if event == "socket.connect" and _internal_socketpair_connect(
+            args, sys._getframe(1), platform=platform, codes=socketpair_codes
+        ):
+            # No target, payload or vendor attribution: this is stdlib plumbing.
+            permitted["internal_socketpair_connect"] += 1
+            return
         dns = event in {
             "socket.getaddrinfo",
             "socket.gethostbyname",
@@ -76,7 +126,10 @@ def install_network_guard():
     def set_phase(value):
         phase[0] = value
 
-    return snapshot, set_phase
+    def permitted_snapshot():
+        return dict(permitted)
+
+    return snapshot, set_phase, permitted_snapshot
 
 
 def imported_identity():
@@ -123,7 +176,7 @@ def main():
     # --required-live is useful as a negative gate probe here: sanitation leaves
     # it unmet. It does not disable the guard or authorize a vendor request.
 
-    snapshot, set_phase = install_network_guard()
+    snapshot, set_phase, permitted_snapshot = install_network_guard()
     destination = Path(options.receipt)
     destination.parent.mkdir(parents=True, exist_ok=True)
     receipt = {
@@ -157,6 +210,7 @@ def main():
             if home is not None:
                 home.cleanup()
             receipt["attempts"] = snapshot()
+            receipt["permitted_operations"] = permitted_snapshot()
             receipt["shutdown_accounted"] = True
             receipt["exit_code"] = 1 if receipt["attempts"] else code
             destination = Path(options.receipt)
@@ -276,6 +330,7 @@ def main():
     finally:
         atexit.register(set_phase, "shutdown")
         receipt["attempts"] = snapshot()
+        receipt["permitted_operations"] = permitted_snapshot()
         if receipt["attempts"]:
             code = 1
             print(
