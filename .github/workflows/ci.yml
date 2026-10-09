@@ -33,7 +33,9 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --dev
 
-      - name: Run test suite
-        # Inherited contracts mount with a scoped nonfunctional credential.
-        # Catalog contract tests mock only the SDK boundary; no live secrets.
-        run: uv run pytest -q
+      - name: Install test integration dependency
+        run: uv pip install "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@a34b770ca604b88230449ac728d41dc23a2863a9"
+
+      - name: Run trusted offline inventory (required live vision remains UNMET)
+        # Real vision remains a separate UNMET gate, never a synthetic pass.
+        run: uv run python -I -S tests/run_offline.py -q

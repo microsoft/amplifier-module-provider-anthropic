@@ -13,7 +13,15 @@ Usage
         input_tokens=1_000,
         output_tokens=200,
     )
-    # Returns Decimal or None if the model is not recognised.
+    # Returns Decimal or None if pricing is unavailable.
+
+Haiku 5.5 rates verified 2026-10-07:
+https://platform.claude.com/docs/en/about-claude/pricing
+Prompt <=100,000: input .10, output .50, write 5m .125 / 1h .20, read .01.
+Prompt >100,000: input .50, output 2.50, write 5m .625 / 1h 1.00, read .05.
+All rates USD/MTok. The cached/server-added threshold predicate and full-vs-
+excess charging are unverified. No exact scalar cost is computed, even for
+apparently small prompts; None is unavailable, never a claim of zero cost.
 """
 
 from __future__ import annotations
@@ -74,6 +82,14 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "output_per_m": Decimal("15.00"),
         "cache_read_per_m": Decimal("0.30"),
         "cache_write_per_m": Decimal("3.75"),
+    },
+    # Claude Sonnet 5.5: cache reads reduced from $0.20 to $0.10/MTok.
+    # First-party pricing verified 2026-10-07; only the documented fixed ID.
+    "claude-sonnet-5-5": {
+        "input_per_m": Decimal("2.00"),
+        "output_per_m": Decimal("10.00"),
+        "cache_read_per_m": Decimal("0.10"),
+        "cache_write_per_m": Decimal("2.50"),
     },
     # ------------------------------------------------------------------
     # Claude Opus 4.5 / 4.6 / 4.7 family  ($5 / $25 / $0.50 / $6.25)
@@ -296,7 +312,8 @@ def compute_cost(
     Returns
     -------
     Decimal | None
-        The computed cost in USD, or ``None`` if *model* is not recognised.
+        The computed cost in USD, or ``None`` if pricing is unavailable
+        (including Haiku 5.5's unverified prompt-tier rules).
         ``None`` is semantically distinct from ``Decimal('0')`` (a free call).
     """
     rates = _RATES.get(model)
