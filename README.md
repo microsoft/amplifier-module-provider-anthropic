@@ -110,10 +110,11 @@ and images are retained. Synthetic offline signatures prove storage fidelity,
 not vendor/account replay acceptance.
 
 The model's native computer capability is `computer_toolset_20260801`, **not**
-Haiku 4.5's legacy computer type. Native declarations fail locally in this
-provider path pending separate adapter/executor qualification; ordinary function
-tools, even one named `computer`, are unaffected. Capability metadata does not
-claim installed executor readiness.
+Haiku 4.5's legacy computer type. Explicit neutral v1 intent can compile to this
+GA toolset on the exact first-party HTTPS endpoint. Legacy native declarations
+still fail locally on Haiku 5.5; ordinary function tools, even one named
+`computer`, are unaffected. Offline adapter contracts do not establish live
+vendor/account replay or installed executor readiness.
 
 #### Haiku pricing is unavailable, not zero
 
@@ -171,6 +172,76 @@ Provider-derived headers do not add a legacy computer-use beta for the new
 toolset; an explicitly configured beta header is retained. As elsewhere in this provider, expert
 `extra_request_params.tool_choice` is an explicit wire-level override and wins
 over this derived default. This does not change the default model.
+
+### Provider-neutral computer-use v1
+
+Tools opt in through an explicit `ToolSpec.computer_use` extra, transported by
+the existing native-tool-spec mechanism. Names do not opt in. `ToolSpec.name`
+remains the local dispatch alias; `ToolSpec.parameters` remains the canonical
+function argument schema.
+
+```python
+ToolSpec(
+    name="desktop",
+    parameters=canonical_schema,
+    type="function",
+    computer_use={
+        "version": 1,
+        "operations": ["screenshot", "mouse_move", "left_click", "key"],
+        "image_space": {"width": 1280, "height": 720, "unit": "pixel"},
+        "unavailable_operations": {},
+    },
+)
+```
+
+Supply actual cached screenshot dimensions, not physical monitor dimensions or
+estimates. Only the exact Sonnet/Haiku 5.5 IDs and the existing recognized Opus
+5.5 IDs use this provider's GA native compiler. It explicitly disables every
+member not listed in `operations`; unavailable operations cannot also be enabled.
+No computer-use beta header, legacy display declaration, concrete computer-bundle
+import, peer-provider import or native capability discovery is needed.
+
+Unknown image dimensions (`image_space: None`), oversized screenshots,
+unverified models and unsupported endpoints use the original ordinary function
+schema with intent/diagnostics removed. Optional `computer_use.native_required:
+True` refuses those cases instead of falling back. Malformed intent, ambiguous
+aliases and mixed neutral/legacy declarations always fail locally. Model-only
+expert overrides are compiled using the final effective model; overrides of
+tools/messages/system/tool choice are refused for neutral requests. Use public
+request fields instead.
+
+The native path uses `auto`/`none` only and disables parallel tool use request-wide.
+One vendor member becomes one local-alias **singleton canonical batch**:
+
+```json
+{"version":1,"actions":[{"action":"left_click","coordinate":[426,87]}],"capture_after":true}
+```
+
+Coordinates stay in full-screenshot pixels; durations stay in seconds and scroll
+amounts in wheel notches. The adapter supports the 17 documented GA member names
+when explicitly enabled, but refuses unqualified modifiers, repeated key presses
+other than `repeat: 1`, path variants, missing drag starts, noninteger native
+durations/amounts and invalid geometry. It does not guess alternative semantics.
+Pending safety requirements or unknown native member metadata are refused before
+returning executable calls; no acknowledgement is fabricated. Native replies
+without the declared family are refused unless they name a separately declared
+ordinary function (for example, an ordinary `screenshot` tool).
+
+Both canonical content and compatibility tool calls retain provider-owned
+provenance. Replay reconstructs the original vendor input, never the executor
+batch, and binds tool results by call ID. Alias/image-space/provenance changes
+refuse replay rather than silently downgrading it. Text, images and `is_error`
+survive count/create/stream and second-turn projection without mutating the
+caller. Old installed tools without neutral intent keep their existing flat
+native inputs; they do not receive the new batch contract.
+
+Protocol sources: [computer tool reference](https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool),
+[toolset reference](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-reference#client-toolsets),
+and [Haiku migration](https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide#computer-use-toolset).
+Repository-native offline tests use real Core and SDK types with transport fakes.
+Paid native vendor checks, signed/account replay, actual final screenshots,
+platform/backend input and the required live-vision gate remain separate
+qualification requirements. Haiku pricing is unchanged and still unavailable.
 
 ## Configuration
 

@@ -70,14 +70,18 @@ from ._cost import compute_cost
 from ._computer_toolset import (
     COMPUTER_TOOLSET_NAME,
     PROVENANCE_MEMBER,
+    PROVENANCE_NEUTRAL,
     PROVENANCE_TOOLSET,
     ComputerToolsetError,
     NativeComputerAdapter,
+    canonical_native_batch,
     guard_sonnet_overrides,
     has_native_computer_history,
+    has_neutral_computer_intent,
     is_opus_55,
     is_sonnet_55,
     native_wire_tool_use,
+    neutral_effective_model,
     translate_tools,
     validate_member,
 )
@@ -545,6 +549,7 @@ class _RequestAssembly:
     thinking_budget: int | None
     interleaved_thinking_enabled: bool
     native_computer_adapter: NativeComputerAdapter | None
+    neutral_function_names: frozenset[str] | None = None
 
 
 @dataclass
@@ -3090,8 +3095,9 @@ class AnthropicProvider:
         By default excludes IDs already repaired to prevent legacy detection
         loops. Request-local repairs must include them because the caller's
         canonical history deliberately never contains the synthetic results.
-        Haiku also uses the wire projection to include compatibility tool_calls,
-        with the converter's canonical precedence and duplicate suppression.
+        Compatibility tool_calls use canonical-first duplicate suppression.
+        Pair Core IDs directly: this scan is not an authoritative wire projection
+        and does not yet have the request-local native adapter.
 
         Returns:
             List of (msg_index, call_id, tool_name, tool_arguments) tuples for unpaired calls.
@@ -3101,29 +3107,37 @@ class AnthropicProvider:
         tool_results = set()  # {call_id}
 
         for idx, msg in enumerate(messages):
-            if msg.role == "assistant" and include_compatibility:
-                projected = self._convert_messages(
-                    [msg.model_dump()], emit_warnings=False
-                )[0]["content"]
-                if isinstance(projected, list):
-                    for block in projected:
-                        if block.get("type") == "tool_use":
+            if msg.role == "assistant":
+                canonical_ids = set()
+                if isinstance(msg.content, list):
+                    for raw in msg.content:
+                        block = self._content_block_mapping(raw)
+                        if block and block.get("type") == "tool_call":
+                            canonical_ids.add(block["id"])
                             tool_calls[block["id"]] = (
                                 idx,
                                 block["name"],
                                 block["input"],
                             )
-            # Check assistant messages for ToolCallBlock in content
-            elif msg.role == "assistant" and isinstance(msg.content, list):
-                for block in msg.content:
-                    if hasattr(block, "type") and block.type == "tool_call":
-                        tool_calls[block.id] = (idx, block.name, block.input)
-
-            # Check tool messages for tool_call_id
-            elif (
-                msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id
-            ):
+                if include_compatibility:
+                    for raw in getattr(msg, "tool_calls", None) or []:
+                        call = self._content_block_mapping(raw)
+                        if call and call["id"] not in canonical_ids:
+                            tool_calls[call["id"]] = (
+                                idx,
+                                call["name"],
+                                call.get("arguments", {}),
+                            )
+                            canonical_ids.add(call["id"])
+            if msg.role == "tool" and msg.tool_call_id:
                 tool_results.add(msg.tool_call_id)
+            elif isinstance(msg.content, list):
+                for raw in msg.content:
+                    block = self._content_block_mapping(raw)
+                    if block and block.get("type") == "tool_result":
+                        call_id = block.get("tool_call_id")
+                        if call_id:
+                            tool_results.add(call_id)
 
         # Exclude IDs that have already been repaired to prevent infinite loops
         return [
@@ -3207,6 +3221,9 @@ class AnthropicProvider:
             )
         is_haiku55 = self._prevalidate_haiku55_request(request, validation_options)
         self._prevalidate_sonnet_computer(request, validation_options)
+        if has_neutral_computer_intent(request.tools or []):
+            # Legacy repair mutates its input; neutral transport owns only a copy.
+            request = request.model_copy(deep=True)
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(
             request.messages,
@@ -3606,7 +3623,11 @@ class AnthropicProvider:
         return caps.base_context_window if caps.base_context_window > 0 else None
 
     def _validate_haiku55_request(
-        self, params: dict[str, Any], options: Mapping[str, Any]
+        self,
+        params: dict[str, Any],
+        options: Mapping[str, Any],
+        *,
+        native_computer_adapter: NativeComputerAdapter | None = None,
     ) -> None:
         """Validate the final effective wire, including expert extra_body overrides.
 
@@ -3656,6 +3677,12 @@ class AnthropicProvider:
             )
         for tool in wire.get("tools") or []:
             if str(tool.get("type", "")).startswith("computer_"):
+                if (
+                    native_computer_adapter is not None
+                    and native_computer_adapter.neutral
+                    and tool.get("type") == "computer_toolset_20260801"
+                ):
+                    continue
                 fail(
                     "native computer executor qualification is not available in this provider "
                     "path; use an ordinary function tool until the adapter is qualified."
@@ -3732,6 +3759,10 @@ class AnthropicProvider:
         model = options.get("model", self.default_model)
         native_history = has_native_computer_history(request.messages)
         try:
+            neutral = has_neutral_computer_intent(request.tools or [])
+            model = neutral_effective_model(
+                request.tools or [], model, self.extra_request_params
+            )
             guard_sonnet_overrides(
                 request.tools or [],
                 model,
@@ -3742,18 +3773,26 @@ class AnthropicProvider:
                 translate_tools(
                     request.tools or [], model=model, base_url=self._effective_base_url
                 )
-                if isinstance(model, str)
-                and model.lower().startswith("claude-sonnet-5-5")
+                if neutral
+                or (
+                    isinstance(model, str)
+                    and model.lower().startswith("claude-sonnet-5-5")
+                )
                 else ([], None)
             )
         except ComputerToolsetError as exc:
             raise KernelInvalidRequestError(
                 str(exc), provider="anthropic", model=model, status_code=400
             ) from exc
-        if adapter is not None or (
-            isinstance(model, str)
-            and model.lower().startswith("claude-sonnet-5-5")
-            and native_history
+        if (
+            neutral
+            or adapter is not None
+            or native_history
+            or (
+                isinstance(model, str)
+                and model.lower().startswith("claude-sonnet-5-5")
+                and native_history
+            )
         ):
             self._assemble_request_params(
                 request,
@@ -3795,6 +3834,20 @@ class AnthropicProvider:
         """
         options = dict(request_options)
         effective_model = options.get("model", self.default_model)
+        try:
+            neutral_model = neutral_effective_model(
+                request.tools or [], effective_model, self.extra_request_params
+            )
+        except ComputerToolsetError as exc:
+            raise KernelInvalidRequestError(
+                str(exc), provider="anthropic", model=effective_model, status_code=400
+            ) from exc
+        if has_neutral_computer_intent(request.tools or []):
+            effective_model = options["model"] = neutral_model
+            request_caps = self._apply_runtime_capability_overrides(
+                self._get_capabilities(effective_model),
+                self._runtime_model_info_cache.get(effective_model),
+            )
         if self._is_haiku55_request(options):
             # Expert model overrides must use Haiku controls, not the original
             # model's sampling/manual-thinking defaults.
@@ -3836,7 +3889,10 @@ class AnthropicProvider:
                 base_url=self._effective_base_url,
             )
             if (
-                effective_model.lower().startswith("claude-sonnet-5-5")
+                (
+                    effective_model.lower().startswith("claude-sonnet-5-5")
+                    or has_neutral_computer_intent(request.tools or [])
+                )
                 and native_computer_adapter is None
                 and has_native_computer_history(request.messages)
             ):
@@ -4375,7 +4431,9 @@ class AnthropicProvider:
         _route_wire_only_params(params)
         if native_computer_adapter is not None and native_computer_adapter.strict:
             self._validate_sonnet_computer_wire(params, native_computer_adapter)
-        self._validate_haiku55_request(params, options)
+        self._validate_haiku55_request(
+            params, options, native_computer_adapter=native_computer_adapter
+        )
         if params.get("model") == "claude-haiku-5-5":
             params["max_tokens"] = min(params["max_tokens"], model_ceiling)
             if request.max_output_tokens is not None:
@@ -4391,6 +4449,17 @@ class AnthropicProvider:
             thinking_budget=thinking_budget,
             interleaved_thinking_enabled=interleaved_thinking_enabled,
             native_computer_adapter=native_computer_adapter,
+            neutral_function_names=(
+                frozenset(
+                    tool["name"]
+                    for tool in params.get("tools", [])
+                    if tool.get("type") in {None, "function", "custom"}
+                    and isinstance(tool.get("name"), str)
+                )
+                if has_neutral_computer_intent(request.tools or [])
+                and native_computer_adapter is None
+                else None
+            ),
         )
 
     def _validate_sonnet_computer_wire(
@@ -4406,7 +4475,7 @@ class AnthropicProvider:
         extra = params.get("extra_body") or {}
         choice = extra.get("tool_choice", params.get("tool_choice"))
         if not isinstance(choice, dict) or choice.get("type") not in {"auto", "none"}:
-            fail("Sonnet 5.5 native computer supports only auto/none tool choice.")
+            fail("Native computer supports only auto/none tool choice.")
         if set(choice) - {"type", "disable_parallel_tool_use"}:
             fail("Unsupported native computer tool choice fields.")
         if (
@@ -4485,6 +4554,13 @@ class AnthropicProvider:
         ):
             return None
         options = dict(request_options or {})
+        if has_neutral_computer_intent(request.tools or []):
+            self._prevalidate_sonnet_computer(request, options)
+            options["model"] = neutral_effective_model(
+                request.tools or [],
+                options.get("model", self.default_model),
+                self.extra_request_params,
+            )
         budget_model = (
             "claude-haiku-5-5"
             if self._is_haiku55_request(options)
@@ -4649,7 +4725,18 @@ class AnthropicProvider:
         self._prevalidate_sonnet_computer(request, kwargs)
         if self._prevalidate_haiku55_request(request, kwargs):
             effective_model = "claude-haiku-5-5"
-        request_caps = await self._get_request_capabilities(effective_model)
+        if has_neutral_computer_intent(request.tools or []):
+            # Intent compilation uses verified provider facts, not speculative
+            # discovery. Respect the final wire model even under model overrides.
+            effective_model = neutral_effective_model(
+                request.tools or [], effective_model, self.extra_request_params
+            )
+            request_caps = self._apply_runtime_capability_overrides(
+                self._get_capabilities(effective_model),
+                self._runtime_model_info_cache.get(effective_model),
+            )
+        else:
+            request_caps = await self._get_request_capabilities(effective_model)
         if (
             effective_model in _DEPRECATED_MODELS
             and effective_model not in _warned_deprecated_models
@@ -5346,7 +5433,9 @@ class AnthropicProvider:
 
             # Build ChatResponse first
             chat_response = self._convert_to_chat_response(
-                response, native_computer_adapter=assembly.native_computer_adapter
+                response,
+                native_computer_adapter=assembly.native_computer_adapter,
+                neutral_function_names=assembly.neutral_function_names,
             )
 
             # Emit from canonical fields
@@ -5528,6 +5617,65 @@ class AnthropicProvider:
             return dict(dumped) if isinstance(dumped, dict) else None
         return None
 
+    def _neutral_computer_result(
+        self, block: dict[str, Any], family: str
+    ) -> dict[str, Any]:
+        """Project a call-ID-bound result, retaining error and image fidelity."""
+
+        def fail(reason: str) -> None:
+            raise KernelInvalidRequestError(
+                reason, provider="anthropic", status_code=400
+            )
+
+        if block.get("toolset_name") not in {None, family}:
+            fail("Neutral computer result family disagrees with its call binding.")
+        result = {
+            "type": "tool_result",
+            "tool_use_id": block["tool_use_id"],
+            "toolset_name": family,
+            "content": copy.deepcopy(block.get("content", "")),
+        }
+        if block.get("is_error") is not None:
+            if type(block["is_error"]) is not bool:
+                fail("Neutral computer result is_error must be boolean.")
+            result["is_error"] = block["is_error"]
+        content = result["content"]
+        if isinstance(content, str):
+            return result
+        if not isinstance(content, list):
+            fail("Neutral computer results require text/image content.")
+        projected = []
+        for raw in content:
+            item = self._content_block_mapping(raw)
+            if item is None or item.get("type") not in {"text", "image"}:
+                fail("Neutral computer results allow only text and images.")
+            if item["type"] == "text":
+                if not isinstance(item.get("text"), str):
+                    fail("Neutral computer result text must be a string.")
+                projected.append({"type": "text", "text": item["text"]})
+            else:
+                source = item.get("source")
+                if not isinstance(source, dict) or source.get("type") not in {
+                    "base64",
+                    "url",
+                }:
+                    fail("Neutral computer result image source is unsupported.")
+                fields = (
+                    ("type", "media_type", "data")
+                    if source["type"] == "base64"
+                    else ("type", "url")
+                )
+                if any(not isinstance(source.get(key), str) for key in fields):
+                    fail("Neutral computer result image source is malformed.")
+                projected.append(
+                    {
+                        "type": "image",
+                        "source": {key: copy.deepcopy(source[key]) for key in fields},
+                    }
+                )
+        result["content"] = projected
+        return result
+
     def _convert_messages(
         self,
         messages: list[dict[str, Any]],
@@ -5580,6 +5728,7 @@ class AnthropicProvider:
 
         anthropic_messages = []
         native_tool_use_ids: dict[str, str] = {}
+        preceding_tool_use_ids: set[str] = set()
         i = 0
 
         while i < len(messages):
@@ -5601,6 +5750,17 @@ class AnthropicProvider:
                     tool_msg = messages[i]
                     tool_use_id = tool_msg.get("tool_call_id")
 
+                    if (
+                        native_computer_adapter is not None
+                        and native_computer_adapter.neutral
+                        and tool_use_id not in preceding_tool_use_ids
+                    ):
+                        raise KernelInvalidRequestError(
+                            "Neutral result has no preceding call binding.",
+                            provider="anthropic",
+                            status_code=400,
+                        )
+
                     # DEFENSIVE: Skip tool_results without valid tool_use_id
                     # This prevents API errors from orphaned tool_results after compaction
                     if not tool_use_id or tool_use_id not in valid_tool_use_ids:
@@ -5619,9 +5779,28 @@ class AnthropicProvider:
                         "content": tool_msg.get("content", ""),
                     }
                     toolset_name = native_tool_use_ids.get(tool_use_id)
+                    if (
+                        native_computer_adapter is not None
+                        and native_computer_adapter.neutral
+                        and not toolset_name
+                        and tool_msg.get("toolset_name") is not None
+                    ):
+                        raise KernelInvalidRequestError(
+                            "Ordinary result cannot claim a native toolset family.",
+                            provider="anthropic",
+                            status_code=400,
+                        )
                     if toolset_name:
                         result["toolset_name"] = toolset_name
                     if (
+                        toolset_name
+                        and native_computer_adapter is not None
+                        and native_computer_adapter.neutral
+                    ):
+                        result = self._neutral_computer_result(
+                            {**tool_msg, "tool_use_id": tool_use_id}, toolset_name
+                        )
+                    elif (
                         toolset_name
                         and native_computer_adapter is not None
                         and native_computer_adapter.strict
@@ -5826,6 +6005,11 @@ class AnthropicProvider:
                         legacy_thinking_count, {"type": "text", "text": content}
                     )
 
+                preceding_tool_use_ids.update(
+                    block["id"]
+                    for block in content_blocks
+                    if block.get("type") == "tool_use"
+                )
                 if structured_content and not content_blocks:
                     i += 1
                     continue  # An empty unsigned reasoning-only turn has no wire content.
@@ -5846,9 +6030,61 @@ class AnthropicProvider:
                 if isinstance(content, list):
                     content_blocks = []
                     for block in content:
+                        block = self._content_block_mapping(block)
                         if isinstance(block, dict):
                             block_type = block.get("type")
-                            if block_type == "text":
+                            if (
+                                block_type == "tool_result"
+                                and native_computer_adapter is not None
+                                and native_computer_adapter.neutral
+                            ):
+                                # Core stores tool_call_id/output; the vendor wire
+                                # uses tool_use_id/content. Project without mutation.
+                                result_id = block.get(
+                                    "tool_call_id", block.get("tool_use_id")
+                                )
+                                projected_result = {
+                                    "type": "tool_result",
+                                    "tool_use_id": result_id,
+                                    "content": copy.deepcopy(
+                                        block.get("output", block.get("content", ""))
+                                    ),
+                                }
+                                if block.get("is_error") is not None:
+                                    projected_result["is_error"] = block["is_error"]
+                                if "toolset_name" in block:
+                                    projected_result["toolset_name"] = block[
+                                        "toolset_name"
+                                    ]
+                                if result_id not in preceding_tool_use_ids:
+                                    raise KernelInvalidRequestError(
+                                        "Structured result has no preceding call binding.",
+                                        provider="anthropic",
+                                        status_code=400,
+                                    )
+                                family = native_tool_use_ids.get(result_id)
+                                if not family:
+                                    if projected_result.get("toolset_name") is not None:
+                                        raise KernelInvalidRequestError(
+                                            "Ordinary result cannot claim a native toolset family.",
+                                            provider="anthropic",
+                                            status_code=400,
+                                        )
+                                    projected_result.pop("toolset_name", None)
+                                    if result_id not in valid_tool_use_ids:
+                                        raise KernelInvalidRequestError(
+                                            "Structured result has no matching call binding.",
+                                            provider="anthropic",
+                                            status_code=400,
+                                        )
+                                    content_blocks.append(projected_result)
+                                else:
+                                    content_blocks.append(
+                                        self._neutral_computer_result(
+                                            projected_result, family
+                                        )
+                                    )
+                            elif block_type == "text":
                                 content_blocks.append(
                                     {"type": "text", "text": block.get("text", "")}
                                 )
@@ -6768,6 +7004,7 @@ class AnthropicProvider:
         response: Any,
         *,
         native_computer_adapter: NativeComputerAdapter | None = None,
+        neutral_function_names: frozenset[str] | None = None,
     ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
@@ -6792,6 +7029,22 @@ class AnthropicProvider:
         ] = []
         text_accumulator: list[str] = []
 
+        if neutral_function_names is not None:
+            for block in response.content:
+                if getattr(block, "pending_safety_checks", None) or (
+                    getattr(block, "type", None) == "tool_use"
+                    and (
+                        getattr(block, "toolset_name", None) is not None
+                        or block.name not in neutral_function_names
+                    )
+                ):
+                    raise KernelInvalidRequestError(
+                        "Neutral ordinary fallback returned an undeclared native/function call or pending safety requirements.",
+                        provider="anthropic",
+                        status_code=400,
+                        retryable=False,
+                    )
+
         native_blocks = (
             [
                 block
@@ -6812,7 +7065,39 @@ class AnthropicProvider:
                 retryable=False,
             )
         if native_computer_adapter is not None and native_computer_adapter.strict:
+            seen_tool_ids: set[str] = set()
+            if native_computer_adapter.neutral and getattr(
+                response, "pending_safety_checks", None
+            ):
+                raise KernelInvalidRequestError(
+                    "Pending native safety requirements cannot be acknowledged by this provider.",
+                    provider="anthropic",
+                    status_code=400,
+                    retryable=False,
+                )
             for block in response.content:
+                if native_computer_adapter.neutral:
+                    if getattr(block, "pending_safety_checks", None):
+                        raise KernelInvalidRequestError(
+                            "Pending native safety requirements cannot be acknowledged by this provider.",
+                            provider="anthropic",
+                            status_code=400,
+                            retryable=False,
+                        )
+                    if getattr(block, "type", None) not in {
+                        "tool_use",
+                        "text",
+                        "thinking",
+                        "redacted_thinking",
+                        "web_search_tool_result",
+                        "server_tool_use",
+                    }:
+                        raise KernelInvalidRequestError(
+                            "Unknown neutral native response block cannot authorize execution.",
+                            provider="anthropic",
+                            status_code=400,
+                            retryable=False,
+                        )
                 if getattr(block, "type", None) != "tool_use":
                     continue
                 family = getattr(block, "toolset_name", None)
@@ -6821,6 +7106,19 @@ class AnthropicProvider:
                         raise ComputerToolsetError(
                             "Native computer tool_use requires a nonempty id."
                         )
+                    if native_computer_adapter.neutral:
+                        if block.id in seen_tool_ids:
+                            raise ComputerToolsetError("Duplicate neutral tool_use id.")
+                        seen_tool_ids.add(block.id)
+                        if family is not None and any(
+                            value is not None
+                            for value in (
+                                getattr(block, "model_extra", None) or {}
+                            ).values()
+                        ):
+                            raise ComputerToolsetError(
+                                "Unknown native member metadata, including safety requirements, is unsupported."
+                            )
                     if family is None:
                         if block.name not in native_computer_adapter.ordinary_names:
                             raise ComputerToolsetError(
@@ -6888,11 +7186,21 @@ class AnthropicProvider:
                             retryable=False,
                         )
                     name = native_computer_adapter.alias
-                    input_data = {"action": block.name, **input_data}
                     block_extra = {
                         PROVENANCE_TOOLSET: native_computer_adapter.toolset_name,
                         PROVENANCE_MEMBER: block.name,
                     }
+                    if native_computer_adapter.neutral:
+                        block_extra[PROVENANCE_NEUTRAL] = {
+                            "version": 1,
+                            "input": copy.deepcopy(input_data),
+                            "image_space": list(native_computer_adapter.image_space),
+                        }
+                        input_data = canonical_native_batch(
+                            native_computer_adapter, block.name, input_data
+                        )
+                    else:
+                        input_data = {"action": block.name, **input_data}
                 content_blocks.append(
                     ToolCallBlock(
                         id=block.id, name=name, input=input_data, **block_extra
