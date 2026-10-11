@@ -5261,7 +5261,7 @@ class AnthropicProvider:
 
         return valid_calls
 
-    def _clean_content_block(self, block: dict[str, Any]) -> dict[str, Any]:
+    def _clean_content_block(self, block: dict[str, Any]) -> dict[str, Any] | None:
         """Clean a content block for API by removing fields not accepted by Anthropic API.
 
         Anthropic API may include extra fields (like 'visibility') in responses,
@@ -5271,17 +5271,23 @@ class AnthropicProvider:
             block: Raw content block dict (may include visibility, etc.)
 
         Returns:
-            Cleaned content block dict with only API-accepted fields
+            Cleaned content block with only API-accepted fields. Unsigned
+            thinking becomes readable text; an empty unsigned block is omitted.
         """
         block_type = block.get("type")
 
         if block_type == "text":
             return {"type": "text", "text": block.get("text", "")}
         if block_type == "thinking":
-            cleaned = {"type": "thinking", "thinking": block.get("thinking", "")}
-            if "signature" in block:
-                cleaned["signature"] = block["signature"]
-            return cleaned
+            signature = block.get("signature")
+            thinking = block.get("thinking", "")
+            if not isinstance(signature, str):
+                # Other providers persist unsigned reasoning summaries in the
+                # shared ThinkingBlock shape. They are not Anthropic thinking
+                # blocks: replay their readable text, never a null/fake signature.
+                # This is a wire projection; canonical history remains untouched.
+                return {"type": "text", "text": thinking} if thinking else None
+            return {"type": "thinking", "thinking": thinking, "signature": signature}
         if block_type in {"tool_use", "tool_call"}:
             return {
                 "type": "tool_use",
@@ -5441,6 +5447,7 @@ class AnthropicProvider:
                 content_blocks: list[dict[str, Any]] = []
                 canonical_tool_ids: set[str] = set()
                 canonical_tools: dict[str, dict[str, Any]] = {}
+                canonical_thinking = False
                 if structured_content:
                     for raw_block in content:
                         block = self._content_block_mapping(raw_block)
@@ -5451,6 +5458,9 @@ class AnthropicProvider:
                                     type(raw_block).__name__,
                                 )
                             continue
+                        canonical_thinking |= block.get("type") in {
+                            "thinking", "redacted_thinking"
+                        }
                         try:
                             cleaned = native_wire_tool_use(
                                 block, native_computer_adapter
@@ -5459,6 +5469,8 @@ class AnthropicProvider:
                             raise KernelInvalidRequestError(
                                 str(exc), provider="anthropic", status_code=400
                             ) from exc
+                        if cleaned is None:
+                            continue
                         content_blocks.append(cleaned)
                         if (
                             cleaned.get("type") == "tool_use"
@@ -5478,24 +5490,20 @@ class AnthropicProvider:
                     legacy_thinking = self._content_block_mapping(
                         msg.get("thinking_block")
                     )
-                    if (
-                        legacy_thinking
-                        and not any(
-                            block.get("type") in {"thinking", "redacted_thinking"}
-                            for block in content_blocks
-                        )
-                    ):
+                    if legacy_thinking and not canonical_thinking:
                         # Older persisted turns kept their sole thinking block
                         # separately. It precedes the structured transcript.
-                        content_blocks.insert(
-                            0, self._clean_content_block(legacy_thinking)
-                        )
+                        cleaned_thinking = self._clean_content_block(legacy_thinking)
+                        if cleaned_thinking is not None:
+                            content_blocks.insert(0, cleaned_thinking)
                 else:
                     legacy_thinking = self._content_block_mapping(
                         msg.get("thinking_block")
                     )
                     if legacy_thinking:
-                        content_blocks.append(self._clean_content_block(legacy_thinking))
+                        cleaned_thinking = self._clean_content_block(legacy_thinking)
+                        if cleaned_thinking is not None:
+                            content_blocks.append(cleaned_thinking)
 
                 legacy_tool_ids: set[str] = set()
                 legacy_tool_calls = msg.get("tool_calls") or []
@@ -5586,11 +5594,16 @@ class AnthropicProvider:
                     # Preserve the old scalar-content shape for an ordinary
                     # assistant turn. When compatibility blocks were rebuilt,
                     # text belongs after legacy thinking and before tool uses.
-                    legacy_thinking_count = 1 if legacy_thinking else 0
+                    legacy_thinking_count = (
+                        1 if legacy_thinking and cleaned_thinking is not None else 0
+                    )
                     content_blocks.insert(
                         legacy_thinking_count, {"type": "text", "text": content}
                     )
 
+                if structured_content and not content_blocks:
+                    i += 1
+                    continue  # An empty unsigned reasoning-only turn has no wire content.
                 if structured_content or content_blocks:
                     anthropic_messages.append(
                         {"role": "assistant", "content": content_blocks}
