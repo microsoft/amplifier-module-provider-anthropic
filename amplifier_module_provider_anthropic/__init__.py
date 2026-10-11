@@ -73,9 +73,13 @@ from ._computer_toolset import (
     PROVENANCE_TOOLSET,
     ComputerToolsetError,
     NativeComputerAdapter,
+    guard_sonnet_overrides,
+    has_native_computer_history,
     is_opus_55,
+    is_sonnet_55,
     native_wire_tool_use,
     translate_tools,
+    validate_member,
 )
 
 # Params the Messages API still accepts on the wire but the SDK does not expose
@@ -479,7 +483,9 @@ _RECOVERABLE_COMBINED_OVERFLOW_RE = re.compile(
 )
 
 
-def _recoverable_input_overflow(error: AnthropicBadRequestError) -> tuple[int, int] | None:
+def _recoverable_input_overflow(
+    error: AnthropicBadRequestError,
+) -> tuple[int, int] | None:
     """Extract only the documented input-only 400 grammar from structured SDK data."""
     if getattr(error, "status_code", None) != 400:
         return None
@@ -679,9 +685,7 @@ class ModelCapabilities:
     thinking_always_on: bool = (
         False  # True = thinking is always active; NEVER send thinking:{type:disabled}
     )
-    requires_adaptive_thinking: bool = (
-        False  # True = provider deliberately sends accepted thinking:{type:adaptive}, even for an opt-out
-    )
+    requires_adaptive_thinking: bool = False  # True = provider deliberately sends accepted thinking:{type:adaptive}, even for an opt-out
     supports_forced_tool_choice: bool = (
         True  # False = only portable auto/none tool choice is supported
     )
@@ -1389,9 +1393,9 @@ class AnthropicProvider:
         # suffix length). Bounded LRU: a long-lived provider instance may
         # serve many interleaved conversations, and this must never grow
         # without limit. Values are short hex digests, not message content.
-        self._prefix_fingerprints: OrderedDict[
-            str, tuple[list[str], int | None]
-        ] = OrderedDict()
+        self._prefix_fingerprints: OrderedDict[str, tuple[list[str], int | None]] = (
+            OrderedDict()
+        )
 
         self._overflow_feedback_owner = object()
         self._count_unavailable_warning_categories: set[tuple[str, str]] = set()
@@ -1791,7 +1795,11 @@ class AnthropicProvider:
             # Compare semantic versions before snapshots or lexical spelling:
             # 5.10 is newer than 5.9, and clean aliases win equal-version ties.
             models.sort(
-                key=lambda item: (self._detect_version(item[0], family), -len(item[0]), item[0]),
+                key=lambda item: (
+                    self._detect_version(item[0], family),
+                    -len(item[0]),
+                    item[0],
+                ),
                 reverse=True,
             )
 
@@ -2127,7 +2135,11 @@ class AnthropicProvider:
             # 4.1 and 4.4 exists to probe. Unlike opus (confirmed live down to 4.1), the
             # sonnet floor is set at the lowest version this evidence actually covers
             # (4.5) rather than extrapolated down to match opus's threshold.
-            if is_46_plus:
+            if is_sonnet_55(model_id):
+                computer_use_tool_type = "computer_toolset_20260801"
+            elif model_id.lower().startswith("claude-sonnet-5-5"):
+                computer_use_tool_type = None
+            elif is_46_plus:
                 computer_use_tool_type = "computer_20251124"
             elif is_45_plus:
                 computer_use_tool_type = "computer_20250124"
@@ -2207,7 +2219,14 @@ class AnthropicProvider:
                     supports_native_computer_use=True,
                     computer_use_tool_type="computer_toolset_20260801",
                     min_cacheable_tokens=512,
-                    capability_tags=("tools", "streaming", "json_mode", "fast", "vision", "thinking"),
+                    capability_tags=(
+                        "tools",
+                        "streaming",
+                        "json_mode",
+                        "fast",
+                        "vision",
+                        "thinking",
+                    ),
                 )
             is_45_plus = not version_known or (major, minor) >= (4, 5)
             # Computer-use wire type, live-probed 2026-08-03 (same method as opus,
@@ -2321,7 +2340,9 @@ class AnthropicProvider:
         default_thinking_budget = base_caps.default_thinking_budget
         if (
             supports_thinking
-            and not (base_caps.family == "haiku" and not base_caps.supports_manual_thinking)
+            and not (
+                base_caps.family == "haiku" and not base_caps.supports_manual_thinking
+            )
             and default_thinking_budget <= 0
         ):
             default_thinking_budget = 32000
@@ -2668,7 +2689,8 @@ class AnthropicProvider:
                 message.content = [
                     block
                     for block in message.content
-                    if getattr(block, "type", None) not in ("thinking", "redacted_thinking")
+                    if getattr(block, "type", None)
+                    not in ("thinking", "redacted_thinking")
                 ]
         return stripped
 
@@ -3053,7 +3075,10 @@ class AnthropicProvider:
             pass  # Never crash on I/O errors
 
     def _find_missing_tool_results(
-        self, messages: list[Message], *, include_repaired: bool = False,
+        self,
+        messages: list[Message],
+        *,
+        include_repaired: bool = False,
         include_compatibility: bool = False,
     ) -> list[tuple[int, str, str, dict]]:
         """Find tool calls without matching results.
@@ -3084,7 +3109,9 @@ class AnthropicProvider:
                     for block in projected:
                         if block.get("type") == "tool_use":
                             tool_calls[block["id"]] = (
-                                idx, block["name"], block["input"]
+                                idx,
+                                block["name"],
+                                block["input"],
                             )
             # Check assistant messages for ToolCallBlock in content
             elif msg.role == "assistant" and isinstance(msg.content, list):
@@ -3179,9 +3206,11 @@ class AnthropicProvider:
                 str(kwargs.get("model", self.default_model))
             )
         is_haiku55 = self._prevalidate_haiku55_request(request, validation_options)
+        self._prevalidate_sonnet_computer(request, validation_options)
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(
-            request.messages, include_repaired=is_haiku55,
+            request.messages,
+            include_repaired=is_haiku55,
             include_compatibility=is_haiku55,
         )
 
@@ -3217,13 +3246,15 @@ class AnthropicProvider:
             return await self._apply_refusal_fallback(
                 response,
                 request,
-                "claude-haiku-5-5" if is_haiku55
+                "claude-haiku-5-5"
+                if is_haiku55
                 else str(kwargs.get("model", self.default_model)),
                 **kwargs,
             )
 
         requested_model = (
-            "claude-haiku-5-5" if is_haiku55
+            "claude-haiku-5-5"
+            if is_haiku55
             else str(kwargs.get("model", self.default_model))
         )
         attempted_models: set[str] = set()
@@ -3511,8 +3542,7 @@ class AnthropicProvider:
             if key in _TYPED_REQUEST_PARAMS:
                 if (
                     emit_warnings
-                    and
-                    key in params
+                    and key in params
                     and params[key] != value
                     and key not in self._extra_params_warned_keys
                 ):
@@ -3566,9 +3596,7 @@ class AnthropicProvider:
             self._get_capabilities(model_id), runtime_info
         )
 
-    def _budget_input_limit(
-        self, model_id: str, caps: ModelCapabilities
-    ) -> int | None:
+    def _budget_input_limit(self, model_id: str, caps: ModelCapabilities) -> int | None:
         """Return the independent input ceiling, never output-subtracted."""
         runtime_info = self._runtime_model_info_cache.get(model_id)
         if runtime_info is not None and runtime_info.max_input_tokens:
@@ -3600,35 +3628,63 @@ class AnthropicProvider:
 
         for source in (self.config, options):
             if source.get("thinking_budget_tokens") is not None:
-                fail("thinking_budget_tokens is unsupported; remove the manual budget and use effort.")
+                fail(
+                    "thinking_budget_tokens is unsupported; remove the manual budget and use effort."
+                )
         if "budget_tokens" in wire:
-            fail("budget_tokens is unsupported; remove the manual budget and use effort.")
+            fail(
+                "budget_tokens is unsupported; remove the manual budget and use effort."
+            )
         requested_type = options.get("thinking_type", self.config.get("thinking_type"))
-        if requested_type is not None and requested_type not in {"adaptive", "disabled"}:
-            fail(f"thinking_type={requested_type!r} is unsupported; use adaptive or disabled.")
+        if requested_type is not None and requested_type not in {
+            "adaptive",
+            "disabled",
+        }:
+            fail(
+                f"thinking_type={requested_type!r} is unsupported; use adaptive or disabled."
+            )
         for key in ("temperature", "top_p", "top_k"):
             if key in wire:
-                fail(f"{key} is unsupported; remove sampling from extra_request_params.")
+                fail(
+                    f"{key} is unsupported; remove sampling from extra_request_params."
+                )
         messages = wire.get("messages") or []
         if messages and messages[-1].get("role") == "assistant":
-            fail("assistant prefill is unsupported; use structured outputs or system instructions, "
-                 "and append a user turn without editing signed history.")
+            fail(
+                "assistant prefill is unsupported; use structured outputs or system instructions, "
+                "and append a user turn without editing signed history."
+            )
         for tool in wire.get("tools") or []:
             if str(tool.get("type", "")).startswith("computer_"):
-                fail("native computer executor qualification is not available in this provider "
-                     "path; use an ordinary function tool until the adapter is qualified.")
+                fail(
+                    "native computer executor qualification is not available in this provider "
+                    "path; use an ordinary function tool until the adapter is qualified."
+                )
         thinking = wire.get("thinking")
         if "thinking" in wire:
-            if not isinstance(thinking, dict) or thinking.get("type") not in {"adaptive", "disabled"}:
-                fail("thinking must be adaptive or disabled; enabled and between_tools are unsupported.")
+            if not isinstance(thinking, dict) or thinking.get("type") not in {
+                "adaptive",
+                "disabled",
+            }:
+                fail(
+                    "thinking must be adaptive or disabled; enabled and between_tools are unsupported."
+                )
             if "budget_tokens" in thinking:
                 fail("thinking.budget_tokens is unsupported; remove it and use effort.")
         effort = (wire.get("output_config") or {}).get("effort", "medium")
         if effort not in ("low", "medium", "high", "xhigh", "max"):
-            fail(f"effort={effort!r} is unsupported; use low, medium, high, xhigh, or max.")
-        if thinking and thinking.get("type") == "disabled" and effort in {"xhigh", "max"}:
-            fail(f"effort={effort} cannot be combined with thinking=disabled; use high or below, "
-                 "or adaptive thinking.")
+            fail(
+                f"effort={effort!r} is unsupported; use low, medium, high, xhigh, or max."
+            )
+        if (
+            thinking
+            and thinking.get("type") == "disabled"
+            and effort in {"xhigh", "max"}
+        ):
+            fail(
+                f"effort={effort} cannot be combined with thinking=disabled; use high or below, "
+                "or adaptive thinking."
+            )
         # Ordinary forced function tools are permitted, with thinking suppressed
         # for this turn only. Do not strip persisted signed thinking blocks.
         forced = (wire.get("tool_choice") or {}).get("type") in {"any", "tool"}
@@ -3663,10 +3719,48 @@ class AnthropicProvider:
             self._runtime_model_info_cache.get("claude-haiku-5-5"),
         )
         self._assemble_request_params(
-            request, request_options=options, request_caps=caps,
+            request,
+            request_options=options,
+            request_caps=caps,
             repair_tool_results=False,
         )
         return True
+
+    def _prevalidate_sonnet_computer(
+        self, request: ChatRequest, options: Mapping[str, Any]
+    ) -> None:
+        model = options.get("model", self.default_model)
+        native_history = has_native_computer_history(request.messages)
+        try:
+            guard_sonnet_overrides(
+                request.tools or [],
+                model,
+                self.extra_request_params,
+                native_history=native_history,
+            )
+            _, adapter = (
+                translate_tools(
+                    request.tools or [], model=model, base_url=self._effective_base_url
+                )
+                if isinstance(model, str)
+                and model.lower().startswith("claude-sonnet-5-5")
+                else ([], None)
+            )
+        except ComputerToolsetError as exc:
+            raise KernelInvalidRequestError(
+                str(exc), provider="anthropic", model=model, status_code=400
+            ) from exc
+        if adapter is not None or (
+            isinstance(model, str)
+            and model.lower().startswith("claude-sonnet-5-5")
+            and native_history
+        ):
+            self._assemble_request_params(
+                request,
+                request_options=options,
+                request_caps=self._get_capabilities(model),
+                repair_tool_results=False,
+            )
 
     def _insert_synthetic_tool_results(
         self, request: ChatRequest, missing: list[tuple[int, str, str, dict]]
@@ -3680,7 +3774,7 @@ class AnthropicProvider:
                 self._create_synthetic_result(call_id, tool_name)
                 for call_id, tool_name in by_msg_idx[msg_idx]
             ]
-            request.messages[msg_idx + 1:msg_idx + 1] = synthetics
+            request.messages[msg_idx + 1 : msg_idx + 1] = synthetics
 
     def _assemble_request_params(
         self,
@@ -3717,8 +3811,12 @@ class AnthropicProvider:
                     # Validate the ORIGINAL final envelope first: repairing an
                     # assistant-ending tool call must not make prefill valid.
                     self._assemble_request_params(
-                        request, request_options=options, request_caps=request_caps,
-                        prefix_state=OrderedDict(prefix_state) if prefix_state is not None else None,
+                        request,
+                        request_options=options,
+                        request_caps=request_caps,
+                        prefix_state=OrderedDict(prefix_state)
+                        if prefix_state is not None
+                        else None,
                         repair_tool_results=False,
                     )
                     request = request.model_copy(deep=True)
@@ -3726,11 +3824,25 @@ class AnthropicProvider:
         if not isinstance(effective_model, str):
             return None
         try:
+            guard_sonnet_overrides(
+                request.tools or [],
+                effective_model,
+                self.extra_request_params,
+                native_history=has_native_computer_history(request.messages),
+            )
             request_tools, native_computer_adapter = translate_tools(
                 request.tools or [],
                 model=effective_model,
                 base_url=self._effective_base_url,
             )
+            if (
+                effective_model.lower().startswith("claude-sonnet-5-5")
+                and native_computer_adapter is None
+                and has_native_computer_history(request.messages)
+            ):
+                raise ComputerToolsetError(
+                    "Sonnet 5.5 native computer history requires a matching declaration."
+                )
         except ComputerToolsetError as exc:
             raise KernelInvalidRequestError(
                 str(exc),
@@ -3743,14 +3855,20 @@ class AnthropicProvider:
             if prefix_state is None
             else prefix_state
         )
-        system_msgs = [message for message in request.messages if message.role == "system"]
-        developer_msgs = [message for message in request.messages if message.role == "developer"]
+        system_msgs = [
+            message for message in request.messages if message.role == "system"
+        ]
+        developer_msgs = [
+            message for message in request.messages if message.role == "developer"
+        ]
         conversation = [
             message
             for message in request.messages
             if message.role in ("user", "assistant", "tool")
         ]
-        unstable_suffix_len, has_ephemeral_signal = self._unstable_suffix_length(conversation)
+        unstable_suffix_len, has_ephemeral_signal = self._unstable_suffix_length(
+            conversation
+        )
         system_blocks = self._format_system_with_cache(system_msgs)
         all_messages = [
             *[
@@ -3896,7 +4014,9 @@ class AnthropicProvider:
             tools, _ = self._apply_tool_cache_control(tools)
             params["tools"] = tools
         if options.get("enable_web_search", self.enable_web_search):
-            params.setdefault("tools", []).insert(0, self._build_web_search_tool(options))
+            params.setdefault("tools", []).insert(
+                0, self._build_web_search_tool(options)
+            )
             if emit_diagnostics:
                 logger.info("[PROVIDER] Native web search tool enabled")
         if "tools" in params:
@@ -3917,7 +4037,9 @@ class AnthropicProvider:
                     raise KernelInvalidRequestError(
                         f"claude-haiku-5-5: {config_key}={config_effort!r} is unsupported; "
                         "use low, medium, high, xhigh, or max.",
-                        provider="anthropic", model=effective_model, status_code=400,
+                        provider="anthropic",
+                        model=effective_model,
+                        status_code=400,
                     )
                 elif emit_diagnostics:
                     logger.warning(
@@ -3980,10 +4102,7 @@ class AnthropicProvider:
         if request_caps.requires_adaptive_thinking:
             if (
                 (options.get("extended_thinking") is False)
-                or (
-                    "extended_thinking" not in options
-                    and config_thinking is False
-                )
+                or ("extended_thinking" not in options and config_thinking is False)
             ) and emit_diagnostics:
                 logger.warning(
                     "[PROVIDER] %s uses adaptive thinking; "
@@ -4012,13 +4131,20 @@ class AnthropicProvider:
                 options.get("extended_thinking") is False
                 if "extended_thinking" in options
                 else config_thinking is False
-            ) or options.get("thinking_type", self.config.get("thinking_type")) == "disabled"
+            ) or options.get(
+                "thinking_type", self.config.get("thinking_type")
+            ) == "disabled"
             thinking_enabled = not disabled
             params["thinking"] = (
-                {"type": "disabled"} if disabled else
-                {"type": "adaptive", "display": options.get(
-                    "thinking_display", self.config.get("thinking_display", "summarized")
-                )}
+                {"type": "disabled"}
+                if disabled
+                else {
+                    "type": "adaptive",
+                    "display": options.get(
+                        "thinking_display",
+                        self.config.get("thinking_display", "summarized"),
+                    ),
+                }
             )
             resolved_thinking_type = params["thinking"]["type"]
         elif thinking_enabled:
@@ -4047,16 +4173,19 @@ class AnthropicProvider:
                     else max(1024, model_ceiling - 1)
                 )
                 budget_tokens = min(budget_tokens, max_budget_tokens)
-                buffer_tokens = options.get("thinking_budget_buffer") or self.config.get(
-                    "thinking_budget_buffer", 8192
-                )
+                buffer_tokens = options.get(
+                    "thinking_budget_buffer"
+                ) or self.config.get("thinking_budget_buffer", 8192)
                 thinking_budget = budget_tokens
                 thinking_type = (
                     options.get("thinking_type")
                     or effort_thinking_type
                     or self.config.get("thinking_type", "adaptive")
                 )
-                if thinking_type == "adaptive" and request_caps.supports_adaptive_thinking:
+                if (
+                    thinking_type == "adaptive"
+                    and request_caps.supports_adaptive_thinking
+                ):
                     params["thinking"] = {"type": "adaptive"}
                     resolved_thinking_type = "adaptive"
                 elif not request_caps.supports_manual_thinking:
@@ -4188,7 +4317,9 @@ class AnthropicProvider:
                 raise KernelInvalidRequestError(
                     f"claude-haiku-5-5: effort={effort!r} is unsupported; "
                     "use low, medium, high, xhigh, or max.",
-                    provider="anthropic", model=effective_model, status_code=400,
+                    provider="anthropic",
+                    model=effective_model,
+                    status_code=400,
                 )
             elif emit_diagnostics:
                 logger.warning(
@@ -4242,11 +4373,15 @@ class AnthropicProvider:
         elif params.get("max_tokens") and params["max_tokens"] > model_ceiling:
             params["max_tokens"] = model_ceiling
         _route_wire_only_params(params)
+        if native_computer_adapter is not None and native_computer_adapter.strict:
+            self._validate_sonnet_computer_wire(params, native_computer_adapter)
         self._validate_haiku55_request(params, options)
         if params.get("model") == "claude-haiku-5-5":
             params["max_tokens"] = min(params["max_tokens"], model_ceiling)
             if request.max_output_tokens is not None:
-                params["max_tokens"] = min(request.max_output_tokens, model_ceiling, 128000)
+                params["max_tokens"] = min(
+                    request.max_output_tokens, model_ceiling, 128000
+                )
             thinking_enabled = params.get("thinking", {}).get("type") == "adaptive"
         return _RequestAssembly(
             params=params,
@@ -4258,6 +4393,61 @@ class AnthropicProvider:
             native_computer_adapter=native_computer_adapter,
         )
 
+    def _validate_sonnet_computer_wire(
+        self, params: dict[str, Any], adapter: NativeComputerAdapter
+    ) -> None:
+        """Validate the SDK-effective choice, headers and derived native context."""
+
+        def fail(message: str) -> None:
+            raise KernelInvalidRequestError(
+                message, provider="anthropic", model=params["model"], status_code=400
+            )
+
+        extra = params.get("extra_body") or {}
+        choice = extra.get("tool_choice", params.get("tool_choice"))
+        if not isinstance(choice, dict) or choice.get("type") not in {"auto", "none"}:
+            fail("Sonnet 5.5 native computer supports only auto/none tool choice.")
+        if set(choice) - {"type", "disable_parallel_tool_use"}:
+            fail("Unsupported native computer tool choice fields.")
+        if (
+            choice["type"] == "auto"
+            and choice.get("disable_parallel_tool_use") is not True
+        ):
+            fail("Native computer tool choice must disable parallel tool use.")
+        if extra.get("fine_grained_tool_streaming"):
+            fail("Native computer fine-grained tool streaming is unsupported.")
+        for tool in params.get("tools", []):
+            if (
+                tool.get("type") != "computer_toolset_20260801"
+                and tool.get("name") not in adapter.ordinary_names
+            ):
+                # Unrelated server tools are allowed; fine-grained controls are not.
+                if tool.get("type") is None:
+                    fail("Native computer request has an undeclared ordinary tool.")
+            if tool.get("eager_input_streaming"):
+                fail("Native computer fine-grained tool streaming is unsupported.")
+        headers = dict(params.get("extra_headers") or {})
+        defaults = self.client.default_headers
+        effective_beta = next(
+            (defaults[key] for key in defaults if key.lower() == "anthropic-beta"), None
+        )
+        for key, value in list(headers.items()):
+            if key.lower() != "anthropic-beta":
+                continue
+            effective_beta = value
+            headers.pop(key)
+        if effective_beta is not None:
+            if not isinstance(effective_beta, str):
+                fail("Native computer beta header must be a string.")
+            betas = [beta.strip() for beta in effective_beta.split(",") if beta.strip()]
+            if any("fine-grained-tool-streaming" in beta for beta in betas):
+                fail("Native computer fine-grained tool streaming is unsupported.")
+            betas = [beta for beta in betas if not beta.startswith("computer-use-")]
+            # An empty override suppresses SDK defaults too: deleting a request
+            # header alone would allow a removed default beta to reappear.
+            headers["anthropic-beta"] = ",".join(betas)
+        params["extra_headers"] = headers
+
     @staticmethod
     def _count_tokens_params(params: Mapping[str, Any]) -> dict[str, Any]:
         """Project assembled dispatch params to the count endpoint's schema."""
@@ -4266,11 +4456,7 @@ class AnthropicProvider:
             # Both supported SDK versions accept output_config on count_tokens.
             # Keep Haiku's effective effort/format envelope aligned with dispatch.
             keys = keys | {"output_config"}
-        return {
-            key: params[key]
-            for key in keys
-            if key in params
-        }
+        return {key: params[key] for key in keys if key in params}
 
     def _warn_count_unavailable(self, model: str, category: str) -> None:
         """Log each safe count-unavailable category once per resolved model."""
@@ -4300,7 +4486,8 @@ class AnthropicProvider:
             return None
         options = dict(request_options or {})
         budget_model = (
-            "claude-haiku-5-5" if self._is_haiku55_request(options)
+            "claude-haiku-5-5"
+            if self._is_haiku55_request(options)
             else options.get("model", self.default_model)
         )
         caps = self._budget_capabilities_for(budget_model)
@@ -4390,12 +4577,16 @@ class AnthropicProvider:
             return None
         feedback.consumed = True
         options = dict(request_options or {})
-        if self._fingerprint(failed_request.model_dump()) != feedback.request_fingerprint:
+        if (
+            self._fingerprint(failed_request.model_dump())
+            != feedback.request_fingerprint
+        ):
             return None
         if self._fingerprint(options) != feedback.options_fingerprint:
             return None
         caps = self._budget_capabilities_for(
-            "claude-haiku-5-5" if self._is_haiku55_request(options)
+            "claude-haiku-5-5"
+            if self._is_haiku55_request(options)
             else options.get("model", self.default_model)
         )
         if caps is None:
@@ -4455,6 +4646,7 @@ class AnthropicProvider:
         )
 
         effective_model = kwargs.get("model", self.default_model)
+        self._prevalidate_sonnet_computer(request, kwargs)
         if self._prevalidate_haiku55_request(request, kwargs):
             effective_model = "claude-haiku-5-5"
         request_caps = await self._get_request_capabilities(effective_model)
@@ -4593,7 +4785,9 @@ class AnthropicProvider:
                     )
                     try:
                         async with asyncio.timeout(self.timeout):
-                            async with self.client.messages.stream(**sdk_params) as stream:
+                            async with self.client.messages.stream(
+                                **sdk_params
+                            ) as stream:
                                 async for event in stream:
                                     sdk_stream_started = True
                                     etype = type(event).__name__
@@ -4632,7 +4826,9 @@ class AnthropicProvider:
                                                     # execution waits for the
                                                     # request-local final-response
                                                     # conversion below.
-                                                    payload["toolset_name"] = toolset_name
+                                                    payload["toolset_name"] = (
+                                                        toolset_name
+                                                    )
                                             await self.coordinator.hooks.emit(
                                                 "llm:stream_block_start",
                                                 payload,
@@ -5177,7 +5373,10 @@ class AnthropicProvider:
                     "status": "ok",
                     "usage": _event_usage,
                 }
-                if chat_response.metadata and "anthropic_cost_unavailable" in chat_response.metadata:
+                if (
+                    chat_response.metadata
+                    and "anthropic_cost_unavailable" in chat_response.metadata
+                ):
                     response_event["metadata"] = dict(chat_response.metadata)
                 # Add rate limit info if available
                 if rate_limit_info:
@@ -5407,8 +5606,8 @@ class AnthropicProvider:
                     if not tool_use_id or tool_use_id not in valid_tool_use_ids:
                         if emit_warnings:
                             logger.warning(
-                            f"Skipping orphaned tool_result (no matching tool_use): "
-                            f"tool_call_id={tool_use_id}, content_preview={str(tool_msg.get('content', ''))[:100]}"
+                                f"Skipping orphaned tool_result (no matching tool_use): "
+                                f"tool_call_id={tool_use_id}, content_preview={str(tool_msg.get('content', ''))[:100]}"
                             )
                         skipped_count += 1
                         i += 1
@@ -5422,6 +5621,22 @@ class AnthropicProvider:
                     toolset_name = native_tool_use_ids.get(tool_use_id)
                     if toolset_name:
                         result["toolset_name"] = toolset_name
+                    if (
+                        toolset_name
+                        and native_computer_adapter is not None
+                        and native_computer_adapter.strict
+                    ):
+                        if tool_msg.get("is_error") is not None:
+                            result["is_error"] = tool_msg["is_error"]
+                        if isinstance(result["content"], list):
+                            result["content"] = [
+                                cleaned
+                                for raw in result["content"]
+                                if (mapped := self._content_block_mapping(raw))
+                                is not None
+                                and (cleaned := self._clean_content_block(mapped))
+                                is not None
+                            ]
                     tool_results.append(result)
                     i += 1
 
@@ -5459,7 +5674,8 @@ class AnthropicProvider:
                                 )
                             continue
                         canonical_thinking |= block.get("type") in {
-                            "thinking", "redacted_thinking"
+                            "thinking",
+                            "redacted_thinking",
                         }
                         try:
                             cleaned = native_wire_tool_use(
@@ -5486,7 +5702,9 @@ class AnthropicProvider:
                             canonical_tool_ids.add(cleaned["id"])
                             canonical_tools[cleaned["id"]] = cleaned
                             if cleaned.get("toolset_name") == COMPUTER_TOOLSET_NAME:
-                                native_tool_use_ids[cleaned["id"]] = COMPUTER_TOOLSET_NAME
+                                native_tool_use_ids[cleaned["id"]] = (
+                                    COMPUTER_TOOLSET_NAME
+                                )
                     legacy_thinking = self._content_block_mapping(
                         msg.get("thinking_block")
                     )
@@ -5525,9 +5743,12 @@ class AnthropicProvider:
                         continue
                     tool_id = call.get("id") or call.get("tool_call_id")
                     tool_name = call.get("name") or call.get("tool")
-                    if not isinstance(tool_id, str) or not tool_id or not isinstance(
-                        tool_name, str
-                    ) or not tool_name:
+                    if (
+                        not isinstance(tool_id, str)
+                        or not tool_id
+                        or not isinstance(tool_name, str)
+                        or not tool_name
+                    ):
                         if emit_warnings:
                             logger.warning(
                                 "Skipping malformed assistant tool call without id/name"
@@ -5590,7 +5811,11 @@ class AnthropicProvider:
                     if cleaned_call.get("toolset_name") == COMPUTER_TOOLSET_NAME:
                         native_tool_use_ids[tool_id] = COMPUTER_TOOLSET_NAME
 
-                if not structured_content and content_blocks and content not in (None, ""):
+                if (
+                    not structured_content
+                    and content_blocks
+                    and content not in (None, "")
+                ):
                     # Preserve the old scalar-content shape for an ordinary
                     # assistant turn. When compatibility blocks were rebuilt,
                     # text belongs after legacy thinking and before tool uses.
@@ -5684,7 +5909,11 @@ class AnthropicProvider:
         for tool in tools:
             # Check if this is a model-native tool (has 'type' that's not 'function')
             # Native tools like web_search_20250305 are passed through unchanged
-            tool_type = tool.get("type") if isinstance(tool, dict) else getattr(tool, "type", None)
+            tool_type = (
+                tool.get("type")
+                if isinstance(tool, dict)
+                else getattr(tool, "type", None)
+            )
             if tool_type and tool_type != "function":
                 # Model-native tool - pass through, minus the function-tool-only
                 # fields.
@@ -6094,9 +6323,7 @@ class AnthropicProvider:
 
         def _strip(obj: Any) -> Any:
             if isinstance(obj, dict):
-                return {
-                    k: _strip(v) for k, v in obj.items() if k != "cache_control"
-                }
+                return {k: _strip(v) for k, v in obj.items() if k != "cache_control"}
             if isinstance(obj, list):
                 return [_strip(v) for v in obj]
             return obj
@@ -6367,25 +6594,25 @@ class AnthropicProvider:
             # ever place a conversation-region breakpoint.
             if emit_warnings:
                 logger.warning(
-                "[PROVIDER] Prompt caching: no message in this request carries "
-                "a `metadata` dict, so ephemeral (regenerated-per-turn) "
-                "messages cannot be distinguished from stable history. "
-                "Skipping the conversation-region cache breakpoint(s) rather "
-                "than risking a breakpoint on unstable content -- the "
-                "orchestrator/context manager must stamp "
-                "metadata={'ephemeral': True} on ephemeral injections for "
-                "conversation-region prompt caching to take effect."
-            )
+                    "[PROVIDER] Prompt caching: no message in this request carries "
+                    "a `metadata` dict, so ephemeral (regenerated-per-turn) "
+                    "messages cannot be distinguished from stable history. "
+                    "Skipping the conversation-region cache breakpoint(s) rather "
+                    "than risking a breakpoint on unstable content -- the "
+                    "orchestrator/context manager must stamp "
+                    "metadata={'ephemeral': True} on ephemeral injections for "
+                    "conversation-region prompt caching to take effect."
+                )
             return all_messages, 0
 
         eligible_upper = len(all_messages) - unstable_suffix_len
         if eligible_upper <= 0:
             if emit_warnings:
                 logger.warning(
-                "[PROVIDER] Prompt caching: every message in this request is "
-                "marked ephemeral -- no stable content available for a "
-                "conversation-region cache breakpoint this turn."
-            )
+                    "[PROVIDER] Prompt caching: every message in this request is "
+                    "marked ephemeral -- no stable content available for a "
+                    "conversation-region cache breakpoint this turn."
+                )
             return all_messages, 0
 
         cache_control: dict[str, Any] = {"type": "ephemeral"}
@@ -6394,11 +6621,11 @@ class AnthropicProvider:
         if primary_idx is None:
             if emit_warnings:
                 logger.warning(
-                "[PROVIDER] Prompt caching: could not find a stable message "
-                "boundary that neither splits a tool_use/tool_result pair nor "
-                "lands on an empty text block -- skipping conversation-region "
-                "cache breakpoint(s)."
-            )
+                    "[PROVIDER] Prompt caching: could not find a stable message "
+                    "boundary that neither splits a tool_use/tool_result pair nor "
+                    "lands on an empty text block -- skipping conversation-region "
+                    "cache breakpoint(s)."
+                )
             return all_messages, 0
 
         breakpoints_used = 0
@@ -6584,6 +6811,34 @@ class AnthropicProvider:
                 status_code=400,
                 retryable=False,
             )
+        if native_computer_adapter is not None and native_computer_adapter.strict:
+            for block in response.content:
+                if getattr(block, "type", None) != "tool_use":
+                    continue
+                family = getattr(block, "toolset_name", None)
+                try:
+                    if not isinstance(block.id, str) or not block.id:
+                        raise ComputerToolsetError(
+                            "Native computer tool_use requires a nonempty id."
+                        )
+                    if family is None:
+                        if block.name not in native_computer_adapter.ordinary_names:
+                            raise ComputerToolsetError(
+                                "Familyless tool_use names an undeclared ordinary function."
+                            )
+                        continue
+                    if family != native_computer_adapter.toolset_name:
+                        raise ComputerToolsetError(
+                            "Returned native computer family is undeclared."
+                        )
+                    raw_input = block.input
+                    if hasattr(raw_input, "model_dump"):
+                        raw_input = raw_input.model_dump(exclude_unset=True)
+                    validate_member(native_computer_adapter, block.name, raw_input)
+                except ComputerToolsetError as exc:
+                    raise KernelInvalidRequestError(
+                        str(exc), provider="anthropic", status_code=400, retryable=False
+                    ) from exc
 
         for block in response.content:
             if block.type == "text":
@@ -6610,6 +6865,12 @@ class AnthropicProvider:
                 )
                 name = block.name
                 input_data = block.input
+                if (
+                    is_native_computer
+                    and native_computer_adapter.strict
+                    and hasattr(input_data, "model_dump")
+                ):
+                    input_data = input_data.model_dump(exclude_unset=True)
                 block_extra: dict[str, Any] = {}
                 if is_native_computer:
                     if not isinstance(input_data, dict):
@@ -6633,10 +6894,14 @@ class AnthropicProvider:
                         PROVENANCE_MEMBER: block.name,
                     }
                 content_blocks.append(
-                    ToolCallBlock(id=block.id, name=name, input=input_data, **block_extra)
+                    ToolCallBlock(
+                        id=block.id, name=name, input=input_data, **block_extra
+                    )
                 )
                 tool_calls.append(
-                    ToolCall(id=block.id, name=name, arguments=input_data, **block_extra)
+                    ToolCall(
+                        id=block.id, name=name, arguments=input_data, **block_extra
+                    )
                 )
                 event_blocks.append(
                     ToolCallContent(id=block.id, name=name, arguments=input_data)
