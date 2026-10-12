@@ -74,6 +74,7 @@ from ._computer_toolset import (
     PROVENANCE_TOOLSET,
     ComputerToolsetError,
     NativeComputerAdapter,
+    _json_agrees,
     canonical_native_batch,
     guard_sonnet_overrides,
     has_native_computer_history,
@@ -5699,6 +5700,27 @@ class AnthropicProvider:
         valid_tool_use_ids: set[str] = set()
         for msg in messages:
             if msg.get("role") == "assistant":
+                if (
+                    native_computer_adapter is not None
+                    and native_computer_adapter.neutral
+                ):
+                    # Validate before even the permissive ID-collection pass.
+                    # Malformed native copies must not be skipped or hashed.
+                    for population in (msg.get("content"), msg.get("tool_calls")):
+                        if isinstance(population, list):
+                            for raw in population:
+                                block = self._content_block_mapping(raw)
+                                if block is not None:
+                                    try:
+                                        native_wire_tool_use(
+                                            block, native_computer_adapter
+                                        )
+                                    except ComputerToolsetError as exc:
+                                        raise KernelInvalidRequestError(
+                                            str(exc),
+                                            provider="anthropic",
+                                            status_code=400,
+                                        ) from exc
                 legacy_tool_calls = msg.get("tool_calls") or []
                 if isinstance(legacy_tool_calls, list):
                     for raw_call in legacy_tool_calls:
@@ -5866,6 +5888,27 @@ class AnthropicProvider:
                             ) from exc
                         if cleaned is None:
                             continue
+                        if (
+                            native_computer_adapter is not None
+                            and native_computer_adapter.neutral
+                            and cleaned.get("toolset_name") == COMPUTER_TOOLSET_NAME
+                        ):
+                            existing = next(
+                                (
+                                    item
+                                    for item in content_blocks
+                                    if item.get("toolset_name") == COMPUTER_TOOLSET_NAME
+                                ),
+                                None,
+                            )
+                            if existing is not None:
+                                if not _json_agrees(existing, cleaned):
+                                    raise KernelInvalidRequestError(
+                                        "Neutral computer history mirrors disagree.",
+                                        provider="anthropic",
+                                        status_code=400,
+                                    )
+                                continue
                         content_blocks.append(cleaned)
                         if (
                             cleaned.get("type") == "tool_use"
@@ -5920,6 +5963,49 @@ class AnthropicProvider:
                                 type(raw_call).__name__,
                             )
                         continue
+                    native = None
+                    if (
+                        native_computer_adapter is not None
+                        and native_computer_adapter.neutral
+                    ):
+                        # Validate supplied copies before selecting fields or
+                        # discarding a mirror, even when diagnostics are off.
+                        try:
+                            native = native_wire_tool_use(
+                                call, native_computer_adapter
+                            )
+                        except ComputerToolsetError as exc:
+                            raise KernelInvalidRequestError(
+                                str(exc), provider="anthropic", status_code=400
+                            ) from exc
+                        neutral_mirrors = [
+                            item
+                            for item in content_blocks
+                            if item.get("toolset_name") == COMPUTER_TOOLSET_NAME
+                        ]
+                        tool_id = call.get("id") or call.get("tool_call_id")
+                        canonical = next(
+                            (
+                                item
+                                for item in content_blocks
+                                if item.get("type") == "tool_use"
+                                and item.get("id") == tool_id
+                            ),
+                            None,
+                        )
+                        if native is not None and neutral_mirrors:
+                            canonical = neutral_mirrors[0]
+                        if canonical is not None and (
+                            native is not None
+                            or canonical.get("toolset_name") == COMPUTER_TOOLSET_NAME
+                        ):
+                            if not _json_agrees(canonical, native):
+                                raise KernelInvalidRequestError(
+                                    "Neutral computer history mirrors disagree.",
+                                    provider="anthropic",
+                                    status_code=400,
+                                )
+                            continue
                     tool_id = call.get("id") or call.get("tool_call_id")
                     tool_name = call.get("name") or call.get("tool")
                     if (

@@ -9,6 +9,7 @@ state, no capability inference, and no broader endpoint classifier.
 from __future__ import annotations
 
 import copy
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -741,6 +742,51 @@ def translate_tools(
     return converted, adapter
 
 
+def _json_agrees(left: Any, right: Any) -> bool:
+    """Compare JSON copies, not Python's bool-as-number/container equality."""
+    if type(left) in {int, float} and type(right) in {int, float}:
+        return (
+            (type(left) is int or math.isfinite(left))
+            and (type(right) is int or math.isfinite(right))
+            and left == right
+        )
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        return (
+            all(type(key) is str for key in left)
+            and all(type(key) is str for key in right)
+            and left.keys() == right.keys()
+            and all(_json_agrees(left[key], right[key]) for key in left)
+        )
+    if type(left) is list:
+        return len(left) == len(right) and all(
+            _json_agrees(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return type(left) in {str, bool, type(None)} and left == right
+
+
+def _neutral_replay_id(
+    block: dict[str, Any], name: str, input_data: dict[str, Any]
+) -> str:
+    # Every supplied copy is evidence, including explicit nulls. Never let
+    # serializer precedence or Python's True == 1 hide a disagreement.
+    ids = [block[key] for key in ("id", "tool_call_id", "call_id") if key in block]
+    if not ids or type(ids[0]) is not str or not ids[0]:
+        raise ComputerToolsetError("Neutral computer history requires a call ID.")
+    for keys, value in (
+        (("name", "tool"), name),
+        (("input", "arguments"), input_data),
+        (("id", "tool_call_id", "call_id"), ids[0]),
+    ):
+        copies = [block[key] for key in keys if key in block]
+        if not copies or any(not _json_agrees(item, value) for item in copies):
+            raise ComputerToolsetError(
+                "Neutral computer history disagrees with its vendor provenance."
+            )
+    return ids[0]
+
+
 def native_wire_tool_use(
     block: dict[str, Any], adapter: NativeComputerAdapter | None
 ) -> dict[str, Any] | None:
@@ -757,9 +803,8 @@ def native_wire_tool_use(
             or set(provenance) != {"version", "input", "image_space"}
             or type(provenance.get("version")) is not int
             or provenance["version"] != 1
-            or provenance["image_space"] != list(adapter.image_space)
+            or not _json_agrees(provenance["image_space"], list(adapter.image_space))
             or block.get(PROVENANCE_TOOLSET) != adapter.toolset_name
-            or block.get("name", block.get("tool")) != adapter.alias
             or block.get("type") not in {None, "tool_call", "tool_use"}
             or block.get("toolset_name") is not None
         ):
@@ -769,13 +814,10 @@ def native_wire_tool_use(
         expected = canonical_native_batch(
             adapter, member, provenance["input"], check_enabled=False
         )
-        if block.get("input", block.get("arguments")) != expected:
-            raise ComputerToolsetError(
-                "Neutral computer history disagrees with its vendor provenance."
-            )
+        call_id = _neutral_replay_id(block, adapter.alias, expected)
         return {
             "type": "tool_use",
-            "id": block.get("id") or block.get("tool_call_id", ""),
+            "id": call_id,
             "toolset_name": adapter.toolset_name,
             "name": member,
             "input": copy.deepcopy(provenance["input"]),
@@ -786,7 +828,7 @@ def native_wire_tool_use(
         and (
             PROVENANCE_MEMBER in block
             or PROVENANCE_TOOLSET in block
-            or block.get("name", block.get("tool")) == adapter.alias
+            or any(block.get(key) == adapter.alias for key in ("name", "tool"))
             and block.get("type") in {None, "tool_call", "tool_use"}
             and block.get("toolset_name") is None
         )
@@ -810,9 +852,14 @@ def native_wire_tool_use(
         validate_member(
             adapter, block.get("name"), block.get("input"), check_enabled=False
         )
+        call_id = (
+            _neutral_replay_id(block, block["name"], block["input"])
+            if adapter.neutral
+            else block.get("id", "")
+        )
         return {
             "type": "tool_use",
-            "id": block.get("id", ""),
+            "id": call_id,
             "toolset_name": adapter.toolset_name,
             "name": block["name"],
             "input": copy.deepcopy(block["input"]),

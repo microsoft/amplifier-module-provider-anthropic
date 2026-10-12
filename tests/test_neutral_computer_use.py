@@ -789,3 +789,268 @@ async def test_native_and_ordinary_results_coexist_without_rebinding(model, stru
         assert second.model_dump_json() == before
     finally:
         await wire.close()
+
+
+def replay_request(req, first, representation):
+    """Use real Core mirrors, retaining every supplied compatibility extra."""
+    persisted = json.loads(first.model_dump_json())
+    assistant = Message(
+        role="assistant",
+        content=persisted["content"] if representation != "tool_calls" else "",
+        tool_calls=persisted["tool_calls"] if representation != "content" else None,
+    )
+    return ChatRequest(
+        messages=[
+            *req.messages,
+            assistant,
+            Message(role="tool", tool_call_id="call_native", content="done"),
+        ],
+        tools=req.tools,
+    )
+
+
+def replay_copy_get(block, field, default=None):
+    # Core retains legacy tool_calls dictionaries alongside structured models.
+    # Edit the actual representation without coercing away null/malformed extras.
+    if isinstance(block, dict):
+        return block.get(field, default)
+    return getattr(block, field, default)
+
+
+def replay_copy_set(block, field, value):
+    if isinstance(block, dict):
+        block[field] = value
+    else:
+        setattr(block, field, value)
+
+
+def replay_copy_delete(block, field):
+    if isinstance(block, dict):
+        del block[field]
+    else:
+        delattr(block, field)
+
+
+def change_replay_copy(block, path, value):
+    # Assignment preserves malformed primary fields too; validating construction
+    # would test Core's schema rather than the provider's public replay boundary.
+    field, *nested = path
+    if field == "payload":
+        field = "input" if replay_copy_get(block, "type") == "tool_call" else "arguments"
+    if not nested:
+        replay_copy_set(block, field, copy.deepcopy(value))
+        return
+    target = replay_copy_get(block, field)
+    for key in nested[:-1]:
+        target = target[key]
+    target[nested[-1]] = copy.deepcopy(value)
+
+
+REPLAY_DISAGREEMENTS = [
+    (("payload", "version"), True),
+    (("payload", "actions", 0, "coordinate", 0), True),
+    (("payload", "capture_after"), 1),
+    (("payload", "version"), "1"),
+    (("payload", "actions"), ({"action": "left_click", "coordinate": [1, 47]},)),
+    (("payload", "actions", 0, "coordinate", 0), float("nan")),
+    (("payload", "actions", 0, "coordinate", 0), float("inf")),
+    ((PROVENANCE_NEUTRAL, "image_space", 0), True),
+    *[
+        ((field,), value)
+        for field in ("name", "tool", "id", "tool_call_id", "call_id")
+        for value in (None, [], ["malformed"], {"malformed": 1}, 1, "", "conflicting")
+    ],
+    *[
+        ((field,), value)
+        for field in ("input", "arguments")
+        for value in (None, [], "not a mapping", batch("screenshot", {}))
+    ],
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "storage", ["content", "tool_calls", "both-content", "both-tool_calls"]
+)
+@pytest.mark.parametrize("path,value", REPLAY_DISAGREEMENTS)
+async def test_public_replay_rejects_every_supplied_disagreeing_copy(
+    storage, path, value
+):
+    wire = Wire([member("left_click", {"coordinate": [1, 47]})])
+    try:
+        req = request([neutral()])
+        first = await wire.complete(req)
+        second = replay_request(req, first, "both" if storage.startswith("both") else storage)
+        assistant = second.messages[1]
+        block = (
+            assistant.content[0]
+            if storage in {"content", "both-content"}
+            else assistant.tool_calls[0]
+        )
+        change_replay_copy(block, path, value)
+        before = second.model_dump_json()
+        first_before = first.model_dump_json()
+        for operation in (wire.budget, wire.complete):
+            with pytest.raises(InvalidRequestError) as error:
+                await operation(second)
+            assert error.value.retryable is False
+            assert len(wire.captured) == 1  # No count/create/retry HTTP on bad history.
+            assert len(wire.effects) == 1  # Only the genuine first reply.
+            assert second.model_dump_json() == before
+            assert first.model_dump_json() == first_before
+    finally:
+        await wire.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage", ["content", "tool_calls", "both"])
+@pytest.mark.parametrize("copies", ["original", "agreeing", "number-equivalent"])
+async def test_public_replay_accepts_original_and_json_number_equivalent_copies(
+    storage, copies
+):
+    wire = Wire([member("left_click", {"coordinate": [1, 47]})])
+    try:
+        req = request([neutral()])
+        first = await wire.complete(req)
+        second = replay_request(req, first, storage)
+        assistant = second.messages[1]
+        blocks = (
+            (assistant.content if isinstance(assistant.content, list) else [])
+            + (assistant.tool_calls or [])
+        )
+        for block in blocks:
+            if copies == "original":
+                continue
+            canonical = batch("left_click", {"coordinate": [1, 47]})
+            if copies == "number-equivalent":
+                canonical["version"] = 1.0
+                canonical["actions"][0]["coordinate"] = [1.0, 47.0]
+            for key, value in (
+                ("name", "desktop"), ("tool", "desktop"),
+                ("id", "call_native"), ("tool_call_id", "call_native"),
+                ("call_id", "call_native"), ("input", canonical),
+                ("arguments", canonical),
+            ):
+                replay_copy_set(block, key, copy.deepcopy(value))
+        before = second.model_dump_json()
+        assert await wire.budget(second) is not None
+        await wire.complete(second)
+        assert len(wire.captured) == 3
+        for _, body, _ in wire.captured[-2:]:
+            assert body["messages"][1]["content"] == [
+                member("left_click", {"coordinate": [1, 47]})
+            ]
+            assert body["messages"][2]["content"][0]["content"] == "done"
+        assert second.model_dump_json() == before
+    finally:
+        await wire.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("diagnostics", [False, True])
+@pytest.mark.parametrize("difference", ["id", "vendor-input", "missing-provenance"])
+async def test_public_replay_cross_mirror_consistency_is_not_a_warning(
+    diagnostics, difference
+):
+    wire = Wire([member("left_click", {"coordinate": [1, 47]})], raw=diagnostics)
+    try:
+        req = request([neutral()])
+        first = await wire.complete(req)
+        second = replay_request(req, first, "both")
+        mirror = second.messages[1].tool_calls[0]
+        if difference == "id":
+            replay_copy_set(mirror, "id", "different-call")
+        elif difference == "vendor-input":
+            # Internally agreeing but different from the canonical mirror.
+            replay_copy_get(mirror, "arguments")["actions"][0]["coordinate"] = [5, 6]
+            replay_copy_get(mirror, PROVENANCE_NEUTRAL)["input"]["coordinate"] = [5, 6]
+        else:
+            replay_copy_delete(mirror, PROVENANCE_NEUTRAL)
+        before = second.model_dump_json()
+        for operation in (wire.budget, wire.complete):
+            with pytest.raises(InvalidRequestError) as error:
+                await operation(second)
+            assert error.value.retryable is False
+            assert len(wire.captured) == 1
+            assert len(wire.effects) == 1
+            assert second.model_dump_json() == before
+    finally:
+        await wire.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declaration", [function("desktop"), native()])
+async def test_public_replay_unrelated_ordinary_and_legacy_precedence_is_unchanged(
+    declaration
+):
+    wire = Wire()
+    try:
+        canonical = {
+            "type": "tool_call", "id": "call_native", "name": "desktop",
+            "input": {"action": "left_click", "coordinate": [1, 47]},
+        }
+        stale = ToolCall(
+            id="call_native", name="desktop",
+            arguments={"action": "screenshot"},
+        )
+        req = ChatRequest(
+            messages=[
+                Message(role="user", content="Continue"),
+                Message(role="assistant", content=[canonical], tool_calls=[stale]),
+                Message(role="tool", tool_call_id="call_native", content="done"),
+            ],
+            tools=[declaration],
+        )
+        before = req.model_dump_json()
+        assert await wire.budget(req) is not None
+        await wire.complete(req)
+        for _, body, _ in wire.captured:
+            call = body["messages"][1]["content"][0]
+            expected = (
+                {"coordinate": [1, 47]}
+                if getattr(declaration, "type", None)
+                else canonical["input"]
+            )
+            assert call["input"] == expected
+        assert req.model_dump_json() == before
+    finally:
+        await wire.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage", ["content", "tool_calls", "both"])
+@pytest.mark.parametrize("agreeing", [False, True])
+async def test_public_replay_checks_duplicates_before_discarding_them(storage, agreeing):
+    wire = Wire([member("left_click", {"coordinate": [1, 47]})])
+    try:
+        req = request([neutral()])
+        first = await wire.complete(req)
+        second = replay_request(req, first, storage)
+        assistant = second.messages[1]
+        population = (
+            assistant.content if storage != "tool_calls" else assistant.tool_calls
+        )
+        duplicate = copy.deepcopy(population[0])
+        if not agreeing:
+            change_replay_copy(
+                duplicate, ("payload", "actions", 0, "coordinate"), [5, 6]
+            )
+            change_replay_copy(
+                duplicate, (PROVENANCE_NEUTRAL, "input", "coordinate"), [5, 6]
+            )
+        population.append(duplicate)
+        before = second.model_dump_json()
+        for operation in (wire.budget, wire.complete):
+            if agreeing:
+                await operation(second)
+                assert wire.captured[-1][1]["messages"][1]["content"] == [
+                    member("left_click", {"coordinate": [1, 47]})
+                ]
+            else:
+                with pytest.raises(InvalidRequestError) as error:
+                    await operation(second)
+                assert error.value.retryable is False
+                assert len(wire.captured) == 1
+            assert second.model_dump_json() == before
+    finally:
+        await wire.close()
