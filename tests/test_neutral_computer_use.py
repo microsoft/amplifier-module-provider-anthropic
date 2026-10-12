@@ -142,6 +142,84 @@ async def test_real_sdk_closed_surface_count_dispatch_and_canonical_conversion(
         await wire.close()
 
 
+def loop_replay_request(req, first):
+    """Persist the public response exactly as Loop does, with its lossy mirrors."""
+    persisted = json.loads(first.model_dump_json())
+    return ChatRequest(
+        messages=[
+            *req.messages,
+            Message(
+                role="assistant",
+                content=persisted["content"],
+                tool_calls=[
+                    {
+                        "id": call["id"],
+                        "tool": call["name"],
+                        "arguments": call["arguments"],
+                    }
+                    for call in persisted["tool_calls"]
+                ],
+            ),
+            *[
+                Message(role="tool", tool_call_id=call["id"], content="done")
+                for call in persisted["tool_calls"]
+            ],
+        ],
+        tools=req.tools,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("copies", ["original", "agreeing", "number-equivalent", "secondary-id"])
+async def test_public_loop_mirror_binds_exact_canonical_call(model, streaming, copies):
+    ordinary = {"type": "tool_use", "id": "call_lookup", "name": "lookup", "input": {}}
+    original_member = member("left_click", {"coordinate": [1, 47]}, id="call_second")
+    wire = Wire([ordinary, original_member], model=model, use_streaming=streaming)
+    try:
+        req = request([neutral(), function("lookup")])
+        first = await wire.complete(req)
+        second = loop_replay_request(req, first)
+        mirror = second.messages[1].tool_calls[1]
+        assert set(mirror) == {"id", "tool", "arguments"}
+        if copies in {"agreeing", "number-equivalent"}:
+            payload = batch("left_click", {"coordinate": [1, 47]})
+            if copies == "number-equivalent":
+                payload["version"] = 1.0
+                payload["actions"][0]["coordinate"] = [1.0, 47.0]
+            mirror.update(
+                name="desktop", tool_call_id="call_second", call_id="call_second",
+                input=copy.deepcopy(payload), arguments=copy.deepcopy(payload),
+            )
+        elif copies == "secondary-id":
+            mirror["call_id"] = mirror.pop("id")
+        before = second.model_dump_json()
+        first_before = first.model_dump_json()
+        assert await wire.budget(second) is not None
+        await wire.complete(second)
+        assert len(wire.captured) == 3
+        count, dispatch = [entry[1] for entry in wire.captured[-2:]]
+        assert count["messages"] == dispatch["messages"]
+        for body in (count, dispatch):
+            assert body["messages"][1]["content"] == [ordinary, original_member]
+            results = body["messages"][2]["content"]
+            assert [result["tool_use_id"] for result in results] == [
+                "call_lookup", "call_second",
+            ]
+            assert "toolset_name" not in results[0]
+            assert results[1]["toolset_name"] == "computer"
+        assert second.model_dump_json() == before
+        assert first.model_dump_json() == first_before
+        assert set(mirror).isdisjoint({
+            "_anthropic_computer_member_name",
+            "_anthropic_computer_toolset_name",
+            "_anthropic_computer_use_v1",
+        })
+    finally:
+        await wire.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("alias", ["computer", "screenshot", "workstation_2"])
 async def test_actual_alias_is_not_a_vendor_member_or_hardcoded_dispatch(alias):
@@ -820,6 +898,10 @@ def replay_copy_get(block, field, default=None):
 def replay_copy_set(block, field, value):
     if isinstance(block, dict):
         block[field] = value
+    elif field.startswith("_"):
+        # Public extras are what Core serializes; setattr creates a shadow
+        # attribute for underscore fields without replacing the persisted extra.
+        block.model_extra[field] = value
     else:
         setattr(block, field, value)
 
@@ -1052,5 +1134,192 @@ async def test_public_replay_checks_duplicates_before_discarding_them(storage, a
                 assert error.value.retryable is False
                 assert len(wire.captured) == 1
             assert second.model_dump_json() == before
+    finally:
+        await wire.close()
+
+
+LOOP_MIRROR_DISAGREEMENTS = [
+    (path, value) for path, value in REPLAY_DISAGREEMENTS
+    if path[0] != PROVENANCE_NEUTRAL
+] + [
+    ((field,), value)
+    for field in (
+        "_anthropic_computer_member_name",
+        "_anthropic_computer_toolset_name",
+        "_anthropic_computer_use_v1",
+    )
+    for value in (None, {})
+] + [
+    (("type",), value) for value in ("text", [], {}, True)
+] + [
+    (("toolset_name",), value) for value in ("wrong", "computer", [], {})
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("diagnostics", [False, True])
+@pytest.mark.parametrize("path,value", LOOP_MIRROR_DISAGREEMENTS)
+async def test_public_loop_mirror_rejects_every_disagreeing_copy(
+    diagnostics, path, value
+):
+    wire = Wire([member("left_click", {"coordinate": [1, 47]})], raw=diagnostics)
+    try:
+        req = request([neutral()])
+        first = await wire.complete(req)
+        second = loop_replay_request(req, first)
+        change_replay_copy(second.messages[1].tool_calls[0], path, value)
+        before = second.model_dump_json()
+        first_before = first.model_dump_json()
+        for operation in (wire.budget, wire.complete):
+            with pytest.raises(InvalidRequestError) as error:
+                await operation(second)
+            assert error.value.retryable is False
+            assert len(wire.captured) == len(wire.effects) == 1
+            assert second.model_dump_json() == before
+            assert first.model_dump_json() == first_before
+    finally:
+        await wire.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("primary", ["id", "tool_call_id", "call_id"])
+@pytest.mark.parametrize("secondary", ["id", "tool_call_id", "call_id"])
+@pytest.mark.parametrize("value", ["unknown", None, [], {}, True])
+async def test_public_loop_mirror_checks_known_shadow_ids(primary, secondary, value):
+    wire = Wire([member("left_click", {"coordinate": [1, 47]})])
+    try:
+        req = request([neutral()])
+        first = await wire.complete(req)
+        second = loop_replay_request(req, first)
+        mirror = second.messages[1].tool_calls[0]
+        mirror.pop("id")
+        mirror[secondary] = "call_native"
+        mirror[primary] = copy.deepcopy(value)
+        before = second.model_dump_json()
+        for operation in (wire.budget, wire.complete):
+            with pytest.raises(InvalidRequestError):
+                await operation(second)
+            assert len(wire.captured) == len(wire.effects) == 1
+            assert second.model_dump_json() == before
+    finally:
+        await wire.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "no-content", "other-assistant", "other-id", "ordinary-id",
+        "canonical-partial", "canonical-no-provenance", "canonical-null",
+        "canonical-type", "canonical-unhashable-type", "canonical-toolset",
+    ],
+)
+async def test_public_loop_mirror_requires_current_validated_native_canonical(defect):
+    ordinary = {"type": "tool_use", "id": "call_lookup", "name": "lookup", "input": {}}
+    wire = Wire([ordinary, member("left_click", {"coordinate": [1, 47]})])
+    try:
+        req = request([neutral(), function("lookup")])
+        first = await wire.complete(req)
+        second = loop_replay_request(req, first)
+        assistant = second.messages[1]
+        canonical = assistant.content[1]
+        mirror = assistant.tool_calls[1]
+        if defect == "no-content":
+            assistant.content = ""
+        elif defect == "other-assistant":
+            assistant.tool_calls = None
+            second.messages.insert(
+                2, Message(role="assistant", content="", tool_calls=[mirror])
+            )
+        elif defect == "other-id":
+            mirror["id"] = "different-call"
+        elif defect == "ordinary-id":
+            mirror["id"] = "call_lookup"
+        elif defect == "canonical-partial":
+            replay_copy_delete(canonical, PROVENANCE_NEUTRAL)
+        elif defect == "canonical-no-provenance":
+            for key in (
+                "_anthropic_computer_member_name",
+                "_anthropic_computer_toolset_name",
+                "_anthropic_computer_use_v1",
+            ):
+                replay_copy_delete(canonical, key)
+        elif defect == "canonical-null":
+            replay_copy_set(canonical, PROVENANCE_NEUTRAL, None)
+            serialized = json.loads(second.model_dump_json())["messages"][1]["content"][1]
+            assert PROVENANCE_NEUTRAL in serialized
+            assert serialized[PROVENANCE_NEUTRAL] is None
+        elif defect == "canonical-type":
+            replay_copy_set(canonical, "type", "text")
+        elif defect == "canonical-unhashable-type":
+            replay_copy_set(canonical, "type", [])
+        else:
+            replay_copy_set(canonical, "toolset_name", "wrong")
+        before = second.model_dump_json()
+        for operation in (wire.budget, wire.complete):
+            with pytest.raises(InvalidRequestError):
+                await operation(second)
+            assert len(wire.captured) == 1
+            assert len(wire.effects) == 2
+            assert second.model_dump_json() == before
+    finally:
+        await wire.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known_secondary", [False, True])
+@pytest.mark.parametrize("value", [None, [], {}, "unknown"])
+async def test_public_haiku_loop_mirror_scanner_defers_bad_ids(known_secondary, value):
+    wire = Wire(
+        [member("left_click", {"coordinate": [1, 47]})],
+        model="claude-haiku-5-5",
+    )
+    try:
+        req = request([neutral()])
+        first = await wire.complete(req)
+        second = loop_replay_request(req, first)
+        mirror = second.messages[1].tool_calls[0]
+        mirror["id"] = copy.deepcopy(value)
+        if known_secondary:
+            mirror["call_id"] = "call_native"
+        before = second.model_dump_json()
+        first_before = first.model_dump_json()
+        for operation in (wire.budget, wire.complete):
+            with pytest.raises(InvalidRequestError) as error:
+                await operation(second)
+            assert error.value.retryable is False
+            assert len(wire.captured) == len(wire.effects) == 1
+            assert second.model_dump_json() == before
+            assert first.model_dump_json() == first_before
+    finally:
+        await wire.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage", ["canonical", "compatibility"])
+async def test_public_haiku_scanner_preserves_ordinary_missing_result_repair(storage):
+    ordinary = {"type": "tool_use", "id": "call_lookup", "name": "lookup", "input": {}}
+    wire = Wire([ordinary], model="claude-haiku-5-5")
+    try:
+        req = request([neutral(), function("lookup")])
+        first = await wire.complete(req)
+        second = loop_replay_request(req, first)
+        second.messages.pop()  # The ordinary result is genuinely missing.
+        second.messages.append(Message(role="user", content="Continue"))
+        if storage == "compatibility":
+            second.messages[1].content = ""
+        before = second.model_dump_json()
+        assert await wire.budget(second) is not None
+        await wire.complete(second)
+        assert len(wire.captured) == 3
+        count, dispatch = [entry[1] for entry in wire.captured[-2:]]
+        assert count["messages"] == dispatch["messages"]
+        for body in (count, dispatch):
+            assert body["messages"][1]["content"] == [ordinary]
+            result = body["messages"][2]["content"][0]
+            assert result["tool_use_id"] == "call_lookup"
+            assert "[SYSTEM ERROR: Tool result missing" in result["content"]
+            assert "toolset_name" not in result
+        assert second.model_dump_json() == before
     finally:
         await wire.close()

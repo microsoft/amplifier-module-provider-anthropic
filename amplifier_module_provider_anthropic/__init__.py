@@ -75,6 +75,7 @@ from ._computer_toolset import (
     ComputerToolsetError,
     NativeComputerAdapter,
     _json_agrees,
+    _neutral_replay_id,
     canonical_native_batch,
     guard_sonnet_overrides,
     has_native_computer_history,
@@ -3123,13 +3124,30 @@ class AnthropicProvider:
                 if include_compatibility:
                     for raw in getattr(msg, "tool_calls", None) or []:
                         call = self._content_block_mapping(raw)
-                        if call and call["id"] not in canonical_ids:
-                            tool_calls[call["id"]] = (
+                        if not call:
+                            continue
+                        ids = [
+                            value
+                            for key in ("id", "tool_call_id", "call_id")
+                            if isinstance(value := call.get(key), str) and value
+                        ]
+                        if any(call_id in canonical_ids for call_id in ids):
+                            continue
+                        name = next(
+                            (
+                                value
+                                for key in ("name", "tool")
+                                if isinstance(value := call.get(key), str) and value
+                            ),
+                            None,
+                        )
+                        if ids and name is not None:
+                            tool_calls[ids[0]] = (
                                 idx,
-                                call["name"],
+                                name,
                                 call.get("arguments", {}),
                             )
-                            canonical_ids.add(call["id"])
+                            canonical_ids.add(ids[0])
             if msg.role == "tool" and msg.tool_call_id:
                 tool_results.add(msg.tool_call_id)
             elif isinstance(msg.content, list):
@@ -5677,6 +5695,54 @@ class AnthropicProvider:
         result["content"] = projected
         return result
 
+    @staticmethod
+    def _compatibility_native_tool_use(
+        block: dict[str, Any],
+        adapter: NativeComputerAdapter | None,
+        canonical: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Bind an untagged compatibility mirror only to validated local content."""
+        if adapter is None or not adapter.neutral:
+            return native_wire_tool_use(block, adapter)
+        if block.get("type") is not None and not isinstance(block["type"], str):
+            raise ComputerToolsetError("Neutral computer history has an invalid block type.")
+        # Inspect every ID before applying precedence. A malformed/unknown primary
+        # must not hide a known secondary association or reach a hash lookup.
+        binding = next(
+            (
+                canonical[value]
+                for key in ("id", "tool_call_id", "call_id")
+                if isinstance(value := block.get(key), str) and value in canonical
+            ),
+            None,
+        )
+        if binding is not None and not any(
+            key in block
+            for key in (PROVENANCE_NEUTRAL, PROVENANCE_MEMBER, PROVENANCE_TOOLSET)
+        ):
+            if (
+                block.get("type") not in (None, "tool_call", "tool_use")
+                or block.get("toolset_name") is not None
+            ):
+                raise ComputerToolsetError(
+                    "Neutral computer compatibility mirror has an invalid type/toolset."
+                )
+            expected = canonical_native_batch(
+                adapter, binding["name"], binding["input"], check_enabled=False
+            )
+            call_id = _neutral_replay_id(block, adapter.alias, expected)
+            if call_id != binding["id"]:
+                raise ComputerToolsetError("Neutral computer history mirrors disagree.")
+            return copy.deepcopy(binding)
+        # Any supplied provenance, even null or partial, remains authoritative
+        # evidence and takes the strict standalone path. Never fill it in.
+        native = native_wire_tool_use(block, adapter)
+        if (binding is not None or native is not None and canonical) and not _json_agrees(
+            binding, native
+        ):
+            raise ComputerToolsetError("Neutral computer history mirrors disagree.")
+        return native
+
     def _convert_messages(
         self,
         messages: list[dict[str, Any]],
@@ -5698,7 +5764,10 @@ class AnthropicProvider:
         """
         # First pass: collect all valid tool_use_ids from assistant messages
         valid_tool_use_ids: set[str] = set()
+        canonical_native_calls: list[dict[str, dict[str, Any]]] = []
         for msg in messages:
+            bindings: dict[str, dict[str, Any]] = {}
+            canonical_native_calls.append(bindings)
             if msg.get("role") == "assistant":
                 if (
                     native_computer_adapter is not None
@@ -5706,21 +5775,42 @@ class AnthropicProvider:
                 ):
                     # Validate before even the permissive ID-collection pass.
                     # Malformed native copies must not be skipped or hashed.
-                    for population in (msg.get("content"), msg.get("tool_calls")):
-                        if isinstance(population, list):
-                            for raw in population:
+                    try:
+                        content = msg.get("content")
+                        if isinstance(content, list):
+                            for raw in content:
                                 block = self._content_block_mapping(raw)
                                 if block is not None:
-                                    try:
-                                        native_wire_tool_use(
-                                            block, native_computer_adapter
+                                    if block.get("type") is not None and not isinstance(
+                                        block["type"], str
+                                    ):
+                                        raise ComputerToolsetError(
+                                            "Neutral computer history has an invalid block type."
                                         )
-                                    except ComputerToolsetError as exc:
-                                        raise KernelInvalidRequestError(
-                                            str(exc),
-                                            provider="anthropic",
-                                            status_code=400,
-                                        ) from exc
+                                    native = native_wire_tool_use(
+                                        block, native_computer_adapter
+                                    )
+                                    if native is not None and PROVENANCE_NEUTRAL in block:
+                                        previous = bindings.get(native["id"])
+                                        if previous is not None and not _json_agrees(
+                                            previous, native
+                                        ):
+                                            raise ComputerToolsetError(
+                                                "Neutral computer history mirrors disagree."
+                                            )
+                                        bindings[native["id"]] = native
+                        compatibility = msg.get("tool_calls")
+                        if isinstance(compatibility, list):
+                            for raw in compatibility:
+                                block = self._content_block_mapping(raw)
+                                if block is not None:
+                                    self._compatibility_native_tool_use(
+                                        block, native_computer_adapter, bindings
+                                    )
+                    except ComputerToolsetError as exc:
+                        raise KernelInvalidRequestError(
+                            str(exc), provider="anthropic", status_code=400
+                        ) from exc
                 legacy_tool_calls = msg.get("tool_calls") or []
                 if isinstance(legacy_tool_calls, list):
                     for raw_call in legacy_tool_calls:
@@ -5971,30 +6061,25 @@ class AnthropicProvider:
                         # Validate supplied copies before selecting fields or
                         # discarding a mirror, even when diagnostics are off.
                         try:
-                            native = native_wire_tool_use(
-                                call, native_computer_adapter
+                            native = self._compatibility_native_tool_use(
+                                call, native_computer_adapter, canonical_native_calls[i]
                             )
                         except ComputerToolsetError as exc:
                             raise KernelInvalidRequestError(
                                 str(exc), provider="anthropic", status_code=400
                             ) from exc
-                        neutral_mirrors = [
-                            item
-                            for item in content_blocks
-                            if item.get("toolset_name") == COMPUTER_TOOLSET_NAME
-                        ]
-                        tool_id = call.get("id") or call.get("tool_call_id")
-                        canonical = next(
-                            (
-                                item
-                                for item in content_blocks
-                                if item.get("type") == "tool_use"
-                                and item.get("id") == tool_id
-                            ),
-                            None,
-                        )
-                        if native is not None and neutral_mirrors:
-                            canonical = neutral_mirrors[0]
+                        tool_id = native["id"] if native is not None else None
+                        canonical = canonical_tools.get(tool_id)
+                        if native is not None and canonical is None:
+                            canonical = next(
+                                (
+                                    item
+                                    for item in content_blocks
+                                    if item.get("toolset_name") == COMPUTER_TOOLSET_NAME
+                                    and item.get("id") == tool_id
+                                ),
+                                None,
+                            )
                         if canonical is not None and (
                             native is not None
                             or canonical.get("toolset_name") == COMPUTER_TOOLSET_NAME
@@ -6061,7 +6146,9 @@ class AnthropicProvider:
                         continue
                     legacy_tool_ids.add(tool_id)
                     try:
-                        native = native_wire_tool_use(call, native_computer_adapter)
+                        native = self._compatibility_native_tool_use(
+                            call, native_computer_adapter, canonical_native_calls[i]
+                        )
                     except ComputerToolsetError as exc:
                         raise KernelInvalidRequestError(
                             str(exc), provider="anthropic", status_code=400
