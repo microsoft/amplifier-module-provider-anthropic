@@ -9,6 +9,7 @@ state, no capability inference, and no broader endpoint classifier.
 from __future__ import annotations
 
 import copy
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -19,6 +20,7 @@ COMPUTER_TOOLSET_TYPE = "computer_toolset_20260801"
 COMPUTER_TOOLSET_NAME = "computer"
 PROVENANCE_TOOLSET = "_anthropic_computer_toolset_name"
 PROVENANCE_MEMBER = "_anthropic_computer_member_name"
+PROVENANCE_NEUTRAL = "_anthropic_computer_use_v1"
 _LEGACY_COMPUTER_TYPES = frozenset(
     {
         "computer_20241022",
@@ -63,6 +65,227 @@ class NativeComputerAdapter:
     strict: bool = False
     enabled_members: frozenset[str] = _MEMBERS
     ordinary_names: frozenset[str] = frozenset()
+    neutral: bool = False
+    image_space: tuple[int, int] | None = None
+
+
+def has_neutral_computer_intent(tools: list[Any]) -> bool:
+    """Presence is the discriminator, including malformed intent."""
+    return any("computer_use" in _tool_mapping(tool) for tool in tools)
+
+
+def neutral_effective_model(
+    tools: list[Any], model: str, overrides: dict[str, Any]
+) -> str:
+    """Resolve model-only overrides; refuse shadowing of local tool bindings."""
+    extra = overrides.get("extra_body")
+    envelopes = [overrides, extra] if isinstance(extra, dict) else [overrides]
+    populations = [tools, *(item.get("tools", []) for item in envelopes)]
+    neutral = any(
+        has_neutral_computer_intent(list(population))
+        for population in populations
+        if isinstance(population, (list, tuple))
+    )
+    if not neutral:
+        return model
+    if extra is not None and not isinstance(extra, dict):
+        raise ComputerToolsetError("Neutral computer extra_body must be a mapping.")
+    if any(
+        {"tools", "messages", "system", "tool_choice"}.intersection(item)
+        for item in envelopes
+    ):
+        raise ComputerToolsetError(
+            "Neutral computer sensitive overrides (tools/messages/system/tool_choice) "
+            "are unsupported; use the public request fields."
+        )
+    effective = model
+    for envelope in envelopes:
+        effective = envelope.get("model", effective)
+    if not isinstance(effective, str) or not effective:
+        raise ComputerToolsetError(
+            "Neutral computer effective model must be a nonempty string."
+        )
+    return effective
+
+
+def _exact_first_party_endpoint(base_url: str | None) -> bool:
+    try:
+        endpoint = urlparse(base_url or "https://api.anthropic.com")
+        return (
+            endpoint.hostname == "api.anthropic.com"
+            and endpoint.scheme == "https"
+            and endpoint.port in {None, 443}
+            and endpoint.path in {"", "/"}
+            and not endpoint.username
+            and not endpoint.password
+            and not endpoint.query
+            and not endpoint.fragment
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _translate_neutral_tools(
+    tools: list[Any], *, model: str, base_url: str | None | Callable[[], str | None]
+) -> tuple[list[Any], NativeComputerAdapter | None]:
+    """Compile v1 into a closed GA surface or a sanitized ordinary function.
+
+    Verified protocol: first-party computer-use-tool and Haiku 5.5 migration
+    docs, plus anthropic 1.x's ComputerToolset20260801Param. Legacy declarations
+    remain on their separate shipped path.
+    """
+    neutral_tools = [tool for tool in tools if "computer_use" in _tool_mapping(tool)]
+    if len(neutral_tools) != 1 or any(
+        _unknown_computer_type(_tool_mapping(tool)) for tool in tools
+    ):
+        raise ComputerToolsetError("Ambiguous neutral/legacy computer declarations.")
+    source = _tool_mapping(neutral_tools[0])
+    intent = source["computer_use"]
+    if source.get("type") not in {None, "function", "custom"}:
+        raise ComputerToolsetError(
+            "Neutral computer intent requires a function ToolSpec."
+        )
+    if (
+        not isinstance(intent, dict)
+        or type(intent.get("version")) is not int
+        or intent["version"] != 1
+    ):
+        raise ComputerToolsetError("Neutral computer_use requires integer version=1.")
+    if set(intent) - {
+        "version",
+        "operations",
+        "image_space",
+        "unavailable_operations",
+        "native_required",
+    }:
+        raise ComputerToolsetError("Unknown neutral computer intent fields.")
+    required = intent.get("native_required", False)
+    if type(required) is not bool:
+        raise ComputerToolsetError("Neutral native_required must be a boolean.")
+    operations = intent.get("operations")
+    if (
+        not isinstance(operations, list)
+        or any(not isinstance(op, str) or op not in _MEMBERS for op in operations)
+        or len(set(operations)) != len(operations)
+    ):
+        raise ComputerToolsetError(
+            "Neutral operations must be a closed, unique canonical list."
+        )
+    unavailable = intent.get("unavailable_operations", {})
+    if (
+        not isinstance(unavailable, dict)
+        or any(
+            op not in _MEMBERS or not isinstance(reason, str) or not reason
+            for op, reason in unavailable.items()
+        )
+        or set(operations).intersection(unavailable)
+    ):
+        raise ComputerToolsetError(
+            "Invalid or conflicting neutral unavailable_operations."
+        )
+    alias = source.get("name")
+    if (
+        not isinstance(alias, str)
+        or not alias
+        or sum(_tool_mapping(tool).get("name") == alias for tool in tools) != 1
+    ):
+        raise ComputerToolsetError(
+            "Neutral computer dispatch alias is missing or ambiguous."
+        )
+    if not isinstance(source.get("parameters"), dict):
+        raise ComputerToolsetError(
+            "Neutral computer requires a canonical argument schema."
+        )
+    image = intent.get("image_space")
+    dimensions = None
+    if image is not None:
+        if (
+            not isinstance(image, dict)
+            or set(image) != {"width", "height", "unit"}
+            or image.get("unit") != "pixel"
+            or any(
+                type(image.get(axis)) is not int or image[axis] <= 0
+                for axis in ("width", "height")
+            )
+        ):
+            raise ComputerToolsetError(
+                "Neutral image_space must contain positive integer pixel dimensions."
+            )
+        dimensions = (image["width"], image["height"])
+    reason = None
+    # Fixed verified model IDs only; no inferred aliases or capability discovery.
+    if not (is_sonnet_55(model) or is_opus_55(model) or model == "claude-haiku-5-5"):
+        reason = "unverified native model"
+    elif not operations:
+        reason = "no enabled native operations"
+    elif dimensions is None:
+        reason = "unknown screenshot pixel dimensions"
+    elif (
+        max(dimensions) > 2576
+        or ((dimensions[0] + 27) // 28) * ((dimensions[1] + 27) // 28) > 4784
+    ):
+        reason = "screenshot exceeds native image limits"
+    elif not _exact_first_party_endpoint(
+        base_url() if callable(base_url) else base_url
+    ):
+        reason = "unsupported native endpoint"
+    function = {
+        "name": alias,
+        "description": source.get("description"),
+        "parameters": copy.deepcopy(source["parameters"]),
+    }
+    if reason:
+        if required:
+            raise ComputerToolsetError(
+                f"Neutral native-required request refused: {reason}."
+            )
+        return [
+            function if "computer_use" in _tool_mapping(tool) else tool
+            for tool in tools
+        ], None
+    ordinary_names = frozenset(
+        data["name"]
+        for tool in tools
+        if "computer_use" not in (data := _tool_mapping(tool))
+        and data.get("type") in {None, "function", "custom"}
+        and isinstance(data.get("name"), str)
+    )
+    if "computer" in ordinary_names:
+        raise ComputerToolsetError(
+            "Native computer toolset conflicts with an ordinary tool named computer."
+        )
+    wire = {
+        "type": COMPUTER_TOOLSET_TYPE,
+        "configs": {op: {"enabled": op in operations} for op in sorted(_MEMBERS)},
+    }
+    if "cache_control" in source:
+        wire["cache_control"] = copy.deepcopy(source["cache_control"])
+    return [
+        wire if "computer_use" in _tool_mapping(tool) else tool for tool in tools
+    ], NativeComputerAdapter(
+        alias=alias,
+        strict=True,
+        enabled_members=frozenset(operations),
+        ordinary_names=ordinary_names,
+        neutral=True,
+        image_space=dimensions,
+    )
+
+
+def canonical_native_batch(
+    adapter: NativeComputerAdapter,
+    member: str,
+    input_data: dict[str, Any],
+    *,
+    check_enabled: bool = True,
+) -> dict[str, Any]:
+    """One vendor call ID, one canonical result; never merge distinct calls."""
+    validate_member(adapter, member, input_data, check_enabled=check_enabled)
+    return {
+        "version": 1,
+        "actions": [{"action": member, **copy.deepcopy(input_data)}],
+        "capture_after": True,
+    }
 
 
 def is_sonnet_55(model: str) -> bool:
@@ -84,6 +307,7 @@ def has_native_computer_history(messages: list[Any]) -> bool:
                 if (
                     PROVENANCE_TOOLSET in block
                     or PROVENANCE_MEMBER in block
+                    or PROVENANCE_NEUTRAL in block
                     or block.get("toolset_name") == COMPUTER_TOOLSET_NAME
                 ):
                     return True
@@ -228,6 +452,34 @@ def validate_member(
         or input_data["scroll_direction"] not in {"up", "down", "left", "right"}
     ):
         raise ComputerToolsetError("Native computer scroll direction is invalid.")
+    if adapter.neutral:
+        if "text" in input_data and member in click_members:
+            raise ComputerToolsetError("Neutral native modifiers are not supported.")
+        if "repeat" in input_data and type(input_data["repeat"]) is not int:
+            raise ComputerToolsetError("Neutral native repeat must be integer 1.")
+        if member in {"left_mouse_down", "left_mouse_up"} and input_data:
+            raise ComputerToolsetError(
+                "Neutral native mouse button members take no arguments."
+            )
+        if member == "left_click_drag" and input_data.get("start_coordinate") is None:
+            raise ComputerToolsetError(
+                "Neutral native drag requires an explicit start_coordinate."
+            )
+        if member in {"wait", "hold_key"} and input_data["duration"] > 300:
+            raise ComputerToolsetError("Neutral native duration exceeds 300 seconds.")
+        width, height = adapter.image_space
+        for field in ("coordinate", "start_coordinate"):
+            point = input_data.get(field)
+            if point is not None and (point[0] >= width or point[1] >= height):
+                raise ComputerToolsetError(
+                    "Neutral native coordinate is outside screenshot pixel space."
+                )
+        if member == "zoom":
+            x0, y0, x1, y1 = input_data["region"]
+            if not (x0 < x1 <= width and y0 < y1 <= height):
+                raise ComputerToolsetError(
+                    "Neutral native zoom region is outside screenshot pixel space."
+                )
 
 
 def is_opus_55(model: str) -> bool:
@@ -261,6 +513,10 @@ def _tool_mapping(tool: Any) -> dict[str, Any]:
     if hasattr(tool, "model_dump"):
         dumped = tool.model_dump(exclude_none=True)
         if isinstance(dumped, dict):
+            # Presence is the discriminator; explicit null must reach validation.
+            complete = tool.model_dump(exclude_none=False)
+            if isinstance(complete, dict) and "computer_use" in complete:
+                dumped["computer_use"] = complete["computer_use"]
             return dict(dumped)
     result: dict[str, Any] = {}
     for name in (
@@ -276,6 +532,7 @@ def _tool_mapping(tool: Any) -> dict[str, Any]:
         "display_number",
         "enable_zoom",
         "defer_loading",
+        "computer_use",
     ):
         value = getattr(tool, name, None)
         if value is not None:
@@ -305,6 +562,8 @@ def translate_tools(
     Anthropic's vendor-native toolset. A callable resolves the endpoint only
     after a native declaration is found.
     """
+    if has_neutral_computer_intent(tools):
+        return _translate_neutral_tools(tools, model=model, base_url=base_url)
     sonnet55 = is_sonnet_55(model)
     if not is_opus_55(model) and not sonnet55:
         if model.lower().startswith("claude-sonnet-5-5") and any(
@@ -483,10 +742,100 @@ def translate_tools(
     return converted, adapter
 
 
+def _json_agrees(left: Any, right: Any) -> bool:
+    """Compare JSON copies, not Python's bool-as-number/container equality."""
+    if type(left) in {int, float} and type(right) in {int, float}:
+        return (
+            (type(left) is int or math.isfinite(left))
+            and (type(right) is int or math.isfinite(right))
+            and left == right
+        )
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        return (
+            all(type(key) is str for key in left)
+            and all(type(key) is str for key in right)
+            and left.keys() == right.keys()
+            and all(_json_agrees(left[key], right[key]) for key in left)
+        )
+    if type(left) is list:
+        return len(left) == len(right) and all(
+            _json_agrees(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return type(left) in {str, bool, type(None)} and left == right
+
+
+def _neutral_replay_id(
+    block: dict[str, Any], name: str, input_data: dict[str, Any]
+) -> str:
+    # Every supplied copy is evidence, including explicit nulls. Never let
+    # serializer precedence or Python's True == 1 hide a disagreement.
+    ids = [block[key] for key in ("id", "tool_call_id", "call_id") if key in block]
+    if not ids or type(ids[0]) is not str or not ids[0]:
+        raise ComputerToolsetError("Neutral computer history requires a call ID.")
+    for keys, value in (
+        (("name", "tool"), name),
+        (("input", "arguments"), input_data),
+        (("id", "tool_call_id", "call_id"), ids[0]),
+    ):
+        copies = [block[key] for key in keys if key in block]
+        if not copies or any(not _json_agrees(item, value) for item in copies):
+            raise ComputerToolsetError(
+                "Neutral computer history disagrees with its vendor provenance."
+            )
+    return ids[0]
+
+
 def native_wire_tool_use(
     block: dict[str, Any], adapter: NativeComputerAdapter | None
 ) -> dict[str, Any] | None:
     """Return an exact native wire block when persisted provenance authorizes it."""
+    if PROVENANCE_NEUTRAL in block:
+        if adapter is None or not adapter.neutral:
+            raise ComputerToolsetError(
+                "Neutral computer history requires a matching v1 declaration."
+            )
+        provenance = block[PROVENANCE_NEUTRAL]
+        member = block.get(PROVENANCE_MEMBER)
+        if (
+            not isinstance(provenance, dict)
+            or set(provenance) != {"version", "input", "image_space"}
+            or type(provenance.get("version")) is not int
+            or provenance["version"] != 1
+            or not _json_agrees(provenance["image_space"], list(adapter.image_space))
+            or block.get(PROVENANCE_TOOLSET) != adapter.toolset_name
+            or block.get("type") not in {None, "tool_call", "tool_use"}
+            or block.get("toolset_name") is not None
+        ):
+            raise ComputerToolsetError(
+                "Neutral computer history binding/provenance mismatch."
+            )
+        expected = canonical_native_batch(
+            adapter, member, provenance["input"], check_enabled=False
+        )
+        call_id = _neutral_replay_id(block, adapter.alias, expected)
+        return {
+            "type": "tool_use",
+            "id": call_id,
+            "toolset_name": adapter.toolset_name,
+            "name": member,
+            "input": copy.deepcopy(provenance["input"]),
+        }
+    if (
+        adapter is not None
+        and adapter.neutral
+        and (
+            PROVENANCE_MEMBER in block
+            or PROVENANCE_TOOLSET in block
+            or any(block.get(key) == adapter.alias for key in ("name", "tool"))
+            and block.get("type") in {None, "tool_call", "tool_use"}
+            and block.get("toolset_name") is None
+        )
+    ):
+        raise ComputerToolsetError(
+            "Neutral computer history is missing v1 vendor provenance."
+        )
     if adapter is not None and adapter.strict and block.get("toolset_name") is not None:
         if block.get("type") != "tool_use":
             raise ComputerToolsetError(
@@ -503,9 +852,14 @@ def native_wire_tool_use(
         validate_member(
             adapter, block.get("name"), block.get("input"), check_enabled=False
         )
+        call_id = (
+            _neutral_replay_id(block, block["name"], block["input"])
+            if adapter.neutral
+            else block.get("id", "")
+        )
         return {
             "type": "tool_use",
-            "id": block.get("id", ""),
+            "id": call_id,
             "toolset_name": adapter.toolset_name,
             "name": block["name"],
             "input": copy.deepcopy(block["input"]),
