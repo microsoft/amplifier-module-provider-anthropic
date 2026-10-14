@@ -702,6 +702,12 @@ House-style key reference. ✅ = wizard-visible ConfigField, ⚙️ = settings-o
 | `refusal_fallback_enabled` | `true` | ⚙️ | Retry once on `finish_reason="refusal"`, via the same ladder as overload |
 | `extra_request_params` | *(unset)* | ⚙️ | Escape hatch for Messages API params this provider doesn't model; merged last, user-wins |
 
+An instance selected for Haiku may legitimately inherit `fallback_on_overload`
+from a higher-tier parent. Haiku has no lower tier, so overload downgrade is
+unavailable for that request; its normal retry policy is unchanged. This is an
+informational diagnostic, not a warning to remove the parent's setting. The
+option remains available for higher-tier requests on the same instance.
+
 Removed keys (still recognized, warn with a migration message): `fallback_sonnet_model`,
 `fallback_haiku_model` (use `fallback_models`), `refusal_fallback_model` (refusal fallback
 now follows the same ladder as overload -- see Fallback section).

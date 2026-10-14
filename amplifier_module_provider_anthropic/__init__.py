@@ -1256,23 +1256,19 @@ class AnthropicProvider:
             self.config.get("persist_fallback_state", False)
         )
 
-        # Mount-time LOUD warning: fallback_on_overload has NO EFFECT on an
-        # instance whose default_model is already on the ladder's terminal
-        # rung (haiku) -- there is no lower tier to downgrade to. The wizard
-        # already hides this ConfigField for Haiku (show_when), so this
-        # specifically catches hand-edited settings.yaml.
+        # A delegated instance can legitimately inherit this option while its
+        # default model changes to Haiku. That is not a configuration error.
+        # Do not disable the option: a higher-tier per-request model can still
+        # use it, and the parent's configuration must remain independent.
         if self._fallback_on_overload:
             _fam = self._detect_family(self.default_model)
             if _fam not in _FALLBACK_NEXT_FAMILY:
-                logger.warning(
-                    "[PROVIDER] fallback_on_overload is enabled for "
-                    "default_model=%r (family %r), but %r is the lowest tier "
-                    "on the Anthropic fallback ladder -- there is no "
-                    "lower-tier model to downgrade to, so this setting has "
-                    "NO EFFECT. Remove it, or point this instance at a "
-                    "higher-tier model (fable/mythos/opus/sonnet).",
+                logger.info(
+                    "[PROVIDER] default_model=%r (family %r) has no lower-tier "
+                    "overload fallback. The normal retry policy is unchanged; "
+                    "fallback_on_overload remains available for higher-tier "
+                    "requests. An inherited setting does not need removal.",
                     self.default_model,
-                    _fam,
                     _fam,
                 )
 
