@@ -1,6 +1,6 @@
 """Tests for the fallback ladder redesign: family successor map, target
 resolution (fallback_models override / live cache / static backstop), the
-mythos family, and the terminal-family mount-time warning.
+mythos family, and the terminal-family mount-time notice.
 
 Spec: anthropic-surface-spec.md, Workstream B (§3), test plan §8.1
 (test_fallback_ladder.py, T-B01..T-B18). Refusal-fallback (B-07) and the
@@ -149,26 +149,52 @@ def test_warm_family_latest_runs_at_most_once():
 
 
 # ---------------------------------------------------------------------------
-# B-08 -- terminal-family mount-time LOUD warning
+# B-08 -- terminal-family configuration can be inherited legitimately
 # ---------------------------------------------------------------------------
 
 
-def test_terminal_family_with_fallback_enabled_warns_loudly(caplog):
-    """T-B12: fallback_on_overload=true on a haiku (terminal) instance has
-    NO EFFECT -- must warn loudly at mount, naming the lowest-tier problem,
-    since the wizard's show_when hides this ConfigField for Haiku but
-    hand-edited settings.yaml is not protected by that."""
+@pytest.mark.parametrize("model", ["claude-haiku-4-5", "claude-haiku-5-5"])
+@pytest.mark.parametrize("enabled", [True, "true"])
+def test_terminal_family_with_fallback_enabled_is_informational(caplog, model, enabled):
+    """One informational record, not a warning to remove inherited settings."""
+    with caplog.at_level(logging.INFO):
+        provider = _make_provider(model, fallback_on_overload=enabled)
+    notices = [
+        r for r in caplog.records if "has no lower-tier overload fallback" in r.message
+    ]
+    assert len(notices) == 1
+    assert notices[0].levelno == logging.INFO
+    assert model in notices[0].message
+    assert "inherited setting does not need removal" in notices[0].message
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+    assert provider._fallback_on_overload is True
+    assert provider._fallback_target_for_model(model) is None
+    # Do not mutate the option just because the constructor default is Haiku.
+    assert provider._fallback_target_for_model("claude-opus-5-5") == "claude-sonnet-5"
+
+
+@pytest.mark.parametrize("enabled", [False, "false"])
+def test_disabled_terminal_fallback_does_not_emit_notice(caplog, enabled):
+    with caplog.at_level(logging.INFO):
+        provider = _make_provider("claude-haiku-5-5", fallback_on_overload=enabled)
+    assert provider._fallback_on_overload is False
+    assert not any(
+        "has no lower-tier overload fallback" in r.message for r in caplog.records
+    )
+
+
+def test_terminal_fallback_does_not_render_at_normal_cli_warning_level(caplog):
+    """Normal CLI stderr handlers show warnings, not valid inherited options."""
     with caplog.at_level(logging.WARNING):
-        _make_provider("claude-haiku-4-5-20251001", fallback_on_overload=True)
-    messages = [r.message for r in caplog.records]
-    assert any("lowest tier" in m for m in messages)
+        _make_provider("claude-haiku-5-5", fallback_on_overload="true")
+    assert not caplog.records
 
 
 def test_non_terminal_family_with_fallback_enabled_does_not_warn(caplog):
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         _make_provider("claude-sonnet-5", fallback_on_overload=True)
     messages = [r.message for r in caplog.records]
-    assert not any("lowest tier" in m for m in messages)
+    assert not any("has no lower-tier overload fallback" in m for m in messages)
 
 
 # ---------------------------------------------------------------------------
