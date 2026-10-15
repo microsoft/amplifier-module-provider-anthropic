@@ -225,6 +225,39 @@ class TestConfigBudgetReachesTheWire:
 
         assert "thinking" not in params
 
+    def test_per_call_opt_out_does_not_warn_about_a_config_budget(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """Utility callers (session naming, goal judges) pass
+        `extended_thinking=False` deliberately. The config budget going unused is
+        the intended outcome, so no warning -- its remedy ("turn thinking on")
+        would contradict the caller. Mirrors a routing-matrix `fast` role that
+        pins `thinking_budget_tokens: 32000` on Haiku."""
+        provider = _make_provider(
+            HAIKU, thinking_budget_tokens=32000, extended_thinking=True
+        )
+        with caplog.at_level(logging.WARNING):
+            params = _run(provider, extended_thinking=False)
+
+        assert "thinking" not in params
+        assert _budget_warnings(caplog) == []
+
+    def test_per_call_opt_out_does_not_warn_about_a_role_config_budget(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """loop-streaming forwards the routing role's config as kwargs, then
+        applies `extended_thinking=False`, so a kwargs budget arrives WITH the
+        opt-out (routing-matrix `fast` role: thinking_budget_tokens=32000). The
+        opt-out wins and the unused budget is not reported."""
+        provider = _make_provider(HAIKU)
+        with caplog.at_level(logging.WARNING):
+            params = _run(
+                provider, extended_thinking=False, thinking_budget_tokens=32000
+            )
+
+        assert "thinking" not in params
+        assert _budget_warnings(caplog) == []
+
     def test_config_budget_on_a_model_that_cannot_think_warns(
         self, caplog: pytest.LogCaptureFixture
     ):
