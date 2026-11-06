@@ -465,6 +465,7 @@ def test_real_sdk_create_count_models_usage_and_json(model):
                             "type": "model",
                             "display_name": model,
                             "created_at": "2026-10-07T00:00:00Z",
+                            "lifecycle": "active",
                         }
                     ],
                     "has_more": False,
