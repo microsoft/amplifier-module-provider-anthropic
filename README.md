@@ -76,6 +76,29 @@ Provides access to Anthropic's Claude models (Claude 4 series: Sonnet, Opus, Hai
 
 ## Supported Models
 
+### Fresh API inventory
+
+`await provider.discover_models()` returns
+`{"version": 1, "source": "provider-api", "models": [...]}`, with `ModelInfo`
+entries whose IDs come only from the configured endpoint/account's Models API.
+Each call fetches every page afresh. A genuine empty inventory is `models: []`;
+missing data, malformed pagination and request failures raise kernel errors,
+never a partial list, cached list, configured default or fallback.
+Discovery validates raw JSON before SDK model parsing, so coerced pagination
+flags such as `"false"` or `0` cannot masquerade as a complete inventory.
+Continuation uses explicit validated `after_id` cursors with cycle detection.
+
+Discovery ignores latest-per-family filtering and selection-only settings
+(`model`, `default_model`, `reasoning_effort`, `priority`). It imposes no
+capability-based inventory exclusions and makes no inference request. Existing
+capability mapping and `enable_1m_context` metadata policy still apply: the
+`provider-api` source describes inventory provenance, not a claim that every
+metadata field was supplied by the API. Discovery neither reads nor warms the
+legacy fallback/model-info caches. `list_models()` retains its existing return
+type, first-page behavior, filtering, cache updates and retry/error policy.
+
+### Model support
+
 - `claude-sonnet-5-5` - Claude Sonnet 5.5 (default; explicit model pins remain unchanged)
 - `claude-sonnet-5` - Claude Sonnet 5 (previous default; still supported)
 - `claude-opus-5` - Claude Opus 5 (most capable)
