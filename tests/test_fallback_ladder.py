@@ -278,6 +278,7 @@ def test_fallback_ladder_defaults_corrected():
 
 
 def test_list_models_populates_family_latest_cache():
+    from tests._helpers import models_page
     provider = _make_provider("claude-sonnet-5")
 
     class _FakeModel:
@@ -286,18 +287,14 @@ def test_list_models_populates_family_latest_cache():
             self.display_name = id_
             self.created_at = created_at
 
-    class _FakeResponse:
-        def __init__(self, data):
-            self.data = data
-
     async def _fake_list(**kwargs):
-        return _FakeResponse(
+        return models_page(
             [
                 _FakeModel("claude-opus-4-8", "2026-01-01"),
                 _FakeModel("claude-opus-5", "2026-06-01"),
             ]
         )
 
-    provider.client.models.list = _fake_list  # type: ignore[method-assign]
+    provider.client.models.with_raw_response.list = _fake_list
     asyncio.run(provider.list_models())
     assert provider._family_latest["opus"] == "claude-opus-5"

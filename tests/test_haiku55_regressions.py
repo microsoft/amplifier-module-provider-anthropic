@@ -114,11 +114,12 @@ def test_exact_capabilities_and_overlay_preserve_static_controls():
 
 @pytest.mark.parametrize("filtered", [True, False])
 def test_numeric_discovery_and_saved_pins(filtered):
+    from tests._helpers import models_page
     p = provider(filtered=filtered)
     ids = ["claude-haiku-4-5", MODEL, "claude-haiku-5-9", "claude-haiku-5-10"]
-    p.client.models.list = AsyncMock(
-        return_value=SimpleNamespace(
-            data=[SimpleNamespace(id=id, display_name=id, created_at="") for id in ids]
+    p.client.models.with_raw_response.list = AsyncMock(
+        return_value=models_page(
+            [SimpleNamespace(id=id, display_name=id, created_at="") for id in ids]
         )
     )
     models = asyncio.run(p.list_models())
@@ -342,7 +343,8 @@ def test_runtime_native_ceiling_does_not_promote_catalog_policy(full_context):
         max_input_tokens=1_000_000,
         max_tokens=128_000,
     )
-    p.client.models.list = AsyncMock(return_value=SimpleNamespace(data=[info]))
+    from tests._helpers import models_page
+    p.client.models.with_raw_response.list = AsyncMock(return_value=models_page([info]))
     models = asyncio.run(p.list_models())
     advertised = 1_000_000 if full_context else 200_000
     assert models[0].context_window == advertised

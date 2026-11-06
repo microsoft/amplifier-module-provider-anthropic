@@ -24,7 +24,7 @@ from amplifier_core.llm_errors import (
 )
 
 from amplifier_module_provider_anthropic import AnthropicProvider
-from tests._helpers import FakeCoordinator
+from tests._helpers import FakeCoordinator, models_page
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,7 +54,7 @@ def _fake_models_response(model_ids: list[str]) -> SimpleNamespace:
         SimpleNamespace(id=mid, display_name=mid, created_at="2026-01-01")
         for mid in model_ids
     ]
-    return SimpleNamespace(data=data)
+    return models_page(data)
 
 
 def _make_sdk_server_error() -> anthropic.InternalServerError:
@@ -82,12 +82,12 @@ def test_list_models_succeeds_first_try():
     """No transient failure: exactly one API call, result unchanged."""
     provider = _make_provider()
     response = _fake_models_response(["claude-sonnet-4-5-20250929"])
-    provider.client.models.list = AsyncMock(return_value=response)
+    provider.client.models.with_raw_response.list = AsyncMock(return_value=response)
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         models = asyncio.run(provider.list_models())
 
-    assert provider.client.models.list.await_count == 1
+    assert provider.client.models.with_raw_response.list.await_count == 1
     mock_sleep.assert_not_awaited()
     assert len(models) == 1
     assert models[0].id == "claude-sonnet-4-5-20250929"
@@ -97,14 +97,14 @@ def test_list_models_recovers_from_transient_500():
     """A single transient 500 is retried, then the call succeeds."""
     provider = _make_provider()
     response = _fake_models_response(["claude-sonnet-4-5-20250929"])
-    provider.client.models.list = AsyncMock(
+    provider.client.models.with_raw_response.list = AsyncMock(
         side_effect=[_make_sdk_server_error(), response]
     )
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
         models = asyncio.run(provider.list_models())
 
-    assert provider.client.models.list.await_count == 2
+    assert provider.client.models.with_raw_response.list.await_count == 2
     assert len(models) == 1
     assert models[0].id == "claude-sonnet-4-5-20250929"
 
@@ -112,7 +112,7 @@ def test_list_models_recovers_from_transient_500():
 def test_list_models_raises_after_retries_exhausted():
     """Persistent transient failure raises the kernel error after retries."""
     provider = _make_provider(max_retries=2)
-    provider.client.models.list = AsyncMock(side_effect=_make_sdk_server_error())
+    provider.client.models.with_raw_response.list = AsyncMock(side_effect=_make_sdk_server_error())
 
     with (
         patch("asyncio.sleep", new_callable=AsyncMock),
@@ -121,13 +121,13 @@ def test_list_models_raises_after_retries_exhausted():
         asyncio.run(provider.list_models())
 
     # 1 initial + 2 retries = 3 total attempts
-    assert provider.client.models.list.await_count == 3
+    assert provider.client.models.with_raw_response.list.await_count == 3
 
 
 def test_list_models_non_retryable_error_raised_immediately():
     """A non-retryable error (401) raises immediately without retrying."""
     provider = _make_provider()
-    provider.client.models.list = AsyncMock(side_effect=_make_sdk_auth_error())
+    provider.client.models.with_raw_response.list = AsyncMock(side_effect=_make_sdk_auth_error())
 
     with (
         patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
@@ -135,5 +135,5 @@ def test_list_models_non_retryable_error_raised_immediately():
     ):
         asyncio.run(provider.list_models())
 
-    assert provider.client.models.list.await_count == 1
+    assert provider.client.models.with_raw_response.list.await_count == 1
     mock_sleep.assert_not_awaited()

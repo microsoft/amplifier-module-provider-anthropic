@@ -10,6 +10,20 @@ intentionally kept local — each file has a different signature.
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+
+def models_page(models):
+    """Raw/parsed page pair for unit tests; real SDK coverage is separate."""
+    data = [{"lifecycle": "active", **vars(model)} for model in models]
+    return SimpleNamespace(
+        json=AsyncMock(return_value={
+            "data": data, "has_more": False,
+            "first_id": models[0].id if models else None,
+            "last_id": models[-1].id if models else None,
+        }),
+        parse=AsyncMock(return_value=SimpleNamespace(data=models)),
+    )
 
 
 class FakeHooks:

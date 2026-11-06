@@ -23,7 +23,7 @@ import amplifier_module_provider_anthropic as module
 from amplifier_module_provider_anthropic import AnthropicProvider
 
 
-def _page(*ids, has_more=False):
+def _page(*ids, has_more=False, lifecycle="active"):
     return {
         "data": [
             {
@@ -31,6 +31,7 @@ def _page(*ids, has_more=False):
                 "display_name": model_id,
                 "type": "model",
                 "created_at": "2026-01-01T00:00:00Z",
+                "lifecycle": lifecycle,
             }
             for model_id in ids
         ],
@@ -49,10 +50,8 @@ def _error(status):
 
 
 def _ids(result):
-    assert result["version"] == 1
-    assert result["source"] == "provider-api"
-    assert set(result) == {"version", "source", "models"}
-    return [model.id for model in result["models"]]
+    assert isinstance(result, list)
+    return [model.id for model in result]
 
 
 @pytest_asyncio.fixture
@@ -124,9 +123,9 @@ async def test_success_preserves_exact_api_ids_without_family_filtering(wire):
     ]
     wire.responses.append(_page(*ids))
     provider = wire.provider(filtered=True, default_model="not-in-account")
-    assert _ids(await provider.discover_models()) == ids
+    assert _ids(await provider.list_models(filters={})) == sorted(ids)
     assert len(wire.requests) == 1
-    assert provider._family_latest == {}
+    assert provider._family_latest == {"sonnet": "claude-sonnet-5-5"}
     assert provider.filtered is True
 
 
@@ -138,11 +137,7 @@ async def test_empty_inventory_is_genuine_even_with_selection_and_cache(wire):
         fallback_models={"sonnet": "configured-not-discovered"},
     )
     provider._family_latest["sonnet"] = "cached-not-discovered"
-    assert await provider.discover_models() == {
-        "version": 1,
-        "source": "provider-api",
-        "models": [],
-    }
+    assert await provider.list_models(filters={}) == []
     assert len(wire.requests) == 1
     assert provider._family_latest == {"sonnet": "cached-not-discovered"}
 
@@ -160,10 +155,10 @@ async def test_every_page_uses_the_same_configured_endpoint_and_account(wire):
         base_url="https://proxy.test/team-one/",
         api_key="offline-team-one-key",
     )
-    assert _ids(await provider.discover_models()) == [
+    assert _ids(await provider.list_models(filters={})) == [
         "claude-sonnet-4-5",
-        "private-model:two",
         "private-model:three",
+        "private-model:two",
     ]
     assert len(wire.requests) == 3
     assert [r.url.params.get("after_id") for r in wire.requests] == [
@@ -188,8 +183,8 @@ async def test_distinct_accounts_do_not_share_inventory(wire):
     second = wire.provider(
         api_key="offline-b", base_url="https://other.test/account-b/"
     )
-    assert _ids(await first.discover_models()) == ["account-a-only"]
-    assert _ids(await second.discover_models()) == ["account-b-only"]
+    assert _ids(await first.list_models(filters={})) == ["account-a-only"]
+    assert _ids(await second.list_models(filters={})) == ["account-b-only"]
     assert [r.headers["x-api-key"] for r in wire.requests] == ["offline-a", "offline-b"]
     assert [r.url.host for r in wire.requests] == ["inventory.test", "other.test"]
 
@@ -207,8 +202,8 @@ async def test_selection_fields_do_not_change_inventory_or_request(wire):
         filtered=True,
     )
     config_before = deepcopy(selected.config)
-    assert _ids(await ordinary.discover_models()) == ids
-    assert _ids(await selected.discover_models()) == ids
+    assert _ids(await ordinary.list_models(filters={})) == ids
+    assert _ids(await selected.list_models(filters={})) == ids
     assert wire.requests[0].url == wire.requests[1].url
     assert selected.config == config_before
     assert selected.default_model == "another-not-an-api-model"
@@ -222,16 +217,14 @@ async def test_repeated_discovery_is_fresh_without_reading_or_warming_caches(wir
     provider._family_latest = {"sonnet": "stale-cached-id"}
     provider._family_latest_attempted = True
     provider._runtime_model_info_cache = {"stale-cached-id": None}
-    provider.list_models = AsyncMock(side_effect=AssertionError("legacy listing used"))
     provider.complete = AsyncMock(side_effect=AssertionError("inference used"))
-    assert _ids(await provider.discover_models()) == ["first-live"]
-    assert _ids(await provider.discover_models()) == ["second-live"]
-    assert _ids(await provider.discover_models()) == []
+    assert _ids(await provider.list_models(filters={})) == ["first-live"]
+    assert _ids(await provider.list_models(filters={})) == ["second-live"]
+    assert _ids(await provider.list_models(filters={})) == []
     assert len(wire.requests) == 3
     assert provider._family_latest == {"sonnet": "stale-cached-id"}
     assert provider._family_latest_attempted is True
     assert provider._runtime_model_info_cache == {"stale-cached-id": None}
-    provider.list_models.assert_not_awaited()
     provider.complete.assert_not_awaited()
 
 
@@ -253,7 +246,7 @@ async def test_http_failures_raise_kernel_errors_not_empty_success(
 ):
     wire.responses.append(_error(status))
     with pytest.raises(error_type) as caught:
-        await wire.provider().discover_models()
+        await wire.provider().list_models(filters={})
     assert caught.value.provider == "anthropic"
     assert caught.value.status_code == status
     assert caught.value.retryable is retryable
@@ -264,7 +257,7 @@ async def test_http_failures_raise_kernel_errors_not_empty_success(
 async def test_missing_credentials_fail_before_transport(wire):
     provider = wire.provider(api_key=None)
     with pytest.raises(AuthenticationError):
-        await provider.discover_models()
+        await provider.list_models(filters={})
     assert wire.requests == []
     assert wire.constructor_args == []
 
@@ -273,14 +266,14 @@ async def test_missing_credentials_fail_before_transport(wire):
 async def test_auth_error_is_not_retried(wire):
     wire.responses.append(_error(401))
     with pytest.raises(AuthenticationError):
-        await wire.provider(max_retries=2).discover_models()
+        await wire.provider(max_retries=2).list_models(filters={})
     assert len(wire.requests) == 1
 
 
 @pytest.mark.asyncio
 async def test_transient_failure_retries_then_returns_actual_success(wire):
     wire.responses.extend([_error(500), _page("actual-retry-result")])
-    assert _ids(await wire.provider(max_retries=1).discover_models()) == [
+    assert _ids(await wire.provider(max_retries=1).list_models(filters={})) == [
         "actual-retry-result"
     ]
     assert len(wire.requests) == 2
@@ -290,9 +283,9 @@ async def test_transient_failure_retries_then_returns_actual_success(wire):
 async def test_exhausted_transient_failure_never_falls_back_to_previous_success(wire):
     wire.responses.extend([_page("previous-live"), _error(500), _error(500)])
     provider = wire.provider(max_retries=1)
-    assert _ids(await provider.discover_models()) == ["previous-live"]
+    assert _ids(await provider.list_models(filters={})) == ["previous-live"]
     with pytest.raises(ProviderUnavailableError):
-        await provider.discover_models()
+        await provider.list_models(filters={})
     assert len(wire.requests) == 3
 
 
@@ -308,7 +301,7 @@ async def test_later_page_failure_cannot_return_partial_inventory(
     wire.responses.extend([_error(status)] * (2 if status == 500 else 1))
     provider = wire.provider(max_retries=retries)
     with pytest.raises(error_type):
-        await provider.discover_models()
+        await provider.list_models(filters={})
     assert [r.url.params.get("after_id") for r in wire.requests] == [
         None,
         *(["partial-not-success"] * (2 if status == 500 else 1)),
@@ -321,7 +314,7 @@ async def test_later_page_retry_keeps_cursor_and_prior_page(wire):
     wire.responses.extend(
         [_page("first", has_more=True), _error(500), _page("second")]
     )
-    assert _ids(await wire.provider(max_retries=1).discover_models()) == [
+    assert _ids(await wire.provider(max_retries=1).list_models(filters={})) == [
         "first",
         "second",
     ]
@@ -359,7 +352,7 @@ async def test_later_page_retry_keeps_cursor_and_prior_page(wire):
 async def test_malformed_pages_are_errors_not_empty_or_partial_success(wire, body):
     wire.responses.append(body)
     with pytest.raises(LLMError):
-        await wire.provider().discover_models()
+        await wire.provider().list_models(filters={})
     assert len(wire.requests) == 1
 
 
@@ -377,7 +370,7 @@ async def test_raw_pagination_flags_cannot_be_coerced_into_success(
     wire.responses.append(body)
     provider = wire.provider(max_retries=2)
     with pytest.raises(LLMError, match="expected data and has_more") as caught:
-        await provider.discover_models()
+        await provider.list_models(filters={})
     assert caught.value.retryable is False
     assert len(wire.requests) == (2 if later_page else 1)
     assert provider._family_latest == {}
@@ -399,7 +392,7 @@ async def test_raw_ids_and_cursors_cannot_be_coerced(
         body["last_id"] = value
     wire.responses.append(body)
     with pytest.raises(LLMError) as caught:
-        await wire.provider(max_retries=2).discover_models()
+        await wire.provider(max_retries=2).list_models(filters={})
     assert caught.value.retryable is False
     assert len(wire.requests) == (2 if later_page else 1)
 
@@ -412,7 +405,7 @@ async def test_invalid_json_is_a_nonretryable_kernel_error(wire):
         )
     )
     with pytest.raises(LLMError, match="expected JSON") as caught:
-        await wire.provider(max_retries=2).discover_models()
+        await wire.provider(max_retries=2).list_models(filters={})
     assert caught.value.retryable is False
     assert len(wire.requests) == 1
 
@@ -421,7 +414,7 @@ async def test_invalid_json_is_a_nonretryable_kernel_error(wire):
 async def test_later_malformed_page_discards_partial_inventory(wire):
     wire.responses.extend([_page("first", has_more=True), {"has_more": False}])
     with pytest.raises(LLMError):
-        await wire.provider().discover_models()
+        await wire.provider().list_models(filters={})
     assert len(wire.requests) == 2
 
 
@@ -431,7 +424,7 @@ async def test_repeated_pagination_cursor_fails_instead_of_looping(wire):
         [_page("same", has_more=True), _page("same", has_more=True)]
     )
     with pytest.raises(LLMError, match="pagination"):
-        await wire.provider().discover_models()
+        await wire.provider().list_models(filters={})
     assert len(wire.requests) == 2
 
 
@@ -440,29 +433,30 @@ async def test_repeated_pagination_cursor_fails_instead_of_looping(wire):
 async def test_transport_failure_is_typed_and_never_becomes_empty(wire, failure):
     wire.responses.append(failure("offline transport failure"))
     with pytest.raises(LLMError) as caught:
-        await wire.provider().discover_models()
+        await wire.provider().list_models(filters={})
     assert caught.value.retryable is True
     assert len(wire.requests) == 1
 
 
 @pytest.mark.asyncio
-async def test_legacy_listing_keeps_filter_first_page_and_cache_behavior(wire):
+async def test_canonical_listing_filters_only_after_all_pages_and_warms_cache(wire):
     body = _page("claude-sonnet-4-5", "claude-sonnet-5-5", has_more=True)
-    wire.responses.extend([deepcopy(body), deepcopy(body), _page("second-page")])
+    wire.responses.extend([deepcopy(body), _page("claude-sonnet-6"),
+                           deepcopy(body), _page("claude-sonnet-6")])
     provider = wire.provider(filtered=True)
-    legacy = await provider.list_models()
-    assert [m.id for m in legacy] == ["claude-sonnet-5-5"]
-    assert len(wire.requests) == 1  # Preserve the legacy first-page contract.
+    recommended = await provider.list_models()
+    assert _ids(recommended) == ["claude-sonnet-6"]
+    assert len(wire.requests) == 2
     cache_before = provider._family_latest.copy()
-    discovered = await provider.discover_models()
+    discovered = await provider.list_models(filters={})
     assert _ids(discovered) == [
         "claude-sonnet-4-5",
         "claude-sonnet-5-5",
-        "second-page",
+        "claude-sonnet-6",
     ]
-    assert discovered["models"][1] == legacy[0]
+    assert discovered[2] == recommended[0]
     assert provider._family_latest == cache_before
-    assert len(wire.requests) == 3
+    assert len(wire.requests) == 4
 
 
 @pytest.mark.asyncio
@@ -495,12 +489,10 @@ async def test_discovery_preserves_bound_workspace_on_every_page(monkeypatch):
             module, "AsyncAnthropic",
             lambda **kwargs: pytest.fail("discovery reconstructed the bound client"),
         )
-        result = await provider.discover_models()
+        result = await provider.list_models(filters={})
         assert _ids(result) == ["first", "last"]
-        serialized = {**result, "models": [
-            item.model_dump(mode="json") for item in result["models"]
-        ]}
-        assert [item["id"] for item in json.loads(json.dumps(serialized))["models"]] == [
+        serialized = [item.model_dump(mode="json") for item in result]
+        assert [item["id"] for item in json.loads(json.dumps(serialized))] == [
             "first", "last"
         ]
         assert provider.client is client
@@ -519,7 +511,7 @@ async def test_mismatched_last_id_fails_before_next_request(wire, later_page, cu
     body["last_id"] = cursor
     wire.responses.extend([body, _page()])
     with pytest.raises(LLMError) as caught:
-        await wire.provider().discover_models()
+        await wire.provider().list_models(filters={})
     assert caught.value.provider == "anthropic"
     assert caught.value.retryable is False
     assert len(wire.requests) == (2 if later_page else 1)
@@ -531,9 +523,9 @@ async def test_runtime_metadata_and_context_policy_are_preserved(wire):
     body = _page("claude-haiku-5-5")
     body["data"][0].update(max_input_tokens=1_000_000, max_tokens=128_000)
     wire.responses.extend([deepcopy(body), deepcopy(body)])
-    capped = await wire.provider(enable_1m_context=False).discover_models()
-    expanded = await wire.provider(enable_1m_context=True).discover_models()
+    capped = await wire.provider(enable_1m_context=False).list_models(filters={})
+    expanded = await wire.provider(enable_1m_context=True).list_models(filters={})
     assert _ids(capped) == _ids(expanded) == ["claude-haiku-5-5"]
-    assert capped["models"][0].context_window == 200_000
-    assert expanded["models"][0].context_window == 1_000_000
-    assert capped["models"][0].max_output_tokens == 128_000
+    assert capped[0].context_window == 200_000
+    assert expanded[0].context_window == 1_000_000
+    assert capped[0].max_output_tokens == 128_000
