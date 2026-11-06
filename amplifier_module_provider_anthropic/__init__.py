@@ -1942,6 +1942,12 @@ class AnthropicProvider:
                         retryable=False,
                     )
             cursor = payload.get("last_id")
+            if data and cursor is not None and cursor != data[-1]["id"]:
+                raise KernelLLMError(
+                    "Malformed model discovery pagination: last_id is not the last data ID",
+                    provider="anthropic",
+                    retryable=False,
+                )
             if has_more and (
                 not data or cursor is None or cursor in cursors
             ):

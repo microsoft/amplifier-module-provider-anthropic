@@ -2,6 +2,7 @@
 
 from collections import deque
 from copy import deepcopy
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -462,6 +463,67 @@ async def test_legacy_listing_keeps_filter_first_page_and_cache_behavior(wire):
     assert discovered["models"][1] == legacy[0]
     assert provider._family_latest == cache_before
     assert len(wire.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_discovery_preserves_bound_workspace_on_every_page(monkeypatch):
+    requests = []
+
+    def receive(request):
+        requests.append(request)
+        assert request.method == "GET"
+        assert str(request.url).split("?")[0] == "https://workspace.invalid/v1/models"
+        assert request.headers["x-api-key"] == "fixture-workspace-key"
+        assert request.headers.get("anthropic-workspace-id") == "wrkspc_A"
+        return httpx2.Response(
+            200, json=_page("first", has_more=True) if len(requests) == 1 else _page("last")
+        )
+
+    async with AsyncAnthropic(
+        api_key="fixture-workspace-key", auth_token="",
+        base_url="https://workspace.invalid",
+        default_headers={"anthropic-workspace-id": "wrkspc_A"},
+        max_retries=0,
+        http_client=httpx2.AsyncClient(
+            transport=httpx2.MockTransport(receive), trust_env=False
+        ),
+    ) as client:
+        provider = AnthropicProvider(api_key="unused", config={"max_retries": 0})
+        provider._client = client
+        before = client.default_headers.copy()
+        monkeypatch.setattr(
+            module, "AsyncAnthropic",
+            lambda **kwargs: pytest.fail("discovery reconstructed the bound client"),
+        )
+        result = await provider.discover_models()
+        assert _ids(result) == ["first", "last"]
+        serialized = {**result, "models": [
+            item.model_dump(mode="json") for item in result["models"]
+        ]}
+        assert [item["id"] for item in json.loads(json.dumps(serialized))["models"]] == [
+            "first", "last"
+        ]
+        assert provider.client is client
+        assert client.default_headers == before
+        assert client.max_retries == 0
+        assert [r.url.params.get("after_id") for r in requests] == [None, "first"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later_page", [False, True])
+@pytest.mark.parametrize("cursor", ["a", "not-in-page"])
+async def test_mismatched_last_id_fails_before_next_request(wire, later_page, cursor):
+    if later_page:
+        wire.responses.append(_page("previous", has_more=True))
+    body = _page("a", "b", has_more=True)
+    body["last_id"] = cursor
+    wire.responses.extend([body, _page()])
+    with pytest.raises(LLMError) as caught:
+        await wire.provider().discover_models()
+    assert caught.value.provider == "anthropic"
+    assert caught.value.retryable is False
+    assert len(wire.requests) == (2 if later_page else 1)
+    assert list(wire.responses) == [_page()]
 
 
 @pytest.mark.asyncio
