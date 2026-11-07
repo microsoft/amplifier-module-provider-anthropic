@@ -21,7 +21,9 @@ dependencies = [
     #
     # Capped below the next major: an unpinned major bump is what broke fresh
     # installs when 1.0.0 shipped.
-    "anthropic>=1.0.0,<2.0.0",
+    # 1.12.0 adds typed lifecycle filtering and ModelInfo.lifecycle. Required
+    # for active-only recommendations and an explicitly unfiltered catalog.
+    "anthropic>=1.12.0,<2.0.0",
 ]
 
 [project.entry-points."amplifier.modules"]

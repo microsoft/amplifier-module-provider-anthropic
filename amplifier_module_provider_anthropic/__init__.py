@@ -67,6 +67,9 @@ from anthropic._exceptions import (
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 from ._cost import compute_cost
+from ._model_listing import (
+    DEFAULT_FILTERS, LIFECYCLES, ModelFilters, latest_models, model_identity, selector_schema,
+)
 from ._computer_toolset import (
     COMPUTER_TOOLSET_NAME,
     PROVENANCE_MEMBER,
@@ -886,6 +889,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "max_concurrent_requests",
         "use_streaming",
         "filtered",
+        "model_filters",
         "enable_1m_context",
         "enable_prompt_caching",
         "cache_stable_region_ttl_1h",
@@ -1331,6 +1335,11 @@ class AnthropicProvider:
         self.filtered = self._config_bool(
             self.config.get("filtered", True)
         )  # Filter to curated model list by default
+        self._model_filters = (
+            ModelFilters.parse(self.config["model_filters"])
+            if "model_filters" in self.config
+            else DEFAULT_FILTERS if self.filtered else ModelFilters()
+        )
         self.enable_prompt_caching = self._config_bool(
             self.config.get("enable_prompt_caching", True)
         )
@@ -1624,31 +1633,15 @@ class AnthropicProvider:
             ],
         )
 
-    async def list_models(
-        self, retry_config: RetryConfig | None = None
-    ) -> list[ModelInfo]:
-        """
-        List available Claude models dynamically from Anthropic API.
-
-        When filtered=True (default), returns only the latest version of each
-        model family (e.g. fable, opus, sonnet, haiku). When filtered=False,
-        returns all available Claude models.
-
-        The query is retried with the same shared retry_with_backoff()/
-        _retry_config machinery used by complete() on transient failures
-        (5xx, connection errors, timeouts, rate limits). Raises the
-        translated kernel error once retries are exhausted, or immediately
-        for non-retryable errors (401/403/404) -- no fallback; caller
-        handles empty lists.
-
-        `retry_config` lets a caller (namely `_warm_family_latest`) use a
-        cheaper retry policy than the instance default -- passed explicitly
-        rather than by mutating `self._retry_config`, which would not be
-        concurrency-safe under the process-wide semaphore.
-
-        Returns:
-            List of ModelInfo for available Claude models.
-        """
+    async def _list_models_page(
+        self,
+        retry_config: RetryConfig | None = None,
+        *,
+        after_id: str | None = None,
+        lifecycle: tuple[str, ...] = LIFECYCLES,
+    ) -> Any:
+        """Fetch one SDK page with the existing listing retry/error policy."""
+        operation = "list_models"
         active_retry_config = retry_config or self._retry_config
 
         async def _do_list_models():
@@ -1660,42 +1653,46 @@ class AnthropicProvider:
             the same retry policy as complete().
             """
             try:
-                return await self.client.models.list()
+                # Locked SDK 1.12 supports limit (1..1000) and lifecycle.
+                # Keep the original bound client and its native header behavior.
+                if after_id is not None:
+                    return await self.client.models.with_raw_response.list(
+                        limit=1000, after_id=after_id, lifecycle=list(lifecycle)
+                    )
+                return await self.client.models.with_raw_response.list(
+                    limit=1000, lifecycle=list(lifecycle)
+                )
             except AnthropicRateLimitError as e:
                 rate_info = self._parse_rate_limit_info(e)
                 retry_after = rate_info.get("retry_after_seconds")
-                body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
                 raise KernelRateLimitError(
-                    msg,
+                    "Anthropic model listing rate limited",
                     provider="anthropic",
                     status_code=429,
                     retryable=True,
                     retry_after=retry_after,
-                ) from e
+                ) from None
             except AnthropicAuthenticationError as e:
-                body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
                 raise KernelAuthenticationError(
-                    msg,
+                    "Anthropic model listing authentication failed",
                     provider="anthropic",
                     status_code=getattr(e, "status_code", 401),
-                ) from e
+                ) from None
             except AnthropicAPIStatusError as e:
                 # Also catches AnthropicOverloadedError (529), a subclass of
                 # AnthropicAPIStatusError -- it falls into the status >= 500
                 # branch below and is retried like any other 5xx.
                 status = getattr(e, "status_code", 500)
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = f"Anthropic model listing failed (HTTP {status})"
                 if status == 403:
                     # Distinguish Cloudflare bot challenges (transient) from
                     # real API 403s (permanent), same detection _do_complete uses.
                     if self._is_cloudflare_challenge(e):
                         logger.warning(
                             "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
-                            "with HTML body) on list_models(). Treating as "
-                            "transient -- will retry."
+                            "with HTML body) on %s(). Treating as "
+                            "transient -- will retry.",
+                            operation,
                         )
                         raise KernelProviderUnavailableError(
                             "Cloudflare bot challenge (transient 403 with HTML "
@@ -1703,56 +1700,51 @@ class AnthropicProvider:
                             provider="anthropic",
                             status_code=403,
                             retryable=True,
-                        ) from e
+                        ) from None
                     raise KernelAccessDeniedError(
                         error_msg,
                         provider="anthropic",
                         status_code=403,
-                    ) from e
+                    ) from None
                 if status == 404:
                     raise KernelNotFoundError(
                         error_msg,
                         provider="anthropic",
                         status_code=404,
-                    ) from e
+                    ) from None
                 if status >= 500:
                     raise KernelProviderUnavailableError(
                         error_msg,
                         provider="anthropic",
                         status_code=status,
                         retryable=True,
-                    ) from e
+                    ) from None
                 raise KernelLLMError(
                     error_msg,
                     provider="anthropic",
                     status_code=status,
                     retryable=False,
-                ) from e
+                ) from None
             except KernelLLMError:
                 raise  # Already translated, don't double-wrap
-            except Exception as e:
+            except Exception:
                 # Connection errors, timeouts, and anything unforeseen land
                 # here -- same catch-all _do_complete() uses, treated as
                 # transient and retryable.
-                body = getattr(e, "body", None)
-                error_msg = (
-                    json.dumps(body)
-                    if body is not None
-                    else (str(e) or f"{type(e).__name__}: (no message)")
-                )
                 raise KernelLLMError(
-                    error_msg,
+                    "Anthropic model listing transport failed",
                     provider="anthropic",
                     retryable=True,
-                ) from e
+                ) from None
 
         async def _on_retry(attempt: int, delay: float, error: KernelLLMError):
             """Callback invoked before each retry sleep."""
             error_type = type(error).__name__
             logger.warning(
-                "[PROVIDER] Retry %d/%d for list_models(): %s, sleeping %.1fs",
+                "[PROVIDER] Retry %d/%d for %s(): %s, sleeping %.1fs",
                 attempt,
                 active_retry_config.max_retries,
+                operation,
                 error_type,
                 delay,
             )
@@ -1769,89 +1761,210 @@ class AnthropicProvider:
                     },
                 )
 
-        response = await retry_with_backoff(
+        return await retry_with_backoff(
             _do_list_models,
-            self._retry_config,
+            active_retry_config,
             on_retry=_on_retry,
         )
-        api_models = list(response.data)
 
-        # Group models by family using _detect_family() as the single source of
-        # truth for family classification. A previous version hardcoded a
-        # separate {opus, haiku, sonnet} map here, which silently dropped any
-        # family not in that list (e.g. fable) until it was updated by hand.
-        families: dict[str, list[tuple[str, str, str]]] = {}
-        for model in api_models:
-            model_id = model.id
-            display_name = getattr(model, "display_name", model_id)
-            family = self._detect_family(model_id)
-            families.setdefault(family, []).append(
-                (model_id, display_name, str(getattr(model, "created_at", "")))
+    async def list_models(
+        self, retry_config: RetryConfig | None = None, *,
+        filters: Mapping[str, object] | None = None,
+    ) -> list[ModelInfo]:
+        """Fetch a complete authentic catalog, then apply a frozen selector.
+
+        None uses configured defaults; an explicit mapping replaces them and {}
+        is unfiltered. Retains the existing retry override for fallback warm-up.
+        Listing policy never restricts explicit inference model selection.
+        """
+        selector = self._model_filters if filters is None else ModelFilters.parse(filters)
+        entries = await self._fetch_models(retry_config, lifecycle=selector.lifecycle)
+        models = [model for model, stage in entries if stage in selector.lifecycle]
+        # Update the fallback side channel only after complete validated success.
+        # Recommendation overrides do not select inference fallback targets.
+        active_ids = [model.id for model, stage in entries if stage == "active"]
+        for model_id in latest_models(active_ids, previews=False):
+            identity = model_identity(model_id)
+            self._family_latest[identity.family] = model_id
+        selected = set(selector.select([model.id for model in models]))
+        return sorted(
+            (model for model in models if model.id in selected),
+            key=lambda model: (model.display_name.casefold(), model.id),
+        )
+
+    def get_model_list_info(self) -> dict[str, Any]:
+        """Optional selector extension; fresh metadata without network I/O."""
+        return {
+            "version": 1,
+            "source": "provider-api",
+            "filters_keyword": "filters",
+            "filters_schema": selector_schema(),
+            "default_filters": self._model_filters.as_dict(),
+            "unfiltered": {},
+            "override": "replace",
+        }
+
+    def _model_info(self, raw_model: Any, display_name: str) -> ModelInfo:
+        """Map an API model without consulting or updating inventory caches."""
+        model_id = raw_model.id
+        if model_identity(model_id) is None:
+            # ModelInfo requires integers: 0 explicitly denotes unknown, not a
+            # usable budget. Never infer Sonnet capabilities for opaque API IDs.
+            def known_limit(name: str) -> int:
+                value = getattr(raw_model, name, None)
+                return value if type(value) is int and value > 0 else 0
+            return ModelInfo(
+                id=model_id, display_name=display_name,
+                context_window=known_limit("max_input_tokens"),
+                max_output_tokens=known_limit("max_tokens"),
+                capabilities=[], defaults={},
+            )
+        caps = self._apply_runtime_capability_overrides(
+            self._get_capabilities(model_id),
+            self._extract_runtime_model_info(raw_model),
+        )
+        has_1m = self._enable_1m_context and caps.supports_1m
+        context_window = (
+            max(caps.base_context_window, 1000000)
+            if has_1m
+            else caps.base_context_window
+        )
+        if model_id == "claude-haiku-5-5" and not self._enable_1m_context:
+            # Runtime metadata describes the native ceiling, not the
+            # operator's opt-in history-retention policy.
+            context_window = 200000
+        return ModelInfo(
+            id=model_id,
+            display_name=display_name,
+            context_window=context_window,
+            max_output_tokens=caps.max_output_tokens,
+            capabilities=list(caps.capability_tags),
+            defaults={
+                "temperature": 0.7,
+                "max_tokens": caps.max_output_tokens,
+            },
+        )
+
+    async def _fetch_models(
+        self, retry_config: RetryConfig | None = None, *,
+        lifecycle: tuple[str, ...] = LIFECYCLES,
+    ) -> list[tuple[ModelInfo, str]]:
+        """Return a fresh, complete API inventory, never a menu or fallback.
+
+        Uses the configured client's endpoint and credentials. All pages must
+        succeed before returning; malformed pages and failed requests raise
+        kernel errors rather than returning a partial or synthetic inventory.
+        Selection settings and ``filtered`` do not restrict the IDs returned.
+        Capability/context metadata retains the normal provider mapping.
+        """
+        if self._client is None and self._api_key is None:
+            raise KernelAuthenticationError(
+                "api_key must be provided for model discovery", provider="anthropic"
             )
 
-        result: list[ModelInfo] = []
-
-        for family, models in families.items():
-            if not models:
-                continue
-
-            # Compare semantic versions before snapshots or lexical spelling:
-            # 5.10 is newer than 5.9, and clean aliases win equal-version ties.
-            models.sort(
-                key=lambda item: (
-                    self._detect_version(item[0], family),
-                    -len(item[0]),
-                    item[0],
-                ),
-                reverse=True,
+        models: list[tuple[ModelInfo, str]] = []
+        cursors: set[str] = set()
+        after_id: str | None = None
+        while True:
+            response = await self._list_models_page(
+                retry_config, after_id=after_id, lifecycle=lifecycle
             )
-
-            # Free side-channel population of the fallback ladder's live
-            # "newest model per family" cache (B-03/_resolve_fallback_model
-            # source 2). Correct regardless of self.filtered -- models[0] is
-            # the latest either way; only models_to_include below branches
-            # on filtered.
-            self._family_latest[family] = models[0][0]
-
-            # When filtered, only include the latest; otherwise include all
-            models_to_include = [models[0]] if self.filtered else models
-
-            for model_id, display_name, _ in models_to_include:
-                raw_model = next(model for model in api_models if model.id == model_id)
-                caps = self._apply_runtime_capability_overrides(
-                    self._get_capabilities(model_id),
-                    self._extract_runtime_model_info(raw_model),
+            try:
+                # Anthropic 1.x exposes async json(). Validate raw JSON before
+                # parse(): SDK coercion can turn "false"/0 into False, silently
+                # accepting a malformed page or truncating the inventory.
+                payload = await response.json()
+            except Exception:
+                raise KernelLLMError(
+                    "Malformed model discovery response: expected JSON",
+                    provider="anthropic",
+                    retryable=False,
+                ) from None
+            if not isinstance(payload, dict):
+                raise KernelLLMError(
+                    "Malformed model discovery page: expected an object",
+                    provider="anthropic",
+                    retryable=False,
                 )
-
-                has_1m = self._enable_1m_context and caps.supports_1m
-                context_window = (
-                    max(caps.base_context_window, 1000000)
-                    if has_1m
-                    else caps.base_context_window
+            data = payload.get("data")
+            has_more = payload.get("has_more")
+            if not isinstance(data, list) or not isinstance(has_more, bool):
+                raise KernelLLMError(
+                    "Malformed model discovery page: expected data and has_more",
+                    provider="anthropic",
+                    retryable=False,
                 )
-                if model_id == "claude-haiku-5-5" and not self._enable_1m_context:
-                    # Runtime metadata describes the native ceiling, not the
-                    # operator's opt-in history-retention policy.
-                    context_window = 200000
-
-                result.append(
-                    ModelInfo(
-                        id=model_id,
-                        display_name=display_name,
-                        context_window=context_window,
-                        max_output_tokens=caps.max_output_tokens,
-                        capabilities=list(caps.capability_tags),
-                        defaults={
-                            "temperature": 0.7,
-                            "max_tokens": caps.max_output_tokens,
-                        },
+            for raw_model in data:
+                model_id = raw_model.get("id") if isinstance(raw_model, dict) else None
+                if not isinstance(model_id, str) or not model_id.strip():
+                    raise KernelLLMError(
+                        "Malformed model discovery entry: expected a nonempty ID",
+                        provider="anthropic",
+                        retryable=False,
                     )
+                if not isinstance(raw_model.get("display_name", model_id), str):
+                    raise KernelLLMError(
+                        "Malformed model discovery entry: expected a display name",
+                        provider="anthropic",
+                        retryable=False,
+                    )
+                if raw_model.get("lifecycle") not in LIFECYCLES:
+                    raise KernelLLMError(
+                        "Malformed model discovery entry: expected lifecycle",
+                        provider="anthropic", retryable=False,
+                    )
+            for field in ("first_id", "last_id"):
+                value = payload.get(field)
+                if value is not None and (
+                    not isinstance(value, str) or not value.strip()
+                ):
+                    raise KernelLLMError(
+                        "Malformed model discovery pagination: invalid cursor",
+                        provider="anthropic",
+                        retryable=False,
+                    )
+            cursor = payload.get("last_id")
+            if data and cursor is not None and cursor != data[-1]["id"]:
+                raise KernelLLMError(
+                    "Malformed model discovery pagination: last_id is not the last data ID",
+                    provider="anthropic",
+                    retryable=False,
                 )
-
-        # Sort alphabetically by display name
-        result.sort(key=lambda m: m.display_name.lower())
-
-        return result
+            if has_more and (
+                not data or cursor is None or cursor in cursors
+            ):
+                raise KernelLLMError(
+                    "Malformed model discovery pagination: missing or repeated cursor",
+                    provider="anthropic",
+                    retryable=False,
+                )
+            try:
+                # Construct SDK models only after raw inventory fields passed.
+                # The SDK still supplies nested capability objects for the
+                # existing ModelInfo mapper; it does not decide pagination.
+                page = await response.parse()
+                for raw_model, sdk_model in zip(data, page.data, strict=True):
+                    if sdk_model.id != raw_model["id"]:
+                        raise ValueError("SDK changed a validated model ID")
+                    models.append(
+                        (self._model_info(
+                            sdk_model,
+                            raw_model.get("display_name", raw_model["id"]),
+                        ), raw_model["lifecycle"])
+                    )
+            except KernelLLMError:
+                raise
+            except Exception:
+                raise KernelLLMError(
+                    "Malformed model discovery metadata",
+                    provider="anthropic",
+                    retryable=False,
+                ) from None
+            if not has_more:
+                break
+            cursors.add(cursor)
+            after_id = cursor
+        return models
 
     @staticmethod
     def _detect_family(model_id: str) -> str:

@@ -16,7 +16,7 @@ from amplifier_core import ModuleCoordinator
 
 from amplifier_module_provider_anthropic import AnthropicProvider
 
-from tests._helpers import FakeCoordinator
+from tests._helpers import FakeCoordinator, models_page
 
 
 def _make_provider(filtered: bool = True) -> AnthropicProvider:
@@ -44,8 +44,8 @@ def _model(model_id: str, display_name: str, created_at: str) -> SimpleNamespace
 def _stub_models_list(
     provider: AnthropicProvider, models: list[SimpleNamespace]
 ) -> None:
-    provider.client.models.list = AsyncMock(  # type: ignore[method-assign]
-        return_value=SimpleNamespace(data=models)
+    provider.client.models.with_raw_response.list = AsyncMock(
+        return_value=models_page(models)
     )
 
 

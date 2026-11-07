@@ -76,6 +76,61 @@ Provides access to Anthropic's Claude models (Claude 4 series: Sonnet, Opus, Hai
 
 ## Supported Models
 
+### Canonical model listing
+
+`await provider.list_models()` returns `list[ModelInfo]` from the bound
+endpoint/account's Models API. The default recommendations select the latest active
+numeric version in each Opus, Sonnet, Haiku and Fable family, plus a distinct
+**newer** preview. Matching aliases win over snapshots; snapshot-only ties use
+the newest date. Both `YYYYMMDD` and `YYYY-MM-DD` suffixes are recognized.
+Unknown families/spellings are conservatively omitted from recommendations.
+
+```python
+await provider.list_models()  # Frozen provider defaults
+await provider.list_models(filters={})  # All actual IDs, including old/unknown IDs
+await provider.list_models(filters={"include": ["CLAUDE-HAIKU-*"]})
+await provider.list_models(filters={"include": []})  # No recommendations
+```
+
+An explicit mapping **replaces**, not merges with, configured defaults.
+Common keys are `include`, `exclude`, and `hide_dated`; this provider also has
+`latest_per_family` and `lifecycle`. Patterns use case-insensitive, OS-independent globs;
+exclusion wins, original IDs remain exact. `hide_dated` suppresses a snapshot
+only if its matching alias survived the include/exclude selection.
+`config.model_filters` takes precedence over legacy `filtered`;
+otherwise `filtered: false` means unfiltered and `filtered: true` uses the
+recommendation defaults. Config and call filters are copied immutably.
+`get_model_list_info()` exposes fresh v1 metadata, including `filters_schema`,
+`default_filters`, `unfiltered: {}`, and `override: "replace"`.
+
+The SDK floor and lock are `anthropic==1.12.0` (dependency range remains `<2`).
+Its native `lifecycle` filter accepts `active`, `deprecated`, and `retired`;
+its `limit` range is 1–1000. Defaults request `lifecycle=["active"]`, `limit=1000`,
+and follow every validated `after_id` cursor. `{}` explicitly requests **all three**
+stages: omitting the native argument would hide retired records. Custom mappings
+also default to all stages unless they specify `lifecycle`.
+Raw lifecycle values are validated and checked locally before recommendations,
+even if a proxy ignores the native filter. These are catalog lifecycle claims,
+not proof of account inference entitlement. The original bound client and SDK
+header behavior are preserved, including configured workspace headers.
+
+Each call fetches afresh. Genuine empty is `[]`; malformed raw JSON, inconsistent
+or repeated cursors, and failures raise typed, sanitized kernel errors, never a
+partial result or cached/static fallback. Raw validation precedes SDK coercion.
+The candidate-only `discover_models()` API is superseded by `list_models`.
+The existing fallback-family cache updates only after complete success, using
+active stable known-family entries independently of include/exclude filters; listing
+never reads that cache. Selection-only inference settings and explicitly chosen
+older models remain usable and unchanged.
+
+Known-model capability mapping and `enable_1m_context` policy remain intact.
+`source: "provider-api"` describes inventory provenance, not the source of every
+metadata value. For opaque IDs with no known capability mapping, supplied API
+limits are retained; absent limits use `0` to denote **unknown**, not a usable
+budget, with empty capabilities/defaults. No Sonnet capabilities are inferred.
+
+### Model support
+
 - `claude-sonnet-5-5` - Claude Sonnet 5.5 (default; explicit model pins remain unchanged)
 - `claude-sonnet-5` - Claude Sonnet 5 (previous default; still supported)
 - `claude-opus-5` - Claude Opus 5 (most capable)
