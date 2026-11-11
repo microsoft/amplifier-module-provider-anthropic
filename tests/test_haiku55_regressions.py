@@ -135,7 +135,10 @@ def test_numeric_discovery_and_saved_pins(filtered):
 
 def test_default_adaptive_medium_and_no_sampling():
     params = assemble(req=request(temperature=0.1))
-    assert params["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert params["thinking"] == {
+        "type": "adaptive", "display": "summarized",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+    }
     assert "output_config" not in params  # omission retains vendor medium, not high
     assert params["max_tokens"] == 128_000
     assert not ({"temperature", "top_p", "top_k"} & params.keys())

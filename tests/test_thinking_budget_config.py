@@ -280,14 +280,17 @@ class TestConfigBudgetReachesTheWire:
     def test_always_on_model_warns_without_claiming_the_value_was_used(
         self, caplog: pytest.LogCaptureFixture
     ):
-        """Fable 5.1 always thinks and rejects a thinking param entirely, so
-        the budget is not sent AND does not size anything. The warning must not
+        """Fable 5.1 always thinks; no manual thinking budget is sent and
+        the budget does not size anything. The warning must not
         borrow the adaptive branch's 'used to size max_tokens' claim."""
         provider = _make_provider("claude-fable-5-1", thinking_budget_tokens=8000)
         with caplog.at_level(logging.WARNING):
             params = _run(provider, reasoning_effort="high")
 
-        assert "thinking" not in params
+        assert not {"type", "budget_tokens"}.intersection(params.get("thinking", {}))
+        assert params["thinking"]["block_binding"] == {
+            "prefix_mismatch_behavior": "drop_block"
+        }
         warnings = _budget_warnings(caplog)
         assert warnings
         assert "always thinks" in warnings[0]

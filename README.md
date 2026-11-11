@@ -314,6 +314,56 @@ config = {
 
 See the [Configuration Reference](#configuration-reference) table below for every surviving key.
 
+### Signed-thinking continuation
+
+Anthropic binds preserved thinking to its preceding `system`, `tools` and
+`messages`. Compaction, a replaced observation, changed tools or resumed history
+can legally change that prefix. The provider never replays old observations,
+rewrites canonical history, re-executes tools, or guesses validity from a local
+cache. It preserves native thinking/redacted blocks and tool results in order;
+Anthropic validates prefix, model and account compatibility.
+
+`thinking_prefix_mismatch_behavior` defaults to `auto`. On the exact first-party
+HTTPS endpoint and documented preserved-thinking models (Fable/Mythos 5.1–5.2,
+Opus/Sonnet/Haiku 5.5), it sends
+`thinking.block_binding.prefix_mismatch_behavior: drop_block` with
+`thinking-binding-controls-2026-08-01`. This lets the server remove only failing
+thinking and its dependent chain; unchanged-prefix reasoning survives. Fable
+5.2 accepts this control without specifying a thinking mode. Sonnet/Haiku 5.5
+require adaptive mode; the provider does not change disabled/between-tools modes
+to enable the control. Unsupported modes/endpoints retain their native behavior,
+including nonretryable errors rather than speculative stripping or retries.
+
+Set this config key (or per-call option) to `error` for strict diagnostics,
+`drop_block` to explicitly opt a compatible custom endpoint into the native
+contract, or YAML `null` to leave vendor defaults unchanged. An explicit native
+`block_binding` in `extra_request_params.thinking` or
+`extra_request_params.extra_body.thinking` wins, including `error`, `{}` or `null`.
+Explicit null thinking and an explicitly emptied beta header are not repopulated.
+No API compatibility is claimed for custom endpoints.
+
+Responses retain the vendor's `input_transformations` in
+`metadata.anthropic_input_transformations`, including empty arrays. Streaming
+captures `message_start` and any replacement report on a final `message_delta`.
+Paths/reasons distinguish prefix drops, model/account incompatibility and allowed
+mismatches. Count preflight uses the same effective thinking, content and headers
+as dispatch; it never registers generation provenance or triggers tool effects.
+Tampered/undecryptable signatures remain nonretryable errors.
+
+**Selective dropping is compatibility recovery, not a cure for avoidable prefix
+churn.** Repeated drops can increase output tokens, latency and change quality.
+Keep stable context unchanged, append new instructions when safe, and monitor
+the transformation report. See Anthropic's
+[preserved-thinking contract](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking).
+
+New native blocks carry internal
+`thinking_provenance: {version: 1, provider: anthropic}` extras. Explicitly foreign
+provider signatures are never submitted as native Anthropic signatures: readable
+summaries become text and foreign opaque redacted data is omitted. Legacy
+untagged signed blocks are replay candidates, not authenticated origin evidence;
+the server still validates them. Provenance is stripped from the native wire and
+does not lock otherwise compatible Anthropic model switches.
+
 ### Reasoning Effort
 
 The `reasoning_effort` config key (canonical — it matches the kernel's portable
@@ -739,6 +789,7 @@ House-style key reference. ✅ = wizard-visible ConfigField, ⚙️ = settings-o
 | `thinking_budget_tokens` | *(model default)* | ⚙️ | Explicit `thinking.budget_tokens`. Outranks the effort-implied budget; warns if it can't reach the wire |
 | `thinking_budget_buffer` | `8192` | ⚙️ | Headroom added to the budget when sizing `max_tokens` |
 | `thinking_type` | `adaptive` | ⚙️ | `adaptive`\|`enabled`. `adaptive` lets the model manage its own budget (and forbids `budget_tokens`); falls back to `enabled` on models without adaptive support |
+| `thinking_prefix_mismatch_behavior` | `auto` | config / per-call | `auto`, `drop_block`, `error`, or `null`. Selective server recovery for legal prefix edits; see [signed-thinking continuation](#signed-thinking-continuation). Does not change explicit thinking modes or native controls |
 | `enable_1m_context` | `false` | ✅ | Advertise the 1M context window (more history kept = higher cost) |
 | `cache_stable_region_ttl_1h` | *(unset)* | ✅ | 1h cache TTL for system prompt + tools. 2x write cost, fewer writes |
 | `enable_prompt_caching` | `true` | ⚙️ | Place cache breakpoints |
