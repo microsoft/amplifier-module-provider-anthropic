@@ -90,6 +90,14 @@ from ._computer_toolset import (
     translate_tools,
     validate_member,
 )
+from ._thinking import (
+    NATIVE_PROVENANCE,
+    PROVENANCE_KEY,
+    configure_binding,
+    input_transformations,
+    is_foreign,
+    supports_binding,
+)
 
 # Params the Messages API still accepts on the wire but the SDK does not expose
 # as typed keyword arguments.
@@ -903,6 +911,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "thinking_budget_buffer",
         "thinking_type",
         "thinking_display",
+        "thinking_prefix_mismatch_behavior",
         "task_budget_tokens",
         "speed",
         # --- deferred: read in _build_web_search_tool ---
@@ -3307,10 +3316,9 @@ class AnthropicProvider:
         """If response is a refusal, retry once against the refusal-fallback model.
 
         Single-shot: whatever the fallback model returns (refusal or not) is
-        returned as-is -- no recursive retry. Thinking/redacted_thinking blocks
-        are stripped from the request before the fallback call, since they were
-        produced by the model that just refused and may not be valid input to
-        a different model.
+        returned as-is -- no recursive retry. Documented first-party models
+        validate thinking compatibility themselves, so preserve signed history
+        on those model switches. Retain the legacy projection for other targets.
         """
         if getattr(response, "finish_reason", None) != "refusal":
             return response
@@ -3327,7 +3335,11 @@ class AnthropicProvider:
 
         fallback_kwargs = dict(complete_kwargs)
         fallback_kwargs["model"] = fallback_model
-        fallback_request = self._strip_thinking_blocks(request)
+        fallback_request = (
+            request.model_copy(deep=True)
+            if supports_binding(fallback_model, self._effective_base_url)
+            else self._strip_thinking_blocks(request)
+        )
         return await self._complete_chat_request(fallback_request, **fallback_kwargs)
 
     async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
@@ -3452,7 +3464,11 @@ class AnthropicProvider:
                     **current_kwargs,
                 )
             except KernelLLMError as e:
-                if use_short_retry_budget and not self._is_overload_fallback_error(e):
+                if (
+                    e.retryable
+                    and use_short_retry_budget
+                    and not self._is_overload_fallback_error(e)
+                ):
                     # Preserve the old retry behavior for non-overload failures:
                     # after the short downgrade budget is exhausted, retry the same
                     # model once more with the full configured retry policy.
@@ -4569,6 +4585,21 @@ class AnthropicProvider:
                     request.max_output_tokens, model_ceiling, 128000
                 )
             thinking_enabled = params.get("thinking", {}).get("type") == "adaptive"
+        try:
+            configure_binding(
+                params,
+                base_url=self._effective_base_url,
+                default_headers=lambda: self.client.default_headers,
+                policy=options.get(
+                    "thinking_prefix_mismatch_behavior",
+                    self.config.get("thinking_prefix_mismatch_behavior", "auto"),
+                ),
+            )
+        except ValueError as exc:
+            raise KernelInvalidRequestError(
+                str(exc), provider="anthropic", model=effective_model,
+                status_code=400, retryable=False,
+            ) from exc
         return _RequestAssembly(
             params=params,
             prefix_state=staged_prefix_state,
@@ -4653,7 +4684,15 @@ class AnthropicProvider:
             # Both supported SDK versions accept output_config on count_tokens.
             # Keep Haiku's effective effort/format envelope aligned with dispatch.
             keys = keys | {"output_config"}
-        return {key: params[key] for key in keys if key in params}
+        projected = {key: params[key] for key in keys if key in params}
+        # Expert wire overrides can shadow typed SDK fields. Count the same
+        # effective content/binding contract, not the pre-override envelope.
+        extra = params.get("extra_body")
+        if isinstance(extra, dict):
+            projected.update({
+                key: extra[key] for key in keys - {"extra_headers"} if key in extra
+            })
+        return projected
 
     def _warn_count_unavailable(self, model: str, category: str) -> None:
         """Log each safe count-unavailable category once per resolved model."""
@@ -4694,13 +4733,26 @@ class AnthropicProvider:
             if self._is_haiku55_request(options)
             else options.get("model", self.default_model)
         )
+        extra_body = self.extra_request_params.get("extra_body")
+        wire_model = self.extra_request_params.get("model", budget_model)
+        if isinstance(extra_body, dict):
+            wire_model = extra_body.get("model", wire_model)
         caps = self._budget_capabilities_for(budget_model)
         if caps is None:
+            return None
+        if self._client is None and self._api_key is None:
+            # Counting is optional and cannot construct a credential-free SDK
+            # client. In particular, endpoint-gated binding policy must not turn
+            # an unavailable preflight into an invalid-request error.
             return None
         assembly = self._assemble_request_params(
             request, request_options=options, request_caps=caps
         )
         if assembly is None:
+            return None
+        if wire_model != budget_model:
+            # Validate the envelope first (native tool preflight must still
+            # reject sensitive overrides), then decline a stale-window count.
             return None
         params = assembly.params
         model = params.get("model")
@@ -4995,6 +5047,7 @@ class AnthropicProvider:
                     # The very first SDK event makes an overflow nonrecoverable,
                     # even if it carries no displayable text or hook payload.
                     sdk_stream_started = False
+                    stream_transformations = None
                     hooks_available = self.coordinator and hasattr(
                         self.coordinator, "hooks"
                     )
@@ -5007,6 +5060,17 @@ class AnthropicProvider:
                                     sdk_stream_started = True
                                     etype = type(event).__name__
                                     idx = getattr(event, "index", None)
+                                    if getattr(event, "type", None) == "message_start":
+                                        stream_transformations = input_transformations(
+                                            getattr(getattr(event, "message", None),
+                                                    "input_transformations", None)
+                                        )
+                                    elif getattr(event, "type", None) == "message_delta":
+                                        final_transformations = input_transformations(
+                                            getattr(event, "input_transformations", None)
+                                        )
+                                        if final_transformations is not None:
+                                            stream_transformations = final_transformations
                                     if etype == "RawContentBlockStartEvent":
                                         if idx is None:
                                             continue
@@ -5114,6 +5178,10 @@ class AnthropicProvider:
 
                                 # Stream drained. Final message is now ready.
                                 response = await stream.get_final_message()
+                                if stream_transformations is not None:
+                                    # The stable SDK accumulator may omit beta
+                                    # fields, especially a fallback's final delta.
+                                    response.input_transformations = stream_transformations
 
                                 # Capture rate limit headers from stream response
                                 if hasattr(stream, "response") and stream.response:
@@ -5697,7 +5765,7 @@ class AnthropicProvider:
         if block_type == "thinking":
             signature = block.get("signature")
             thinking = block.get("thinking", "")
-            if not isinstance(signature, str):
+            if not isinstance(signature, str) or is_foreign(block):
                 # Other providers persist unsigned reasoning summaries in the
                 # shared ThinkingBlock shape. They are not Anthropic thinking
                 # blocks: replay their readable text, never a null/fake signature.
@@ -5712,6 +5780,8 @@ class AnthropicProvider:
                 "input": block.get("input", block.get("arguments", {})),
             }
         if block_type == "redacted_thinking":
+            if is_foreign(block):
+                return None  # Opaque foreign bytes are never readable text.
             return {"type": "redacted_thinking", "data": block.get("data", "")}
         if block_type == "tool_result":
             return {
@@ -7431,12 +7501,15 @@ class AnthropicProvider:
                         thinking=block.thinking,
                         signature=getattr(block, "signature", None),
                         visibility="internal",
+                        **{PROVENANCE_KEY: dict(NATIVE_PROVENANCE)},
                     )
                 )
                 event_blocks.append(ThinkingContent(text=block.thinking))
                 # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
             elif block.type == "redacted_thinking":
-                content_blocks.append(RedactedThinkingBlock(data=block.data))
+                content_blocks.append(RedactedThinkingBlock(
+                    data=block.data, **{PROVENANCE_KEY: dict(NATIVE_PROVENANCE)}
+                ))
             elif block.type == "tool_use":
                 is_native_computer = (
                     native_computer_adapter is not None
@@ -7597,6 +7670,19 @@ class AnthropicProvider:
         self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
+        metadata: dict[str, Any] = {}
+        if response.model == "claude-haiku-5-5" and cost is None:
+            metadata["anthropic_cost_unavailable"] = "haiku55_prompt_tier_unverified"
+        transformations = input_transformations(
+            getattr(response, "input_transformations", None)
+        )
+        if transformations is not None:
+            metadata["anthropic_input_transformations"] = transformations
+            if transformations:
+                logger.info(
+                    "[PROVIDER] Anthropic applied %d thinking input transformation(s); "
+                    "see response metadata for paths and reasons.", len(transformations)
+                )
 
         return AnthropicChatResponse(
             content=content_blocks,
@@ -7606,11 +7692,7 @@ class AnthropicProvider:
             content_blocks=event_blocks if event_blocks else None,
             text=combined_text or None,
             web_search_results=web_search_results if web_search_results else None,
-            metadata=(
-                {"anthropic_cost_unavailable": "haiku55_prompt_tier_unverified"}
-                if response.model == "claude-haiku-5-5" and cost is None
-                else None
-            ),
+            metadata=metadata or None,
         )
 
     async def close(self) -> None:

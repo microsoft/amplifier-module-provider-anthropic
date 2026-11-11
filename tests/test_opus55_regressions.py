@@ -153,7 +153,7 @@ def test_opus55_adapts_legacy_native_computer_declaration() -> None:
             "allowed_callers": ["computer"],
         }
     ]
-    assert "anthropic-beta" not in params.get("extra_headers", {})
+    assert params["extra_headers"]["anthropic-beta"] == "thinking-binding-controls-2026-08-01"
 
 
 def test_opus55_native_computer_sets_single_action_auto_without_mutating_caller() -> None:
@@ -233,7 +233,7 @@ def test_opus55_preserves_explicit_legacy_beta_header_after_translation() -> Non
     )
     assert assembly is not None
     assert assembly.params["extra_headers"]["anthropic-beta"] == (
-        "computer-use-2025-11-24,custom-beta"
+        "computer-use-2025-11-24,custom-beta,thinking-binding-controls-2026-08-01"
     )
 
 
@@ -754,6 +754,7 @@ def test_opus55_requires_adaptive_thinking_without_expanding_output_cap(
     assert assembly.params["thinking"] == {
         "type": "adaptive",
         "display": "summarized",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
     }
     assert assembly.params["output_config"] == {"effort": "high"}
     assert assembly.params["max_tokens"] == 123
@@ -773,7 +774,10 @@ def test_opus55_adaptive_thinking_defaults_display_without_manual_budget() -> No
     assert caps.thinking_display_required is True
     assert caps.supports_manual_thinking is False
     assert caps.max_output_tokens == 128_000
-    assert params["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert params["thinking"] == {
+        "type": "adaptive", "display": "summarized",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+    }
     assert "budget_tokens" not in params["thinking"]
     assert params["max_tokens"] == 123
 
@@ -788,7 +792,10 @@ def test_opus55_adaptive_thinking_uses_configured_display() -> None:
     )
 
     assert assembly is not None
-    assert assembly.params["thinking"] == {"type": "adaptive", "display": "omitted"}
+    assert assembly.params["thinking"] == {
+        "type": "adaptive", "display": "omitted",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+    }
 
 
 def test_opus55_adaptive_thinking_kwargs_display_overrides_config() -> None:
@@ -804,6 +811,7 @@ def test_opus55_adaptive_thinking_kwargs_display_overrides_config() -> None:
     assert assembly.params["thinking"] == {
         "type": "adaptive",
         "display": "summarized",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
     }
 
 
@@ -813,7 +821,10 @@ def test_opus55_keeps_explicit_kwargs_effort_when_thinking_opted_out() -> None:
         extended_thinking=False,
         effort="high",
     )
-    assert params["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert params["thinking"] == {
+        "type": "adaptive", "display": "summarized",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+    }
     assert params["output_config"] == {"effort": "high"}
     assert params["max_tokens"] == 123
 
@@ -831,6 +842,7 @@ def test_opus55_keeps_configured_effort_when_thinking_opted_out() -> None:
     assert assembly.params["thinking"] == {
         "type": "adaptive",
         "display": "summarized",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
     }
     assert assembly.params["output_config"] == {"effort": "medium"}
     assert assembly.params["max_tokens"] == 123
@@ -848,7 +860,7 @@ def test_previous_opus_keeps_explicit_kwargs_effort_when_thinking_opted_out() ->
 
 
 @pytest.mark.parametrize("model", [FABLE_MODEL, MYTHOS_MODEL])
-def test_always_on_models_keep_their_omit_thinking_parameter_behavior(
+def test_always_on_models_do_not_gain_manual_thinking_mode_or_budget(
     model: str,
 ) -> None:
     params = _assemble(
@@ -856,7 +868,11 @@ def test_always_on_models_keep_their_omit_thinking_parameter_behavior(
         model=model,
     )
 
-    assert "thinking" not in params
+    assert not {"type", "budget_tokens"}.intersection(params.get("thinking", {}))
+    if model == FABLE_MODEL:
+        assert params["thinking"]["block_binding"] == {
+            "prefix_mismatch_behavior": "drop_block"
+        }
 
 
 def test_opus55_real_sdk_mock_transport_receives_serialized_safe_request() -> None:
@@ -907,7 +923,10 @@ def test_opus55_real_sdk_mock_transport_receives_serialized_safe_request() -> No
 
     asyncio.run(run())
     assert len(captured) == 1
-    assert captured[0]["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert captured[0]["thinking"] == {
+        "type": "adaptive", "display": "summarized",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+    }
     assert captured[0]["tool_choice"] == {"type": "auto"}
     assert captured[0]["max_tokens"] == 123
 
