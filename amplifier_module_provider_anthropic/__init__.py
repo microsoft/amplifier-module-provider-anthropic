@@ -2058,6 +2058,7 @@ class AnthropicProvider:
                 thinking_display_required=True,
                 supported_efforts=("low", "medium", "high", "xhigh", "max"),
                 supports_speed=False,
+                supports_forced_tool_choice=model_id != "claude-fable-5-2",
                 supports_inline_system=True,
                 default_thinking_budget=0,  # not used — adaptive only
                 # NOT verified: claude-fable-5 rejects every request in this
@@ -3747,6 +3748,8 @@ class AnthropicProvider:
         version = self._detect_version(model_id, family)
         runtime_info = self._runtime_model_info_cache.get(model_id)
         static = version in _STATIC_BUDGET_MODEL_VERSIONS.get(family, frozenset())
+        # Only the documented fixed Fable 5.2 ID; no guessed suffixes/aliases.
+        static = static or model_id == "claude-fable-5-2"
         if family == "haiku" and version == (5, 5) and model_id != "claude-haiku-5-5":
             static = False
         if not static and (
@@ -4186,10 +4189,13 @@ class AnthropicProvider:
                 )
             if (
                 not request_caps.supports_forced_tool_choice
+                # Fable 5.2 is checked after expert overrides below so the
+                # rejection reflects the actual model and tool choice on wire.
+                and effective_model != "claude-fable-5-2"
                 and normalized_tool_choice.get("type") in {"any", "tool"}
             ):
                 raise KernelInvalidRequestError(
-                    "claude-opus-5-5 supports only tool_choice 'auto' or "
+                    f"{effective_model} supports only tool_choice 'auto' or "
                     "'none'; required/any and named tool choice are unavailable.",
                     provider="anthropic",
                     model=effective_model,
@@ -4568,6 +4574,24 @@ class AnthropicProvider:
                 "anthropic-beta": ",".join(headers),
             }
         self._merge_extra_request_params(params, emit_warnings=emit_diagnostics)
+        # extra_body shadows typed SDK fields, including model and tool_choice.
+        # Keep this restriction exact-model/local rather than changing the
+        # expert-override policy for any previously supported model.
+        wire_extra = params.get("extra_body") or {}
+        wire_model = wire_extra.get("model", params.get("model"))
+        wire_choice = wire_extra.get("tool_choice", params.get("tool_choice"))
+        if (
+            wire_model == "claude-fable-5-2"
+            and isinstance(wire_choice, dict)
+            and wire_choice.get("type") in {"any", "tool"}
+        ):
+            raise KernelInvalidRequestError(
+                f"{wire_model} supports only tool_choice 'auto' or "
+                "'none'; required/any and named tool choice are unavailable.",
+                provider="anthropic",
+                model=wire_model,
+                status_code=400,
+            )
         if request.max_output_tokens is not None:
             params["max_tokens"] = min(request.max_output_tokens, model_ceiling)
         elif params.get("max_tokens") and params["max_tokens"] > model_ceiling:
