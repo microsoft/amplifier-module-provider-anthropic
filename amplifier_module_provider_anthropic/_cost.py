@@ -193,6 +193,15 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("0.25"),
         "cache_write_per_m": Decimal("12.50"),
     },
+    # Fable 5.2 standard first-party USD/MTok, verified 2026-11-12:
+    # https://platform.claude.com/docs/en/models/fable-5-2/overview
+    # One-hour writes are derived below as 2x input ($16/MTok).
+    "claude-fable-5-2": {
+        "input_per_m": Decimal("8.00"),
+        "output_per_m": Decimal("40.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("10.00"),
+    },
     # ------------------------------------------------------------------
     # Claude Haiku 3.5  ($0.80 / $4.00 / $0.08 / $1.00)
     # ------------------------------------------------------------------
