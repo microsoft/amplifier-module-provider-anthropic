@@ -74,6 +74,7 @@ def _make_response(
     response.usage.cache_read_input_tokens = cache_read_input_tokens
     response.usage.cache_creation_input_tokens = cache_creation_input_tokens
     response.usage.speed = speed
+    response.usage.inference_geo = "global"
     return response
 
 
@@ -435,32 +436,30 @@ def test_fable51_input_output_same_as_fable5():
 
 
 # ---------------------------------------------------------------------------
-# (r) Sonnet 5 pricing: standard rates $3 / $15 / $0.30 / $3.75 per MTok
-#     (intro discount $2/$10 through 2026-08-31 is intentionally NOT encoded;
-#     _RATES carries durable standard rates, matching the rest of the table.)
+# (r) Sonnet 5 pricing: permanent standard rates $2 / $10 / $0.20 / $2.50.
 # ---------------------------------------------------------------------------
 def test_sonnet_5_input_tokens_cost():
-    """claude-sonnet-5: 1M input -> $3.00"""
+    """claude-sonnet-5: 1M input -> $2.00"""
     result = compute_cost("claude-sonnet-5", input_tokens=1_000_000)
-    assert result == Decimal("3.00"), f"Expected Decimal('3.00'), got {result!r}"
+    assert result == Decimal("2.00")
 
 
 def test_sonnet_5_output_tokens_cost():
-    """claude-sonnet-5: 1M output -> $15.00"""
+    """claude-sonnet-5: 1M output -> $10.00"""
     result = compute_cost("claude-sonnet-5", output_tokens=1_000_000)
-    assert result == Decimal("15.00"), f"Expected Decimal('15.00'), got {result!r}"
+    assert result == Decimal("10.00")
 
 
 def test_sonnet_5_cache_read_cost():
-    """claude-sonnet-5: 1M cache-read -> $0.30 (10% of input)."""
+    """claude-sonnet-5: 1M cache-read -> $0.20."""
     result = compute_cost("claude-sonnet-5", cache_read_input_tokens=1_000_000)
-    assert result == Decimal("0.30"), f"Expected Decimal('0.30'), got {result!r}"
+    assert result == Decimal("0.20")
 
 
 def test_sonnet_5_cache_write_cost():
-    """claude-sonnet-5: 1M cache-write -> $3.75 (125% of input)."""
+    """claude-sonnet-5: 1M cache-write -> $2.50."""
     result = compute_cost("claude-sonnet-5", cache_creation_input_tokens=1_000_000)
-    assert result == Decimal("3.75"), f"Expected Decimal('3.75'), got {result!r}"
+    assert result == Decimal("2.50")
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +623,7 @@ def _make_response_with_ttl_split(
     response.usage.cache_read_input_tokens = 0
     response.usage.cache_creation_input_tokens = cache_creation_input_tokens
     response.usage.speed = None
+    response.usage.inference_geo = "global"
     if ephemeral_5m_input_tokens is None and ephemeral_1h_input_tokens is None:
         response.usage.cache_creation = None
     else:

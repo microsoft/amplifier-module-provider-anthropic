@@ -1,7 +1,7 @@
 """Anthropic pricing rates and cost computation.
 
-Verification date: 2026-06-10
-Source: https://www.anthropic.com/pricing
+Current-model rates verified 2026-11-14:
+https://platform.claude.com/docs/en/about-claude/pricing
 
 Usage
 -----
@@ -15,18 +15,17 @@ Usage
     )
     # Returns Decimal or None if pricing is unavailable.
 
-Haiku 5.5 rates verified 2026-10-07:
-https://platform.claude.com/docs/en/about-claude/pricing
-Prompt <=100,000: input .10, output .50, write 5m .125 / 1h .20, read .01.
-Prompt >100,000: input .50, output 2.50, write 5m .625 / 1h 1.00, read .05.
-All rates USD/MTok. The cached/server-added threshold predicate and full-vs-
-excess charging are unverified. No exact scalar cost is computed, even for
-apparently small prompts; None is unavailable, never a claim of zero cost.
+Haiku 5.5 uses the entire request's fresh + cache-read + cache-write input
+to select its prompt tier. Above 100,000 tokens, every category (including
+output) uses the higher rate. Earlier requests are never repriced.
+None means unavailable, never zero. Rates describe standard first-party
+token charges, not negotiated discounts or separately billed server tools.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from decimal import Decimal
 
 logger = logging.getLogger(__name__)
@@ -70,18 +69,13 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("0.30"),
         "cache_write_per_m": Decimal("3.75"),
     },
-    # Claude Sonnet 5 (launched 2026-06-30; anthropic.com/news/claude-sonnet-5).
-    # Standard rates $3 / $15 (same as the Sonnet 4.x tier). NOTE: an
-    # introductory discount of $2 input / $10 output applies through
-    # 2026-08-31 only; we deliberately encode the durable STANDARD rates here
-    # (no time-windowed pricing logic anywhere in this table). The updated
-    # Sonnet 5 tokenizer maps the same text to ~1.0-1.35x more tokens, which
-    # raises effective per-request cost even at identical rates.
+    # The introductory $2/$10 price is now permanent. The previously
+    # scheduled September increase was cancelled (pricing page footnote 3).
     "claude-sonnet-5": {
-        "input_per_m": Decimal("3.00"),
-        "output_per_m": Decimal("15.00"),
-        "cache_read_per_m": Decimal("0.30"),
-        "cache_write_per_m": Decimal("3.75"),
+        "input_per_m": Decimal("2.00"),
+        "output_per_m": Decimal("10.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("2.50"),
     },
     # Claude Sonnet 5.5: cache reads reduced from $0.20 to $0.10/MTok.
     # First-party pricing verified 2026-10-07; only the documented fixed ID.
@@ -193,6 +187,15 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("0.25"),
         "cache_write_per_m": Decimal("12.50"),
     },
+    # Fable 5.2 standard first-party USD/MTok, verified 2026-11-12:
+    # https://platform.claude.com/docs/en/models/fable-5-2/overview
+    # One-hour writes are derived below as 2x input ($16/MTok).
+    "claude-fable-5-2": {
+        "input_per_m": Decimal("8.00"),
+        "output_per_m": Decimal("40.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("10.00"),
+    },
     # ------------------------------------------------------------------
     # Claude Haiku 3.5  ($0.80 / $4.00 / $0.08 / $1.00)
     # ------------------------------------------------------------------
@@ -251,7 +254,115 @@ _FAST_ELIGIBLE_MODELS: set[str] = {
     "claude-opus-4-8",
     "claude-opus-5",
     "claude-opus-5-5",
+    "claude-fable-5-2",
 }
+
+_HAIKU_MODEL = "claude-haiku-5-5"
+_GEO_ELIGIBLE_MODELS = {
+    "claude-sonnet-4-6", "claude-sonnet-5", "claude-sonnet-5-5",
+    "claude-opus-4-6", "claude-opus-4-6-20260101", "claude-opus-4-7",
+    "claude-opus-4-7-20260416", "claude-opus-4-8", "claude-opus-5",
+    "claude-opus-5-5", "claude-fable-5", "claude-fable-5-1",
+    "claude-fable-5-2", _HAIKU_MODEL,
+}
+_HAIKU_THRESHOLD = 100_000
+_HAIKU_RATES = (
+    {
+        "input_per_m": Decimal(".10"),
+        "output_per_m": Decimal(".50"),
+        "cache_read_per_m": Decimal(".01"),
+        "cache_write_per_m": Decimal(".125"),
+    },
+    {
+        "input_per_m": Decimal(".50"),
+        "output_per_m": Decimal("2.50"),
+        "cache_read_per_m": Decimal(".05"),
+        "cache_write_per_m": Decimal(".625"),
+    },
+)
+
+
+def get_rates(model: str, *, prompt_tokens: int | None = None) -> dict[str, Decimal] | None:
+    """Fresh Decimal rate mapping; exact IDs only, no guessed family aliases."""
+    if model == _HAIKU_MODEL:
+        if prompt_tokens is None:
+            return None
+        source = _HAIKU_RATES[int(prompt_tokens > _HAIKU_THRESHOLD)]
+    else:
+        source = _RATES.get(model)
+    if source is None:
+        return None
+    return {**source, "cache_write_1h_per_m": source["input_per_m"] * 2}
+
+
+def resolve_inference_geo(
+    model: str, *, response_geo: object = None, request_geo: object = None,
+) -> str | None:
+    """Resolve billing geography without guessing a workspace's default.
+
+    The response reports where inference actually ran. Only when that is
+    absent/None may the explicit effective wire request be used. An invalid
+    nonnull response is unknown, not an invitation to mask it with the request.
+    Legacy priced models cannot use geo controls and retain standard rates.
+    https://platform.claude.com/docs/en/manage-claude/data-residency
+    """
+    for value in (response_geo, request_geo):
+        if value is not None:
+            return value if isinstance(value, str) and value in {"global", "us"} else None
+    if model in _RATES and model not in _GEO_ELIGIBLE_MODELS:
+        return "global"
+    return None
+
+
+def pricing_metadata(model: str) -> dict | None:
+    """JSON-safe display contract in provider-local ModelInfo.pricing_details.
+
+    These are base standard/global USD/MTok rates, not an actual request cost.
+    Decimal strings preserve precision; flat Core Pricing is derived separately
+    from get_rates only when the model is not tiered.
+    """
+    def display(rates: dict[str, Decimal]) -> dict[str, str]:
+        return {
+            "input": str(rates["input_per_m"]),
+            "output": str(rates["output_per_m"]),
+            "cache_read": str(rates["cache_read_per_m"]),
+            "cache_write_5m": str(rates["cache_write_per_m"]),
+            "cache_write_1h": str(rates["cache_write_1h_per_m"]),
+        }
+
+    rates = get_rates(model)
+    if rates is None and model != _HAIKU_MODEL:
+        return None
+    result = {
+        "version": 1,
+        "kind": "tiered" if model == _HAIKU_MODEL else "fixed",
+        "currency": "USD",
+        "unit": "per_million_tokens",
+        "basis": "standard_global",
+        "modifiers": {},
+    }
+    if model in _GEO_ELIGIBLE_MODELS:
+        result["modifiers"]["us_inference"] = "1.1"
+    if model in _FAST_ELIGIBLE_MODELS:
+        result["modifiers"]["confirmed_fast"] = "2"
+    if model == _HAIKU_MODEL:
+        result.update({
+            "threshold_tokens": _HAIKU_THRESHOLD,
+            "threshold_basis": "input_tokens+cache_read_input_tokens+cache_creation_input_tokens",
+            "tiers": [
+                {"up_to": _HAIKU_THRESHOLD, "rates": display(get_rates(model, prompt_tokens=0))},
+                {"above": _HAIKU_THRESHOLD, "rates": display(get_rates(model, prompt_tokens=100_001))},
+            ],
+        })
+    else:
+        result["rates"] = display(rates)
+    return result
+
+
+@dataclass(frozen=True)
+class CostResult:
+    cost_usd: Decimal | None
+    unavailable_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -259,18 +370,22 @@ _FAST_ELIGIBLE_MODELS: set[str] = {
 # ---------------------------------------------------------------------------
 
 
-def compute_cost(
+def compute_cost_result(
     model: str,
     *,
     input_tokens: int = 0,
     output_tokens: int = 0,
     cache_read_input_tokens: int = 0,
-    cache_creation_input_tokens: int = 0,
+    cache_creation_input_tokens: int | None = 0,
     cache_creation_5m_input_tokens: int | None = None,
     cache_creation_1h_input_tokens: int | None = None,
     speed: str | None = None,
-) -> Decimal | None:
-    """Return the USD cost for an Anthropic API call as a :class:`~decimal.Decimal`.
+    inference_geo: str | None = "global",
+    requested_speed: str | None = None,
+    cache_write_ttl: str | None = None,
+    strict: bool = False,
+) -> CostResult:
+    """Return a Decimal USD token cost or a machine-readable unknown reason.
 
     Parameters
     ----------
@@ -300,8 +415,7 @@ def compute_cost(
     cache_creation_1h_input_tokens:
         Tokens written to the prompt cache with a 1-hour TTL (Anthropic's
         ``usage.cache_creation.ephemeral_1h_input_tokens``), billed at 2x
-        the base input rate (official Anthropic pricing — 1h writes cost
-        double a 5m write). Undercounting this was the root cause of the
+        the base input rate (1.6x the 5m write rate). Undercounting this was the root cause of the
         cost-tracking bug this split-aware path fixes: before, all cache
         writes — including 1h ones — were billed at the 5-minute (1.25x)
         rate because the usage object only exposed the aggregate count.
@@ -311,14 +425,59 @@ def compute_cost(
 
     Returns
     -------
-    Decimal | None
-        The computed cost in USD, or ``None`` if pricing is unavailable
-        (including Haiku 5.5's unverified prompt-tier rules).
-        ``None`` is semantically distinct from ``Decimal('0')`` (a free call).
+    CostResult
+        cost_usd is Decimal (including true zero), or None with a reason.
+        Strict mode needs a complete consistent TTL split, or a known request
+        TTL when nonzero cache writes are reported only as an aggregate.
     """
-    rates = _RATES.get(model)
+    # Public compute_cost retains legacy aggregate-at-5m behavior on fixed
+    # models. Runtime strict mode refuses an unresolved TTL instead of silently
+    # understating a one-hour write. Tiered Haiku always needs truthful usage.
+    def unknown(reason: str) -> CostResult:
+        return CostResult(None, reason)
+
+    counts = (input_tokens, output_tokens, cache_read_input_tokens)
+    optional_counts = (
+        cache_creation_input_tokens, cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens,
+    )
+    if any(type(n) is not int or n < 0 for n in counts) or any(
+        n is not None and (type(n) is not int or n < 0) for n in optional_counts
+    ):
+        return unknown("invalid_usage_counts")
+    has_ttl_split = (
+        cache_creation_5m_input_tokens is not None
+        or cache_creation_1h_input_tokens is not None
+    )
+    split_total = (cache_creation_5m_input_tokens or 0) + (cache_creation_1h_input_tokens or 0)
+    aggregate = cache_creation_input_tokens or 0
+    if strict or model == _HAIKU_MODEL:
+        if has_ttl_split and (
+            cache_creation_5m_input_tokens is None or cache_creation_1h_input_tokens is None
+        ):
+            return unknown("cache_write_ttl_split_incomplete")
+        if has_ttl_split and cache_creation_input_tokens is not None and aggregate != split_total:
+            return unknown("cache_write_ttl_split_mismatch")
+        if not has_ttl_split and aggregate and cache_write_ttl not in {"5m", "1h"}:
+            return unknown("cache_write_ttl_unavailable")
+    prompt_tokens = input_tokens + cache_read_input_tokens + (
+        split_total if has_ttl_split else aggregate
+    )
+    rates = get_rates(model, prompt_tokens=prompt_tokens)
     if rates is None:
-        return None
+        return unknown("model_rates_unavailable")
+    if not isinstance(inference_geo, str) or inference_geo not in {"global", "us"}:
+        return unknown("inference_geo_unavailable")
+    if requested_speed is not None and (
+        not isinstance(requested_speed, str) or requested_speed not in {"fast", "standard"}
+    ):
+        return unknown("request_speed_unavailable")
+    if speed is not None and (not isinstance(speed, str) or speed not in {"fast", "standard"}):
+        return unknown("response_speed_unavailable")
+    if requested_speed == "fast" and speed is None:
+        return unknown("response_speed_unavailable")
+    if strict and speed == "fast" and model not in _FAST_ELIGIBLE_MODELS:
+        return unknown("fast_mode_rates_unavailable")
 
     cost = (
         Decimal(input_tokens) * rates["input_per_m"] / _PER_M
@@ -366,14 +525,43 @@ def compute_cost(
             # 1-hour cache writes cost 2x the base input rate (Anthropic
             # pricing), not the 1.25x 5-minute cache_write_per_m rate.
             cost += Decimal(one_hour_tokens) * (rates["input_per_m"] * 2) / _PER_M
-    elif cache_creation_input_tokens > 0:
+    elif aggregate > 0:
         # Legacy path: no TTL split available, bill the full aggregate at
         # the 5-minute rate (unchanged historical behavior).
         cost += (
-            Decimal(cache_creation_input_tokens) * rates["cache_write_per_m"] / _PER_M
+            Decimal(aggregate) * rates[
+                "cache_write_1h_per_m" if cache_write_ttl == "1h" else "cache_write_per_m"
+            ] / _PER_M
         )
 
     if speed == "fast" and model in _FAST_ELIGIBLE_MODELS:
         cost *= 2
+    if inference_geo == "us":
+        cost *= Decimal("1.1")
+    return CostResult(cost)
 
-    return cost
+
+def compute_cost(
+    model: str, *, input_tokens: int = 0, output_tokens: int = 0,
+    cache_read_input_tokens: int = 0, cache_creation_input_tokens: int | None = 0,
+    cache_creation_5m_input_tokens: int | None = None,
+    cache_creation_1h_input_tokens: int | None = None,
+    speed: str | None = None, inference_geo: str | None = "global",
+    requested_speed: str | None = None, cache_write_ttl: str | None = None,
+    strict: bool = False,
+) -> Decimal | None:
+    """Backward-compatible Decimal-or-None helper.
+
+    Direct callers retain the historical standard/global default. Runtime
+    response conversion instead resolves actual response/explicit wire geo
+    and passes None when the workspace's default cannot be established.
+    """
+    return compute_cost_result(
+        model, input_tokens=input_tokens, output_tokens=output_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_creation_5m_input_tokens=cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens=cache_creation_1h_input_tokens,
+        speed=speed, inference_geo=inference_geo, requested_speed=requested_speed,
+        cache_write_ttl=cache_write_ttl, strict=strict,
+    ).cost_usd
