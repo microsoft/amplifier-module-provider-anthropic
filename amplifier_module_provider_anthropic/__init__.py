@@ -66,7 +66,15 @@ from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
-from ._cost import compute_cost
+from ._cost import compute_cost_result, get_rates, pricing_metadata
+
+
+class AnthropicModelInfo(ModelInfo):
+    """Additive descriptive pricing extension; never an inference default."""
+
+    pricing_details: dict[str, Any] | None = None
+
+
 from ._model_listing import (
     DEFAULT_FILTERS, LIFECYCLES, ModelFilters, latest_models, model_identity, selector_schema,
 )
@@ -1205,8 +1213,8 @@ class AnthropicProvider:
         # the default: you don't need a beta header, and long-context
         # requests are billed at standard pricing."
         #
-        # Haiku 5.5 is an exception: it has prompt-length pricing tiers.
-        # Their precise billing predicate remains unverified; cost is unavailable.
+        # Haiku 5.5 is an exception: its per-request prompt-length tier includes
+        # fresh input, cache reads and cache writes (see _cost.py).
         # The context-1m-2025-08-07 beta header is gone from Anthropic's
         # docs and has been removed from this provider (C-01); sending an
         # unrecognised beta header is a hard 400.
@@ -1842,16 +1850,32 @@ class AnthropicProvider:
             # Runtime metadata describes the native ceiling, not the
             # operator's opt-in history-retention policy.
             context_window = 200000
-        return ModelInfo(
+        model_defaults: dict[str, Any] = {
+            "temperature": 0.7,
+            "max_tokens": caps.max_output_tokens,
+        }
+        metadata = pricing_metadata(model_id)
+        # Old Core versions lack Pricing. Keep import/mount compatibility and
+        # expose the provider-local extension there; never flatten Haiku's tiers.
+        pricing = {}
+        rates = get_rates(model_id)
+        if rates is not None and "pricing" in ModelInfo.model_fields:
+            pricing["pricing"] = {
+                "input_per_million": float(rates["input_per_m"]),
+                "output_per_million": float(rates["output_per_m"]),
+                "cache_read_per_million": float(rates["cache_read_per_m"]),
+                "cache_write_per_million": float(rates["cache_write_per_m"]),
+                "currency": "USD",
+            }
+        return AnthropicModelInfo(
             id=model_id,
             display_name=display_name,
             context_window=context_window,
             max_output_tokens=caps.max_output_tokens,
             capabilities=list(caps.capability_tags),
-            defaults={
-                "temperature": 0.7,
-                "max_tokens": caps.max_output_tokens,
-            },
+            defaults=model_defaults,
+            pricing_details=metadata,
+            **pricing,
         )
 
     async def _fetch_models(
@@ -5656,6 +5680,7 @@ class AnthropicProvider:
                 response,
                 native_computer_adapter=assembly.native_computer_adapter,
                 neutral_function_names=assembly.neutral_function_names,
+                request_params=params,
             )
 
             # Emit from canonical fields
@@ -7381,6 +7406,7 @@ class AnthropicProvider:
         *,
         native_computer_adapter: NativeComputerAdapter | None = None,
         neutral_function_names: frozenset[str] | None = None,
+        request_params: Mapping[str, Any] | None = None,
     ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
@@ -7674,7 +7700,40 @@ class AnthropicProvider:
         if not isinstance(cache_creation_1h, int):
             cache_creation_1h = None
 
-        cost = compute_cost(
+        # Price the actual response model with effective final wire modifiers.
+        # extra_body takes precedence over typed parameters in Anthropic's SDK.
+        wire = dict(request_params or {})
+        extra = wire.pop("extra_body", None)
+        if isinstance(extra, Mapping):
+            wire.update(extra)
+        requested_speed = wire.get("speed")
+        response_speed = getattr(response.usage, "speed", None)
+        if not isinstance(response_speed, str):
+            response_speed = None
+        inference_geo = wire.get("inference_geo", "global")
+        if not isinstance(inference_geo, str):
+            inference_geo = None
+        # Aggregate-only cache counts cannot reveal mixed TTL. A single TTL
+        # across final request cache controls is sufficient; otherwise unknown.
+        ttls: set[str] = set()
+
+        def cache_ttls(value: Any) -> None:
+            if isinstance(value, dict):
+                control = value.get("cache_control")
+                if isinstance(control, dict):
+                    value_ttl = control.get("ttl", "5m")
+                    ttls.add(value_ttl if isinstance(value_ttl, str) else "unknown")
+                for key, child in value.items():
+                    # Only API structure, not arbitrary tool argument content.
+                    if key in {"messages", "system", "tools", "content"}:
+                        cache_ttls(child)
+            elif isinstance(value, list):
+                for child in value:
+                    cache_ttls(child)
+
+        cache_ttls(wire)
+        ttl = next(iter(ttls)) if len(ttls) == 1 else None
+        cost_result = compute_cost_result(
             response.model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
@@ -7683,20 +7742,24 @@ class AnthropicProvider:
             )
             or 0,
             cache_creation_input_tokens=getattr(
-                response.usage, "cache_creation_input_tokens", 0
-            )
-            or 0,
+                response.usage, "cache_creation_input_tokens", None
+            ),
             cache_creation_5m_input_tokens=cache_creation_5m,
             cache_creation_1h_input_tokens=cache_creation_1h,
-            speed=getattr(response.usage, "speed", None),
+            speed=response_speed,
+            requested_speed=requested_speed,
+            inference_geo=inference_geo,
+            cache_write_ttl=ttl,
+            strict=request_params is not None,
         )
+        cost = cost_result.cost_usd
         usage = usage.model_copy(update={"cost_usd": cost})
         self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
         metadata: dict[str, Any] = {}
-        if response.model == "claude-haiku-5-5" and cost is None:
-            metadata["anthropic_cost_unavailable"] = "haiku55_prompt_tier_unverified"
+        if cost is None:
+            metadata["anthropic_cost_unavailable"] = cost_result.unavailable_reason
         transformations = input_transformations(
             getattr(response, "input_transformations", None)
         )

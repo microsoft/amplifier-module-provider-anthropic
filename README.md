@@ -171,28 +171,72 @@ still fail locally on Haiku 5.5; ordinary function tools, even one named
 `computer`, are unaffected. Offline adapter contracts do not establish live
 vendor/account replay or installed executor readiness.
 
-#### Haiku pricing is unavailable, not zero
+#### Haiku pricing and cost metadata
 
-Published first-party USD/MTok rates, checked **2026-10-07**:
+Published first-party USD/MTok rates, checked **2026-11-14**:
 
 | Prompt length | Input | Output | Cache write 5m / 1h | Cache read |
 | --- | ---: | ---: | ---: | ---: |
 | Up to 100,000 tokens | $0.10 | $0.50 | $0.125 / $0.20 | $0.01 |
 | Above 100,000 tokens | $0.50 | $2.50 | $0.625 / $1.00 | $0.05 |
 
-The cached/server-added threshold predicate and full-versus-excess charging
-remain unverified. Consequently **all Haiku 5.5 scalar costs are `None`**, not
-a guessed lower-tier amount or a legacy Haiku rate. Response metadata and the
-`llm:response` event expose
-`anthropic_cost_unavailable: haiku55_prompt_tier_unverified`; JSON cost is `null`.
+The tier counts **fresh input + cache reads + cache writes once**. Over 100,000
+prompt tokens, the whole request (including output) uses the higher prices.
+Each request is priced independently; earlier requests are not repriced.
+Runtime uses the response usage and model, never a preflight token estimate.
+A complete TTL split controls 5m/1h write billing. Aggregate-only writes need
+an unambiguous TTL in the final request; inconsistent/incomplete splits or
+unresolved modifiers leave cost unavailable rather than falsely precise.
+
+`Usage.cost_usd` carries the Decimal token cost; JSON and `llm:response` expose
+a decimal string or `null`. Unknown costs include a machine-readable
+`metadata.anthropic_cost_unavailable` reason (for example,
+`cache_write_ttl_unavailable`, `response_speed_unavailable`, or
+`model_rates_unavailable`). True zero is not unknown.
 The provider's registered `session.cost` contribution reports `cost_usd: null`
 after any unknown-cost call, including when later calls have known costs. Its
 known subtotal is not reported as a complete total. External consumers that sum
 only known costs may still show an unchanged or incomplete total: provider
 accounting alone does not establish consumer/UI completeness or a free call.
 Costs do not determine model discovery ranking.
-Sonnet 5.5's documented fixed ID uses its reduced $0.10/MTok cache-read rate;
-existing per-TTL write accounting and legacy model prices remain unchanged.
+Sonnet 5 now uses its permanent $2/$10 input/output rates, with $0.20 reads
+and $2.50/$4 writes. Fable 5.2 uses $8/$40, $0.20 reads, and $10/$16 writes.
+Confirmed response fast mode doubles eligible model token costs, including
+Fable 5.2; effective final-wire US inference multiplies all categories by1.1.
+Pricing support does not enable new request capabilities. These are standard
+first-party token charges, not invoices, negotiated discounts, or separate
+server-tool fees.
+
+`list_models()` derives fixed Core `Pricing` and runtime rates from the same
+provider-local Decimal source. Haiku has `pricing=None`: a flat rate would be
+misleading. Provider-local `AnthropicModelInfo(ModelInfo)` adds optional
+**`pricing_details`** (not inference defaults), retained by `model_dump()`:
+
+```json
+{
+  "version": 1,
+  "kind": "tiered",
+  "currency": "USD",
+  "unit": "per_million_tokens",
+  "basis": "standard_global",
+  "modifiers": {"us_inference": "1.1"},
+  "threshold_tokens": 100000,
+  "threshold_basis": "input_tokens+cache_read_input_tokens+cache_creation_input_tokens",
+  "tiers": [
+    {"up_to": 100000, "rates": {"input": "0.10", "output": "0.50", "cache_read": "0.01", "cache_write_5m": "0.125", "cache_write_1h": "0.20"}},
+    {"above": 100000, "rates": {"input": "0.50", "output": "2.50", "cache_read": "0.05", "cache_write_5m": "0.625", "cache_write_1h": "1.00"}}
+  ]
+}
+```
+
+Fixed models use `kind:"fixed"` and `rates` instead of tier fields. Rates and
+multipliers are decimal strings; eligible models include
+`modifiers.confirmed_fast:"2"`. Consumers should validate the version/shape,
+preserve unknown as unknown, never insert descriptive fields into inference
+configuration, and use actual usage cost instead of recomputing from menu rates.
+Old Core without the flat `pricing` field still receives the provider-local
+extension without importing a new Core symbol. Unsupported IDs, including
+Mythos, receive no guessed rates.
 
 Sources: [Haiku overview](https://platform.claude.com/docs/en/models/haiku-5-5/overview),
 [migration](https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide),
@@ -296,7 +340,7 @@ and [Haiku migration](https://platform.claude.com/docs/en/models/haiku-5-5/migra
 Repository-native offline tests use real Core and SDK types with transport fakes.
 Paid native vendor checks, signed/account replay, actual final screenshots,
 platform/backend input and the required live-vision gate remain separate
-qualification requirements. Haiku pricing is unchanged and still unavailable.
+qualification requirements. Offline pricing checks do not establish billed cost.
 
 ## Configuration
 
@@ -760,7 +804,7 @@ verified 2026-08-29). Those models cap output at **128K tokens** per request
 regardless of context size.
 
 Haiku 5.5 also has a native 1M window, but has prompt-length pricing tiers;
-see its unavailable-cost boundary above.
+see its per-request pricing boundary above.
 
 The `enable_1m_context` config key does **not** change what the API accepts.
 It only sets the context window this provider *advertises* to Amplifier's
