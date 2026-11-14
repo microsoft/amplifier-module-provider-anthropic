@@ -154,6 +154,7 @@ def test_fable51_cost_usd_stamped():
     response.usage.output_tokens = 200
     response.usage.cache_read_input_tokens = 0
     response.usage.cache_creation_input_tokens = 0
+    response.usage.inference_geo = "global"
     del response.usage.speed
 
     result = provider._convert_to_chat_response(response)

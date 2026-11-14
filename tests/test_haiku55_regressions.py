@@ -397,9 +397,9 @@ def test_unavailable_count_is_not_estimated(result):
 
 
 @pytest.mark.parametrize("tokens", [0, 99_999, 100_000, 100_001, 900_000])
-def test_haiku_unknown_cost_never_legacy_or_zero(tokens):
-    assert (
-        compute_cost(
+def test_haiku_cost_uses_full_prompt_tier(tokens):
+    multiplier = Decimal("5") if tokens + 199 > 100_000 else Decimal("1")
+    assert compute_cost(
             MODEL,
             input_tokens=tokens,
             output_tokens=10,
@@ -407,9 +407,10 @@ def test_haiku_unknown_cost_never_legacy_or_zero(tokens):
             cache_creation_input_tokens=100,
             cache_creation_5m_input_tokens=40,
             cache_creation_1h_input_tokens=60,
-        )
-        is None
-    )
+        ) == multiplier * (
+            Decimal(tokens) * Decimal(".10") + Decimal("5") + Decimal(".99")
+            + Decimal("5") + Decimal("12")
+        ) / Decimal(1_000_000)
     assert compute_cost(MODEL + "-20261007", input_tokens=tokens) is None
 
 
@@ -439,6 +440,7 @@ def sdk_body(model=MODEL, content=None, stop="end_turn"):
         "usage": {
             "input_tokens": 1000,
             "output_tokens": 100,
+            "inference_geo": "global",
             "cache_read_input_tokens": 1_000_000,
             "cache_creation_input_tokens": 1000,
             "cache_creation": {
@@ -495,13 +497,9 @@ def test_real_sdk_create_count_models_usage_and_json(model):
             json.loads(response.model_dump_json())
             json.dumps(event)
             if model == MODEL:
-                assert response.usage.cost_usd is None
-                assert event["usage"]["cost_usd"] is None
-                assert (
-                    response.metadata["anthropic_cost_unavailable"]
-                    == "haiku55_prompt_tier_unverified"
-                )
-                assert event["metadata"] == response.metadata
+                assert response.usage.cost_usd == Decimal("0.0516")
+                assert Decimal(event["usage"]["cost_usd"]) == Decimal("0.0516")
+                assert "anthropic_cost_unavailable" not in (response.metadata or {})
             else:
                 assert response.usage.cost_usd == Decimal("0.1064")
                 assert event["usage"]["cost_usd"] == "0.1064"
@@ -534,7 +532,7 @@ def recording_client(seen, *, zero_usage=False):
             return httpx2.Response(200, json={"input_tokens": 321})
         response = sdk_body(body.get("model", MODEL))
         if zero_usage:
-            response["usage"] = {"input_tokens": 0, "output_tokens": 0}
+            response["usage"] = {"input_tokens": 0, "output_tokens": 0, "inference_geo": "global"}
         return httpx2.Response(200, json=response)
 
     return AsyncAnthropic(
@@ -548,6 +546,8 @@ def recording_client(seen, *, zero_usage=False):
     ([MODEL, "claude-sonnet-5-5"], False),
     ([MODEL], False),
     (["claude-sonnet-5-5", MODEL], True),
+    ([MODEL, "claude-mythos-5-2", MODEL], False),
+    (["claude-mythos-5-2", MODEL], True),
 ])
 def test_public_mount_cost_contribution_stays_unknown(models, zero):
     async def run():
@@ -565,11 +565,11 @@ def test_public_mount_cost_contribution_stays_unknown(models, zero):
             subtotal = Decimal("0")
             for model in models:
                 response = await p.complete(request(), model=model)
-                if model == MODEL:
+                if model == "claude-mythos-5-2":
                     unknown = True
                     assert response.usage.cost_usd is None
                     assert response.metadata["anthropic_cost_unavailable"] == (
-                        "haiku55_prompt_tier_unverified"
+                        "model_rates_unavailable"
                     )
                 else:
                     assert response.usage.cost_usd is not None
