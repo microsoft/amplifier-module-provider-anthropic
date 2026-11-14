@@ -6,6 +6,7 @@ Real SDK parsing over transport-only synthetic streams. No paid vendor calls.
 import asyncio
 from decimal import Decimal
 import json
+from types import SimpleNamespace
 
 import httpx2 as httpx
 import pytest
@@ -65,7 +66,7 @@ async def mounted(scenarios, *, max_retries=0):
         "use_streaming": True, "enable_prompt_caching": False,
         "max_retries": max_retries, "min_retry_delay": .001,
         "max_retry_delay": .001, "retry_jitter": False,
-        "overload_fallback_enabled": False, "refusal_fallback_enabled": False,
+        "fallback_on_overload": False, "refusal_fallback_enabled": False,
         "max_concurrent_requests": 0,
     })
     provider = coordinator.get("providers", "anthropic")
@@ -164,7 +165,9 @@ def test_success_not_double_counted_even_when_later_hook_fails():
             if event == "llm:response":
                 raise RuntimeError("synthetic post-accounting hook failure")
             return await emit(event, data)
-        c.hooks.emit = fail_after_conversion
+        # RustHookRegistry methods are read-only. Inject only the provider's
+        # hook boundary, keeping the real mounted contribution on c unchanged.
+        p.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=fail_after_conversion))
         try:
             with pytest.raises(RuntimeError, match="synthetic post-accounting"):
                 await p.complete(request())
