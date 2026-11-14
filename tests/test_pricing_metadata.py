@@ -294,3 +294,39 @@ def test_missing_geo_keeps_session_total_incomplete_after_known_cost():
         finally:
             await cleanup()
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("speed", [[], {}, 0, False, "", "future"])
+def test_converter_invalid_actual_speed_without_fast_request_keeps_unknown(speed):
+    from amplifier_module_provider_anthropic import mount
+    from amplifier_core import ModuleCoordinator
+
+    async def run():
+        coordinator = ModuleCoordinator()
+        cleanup = await mount(coordinator, {"api_key": "offline-placeholder"})
+        p = coordinator.get("providers", "anthropic")
+        body = {
+            "id": "msg_offline", "type": "message", "role": "assistant",
+            "model": FABLE, "content": [], "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": 1000, "output_tokens": 0,
+                      "inference_geo": "global", "speed": speed},
+        }
+        try:
+            # Actual SDK construction retains malformed/unknown response
+            # fields. No requested fast mode exists to trigger another guard.
+            result = p._convert_to_chat_response(
+                construct_type(value=body, type_=SDKMessage), request_params={})
+            assert result.usage.cost_usd is None
+            assert result.metadata["anthropic_cost_unavailable"] == "response_speed_unavailable"
+            assert json.loads(result.model_dump_json())["usage"]["cost_usd"] is None
+            # None is the documented optional absence and still allows normal
+            # standard pricing; it must not erase the previous unknown call.
+            body["usage"]["speed"] = None
+            standard = p._convert_to_chat_response(
+                construct_type(value=body, type_=SDKMessage), request_params={})
+            assert standard.usage.cost_usd == Decimal(".008")
+            assert "anthropic_cost_unavailable" not in (standard.metadata or {})
+            assert await coordinator.collect_contributions("session.cost") == [{"cost_usd": None}]
+        finally:
+            await cleanup()
+    asyncio.run(run())

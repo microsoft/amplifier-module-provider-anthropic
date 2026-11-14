@@ -26,7 +26,7 @@ from typing import Any
 from typing import ClassVar
 
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field
 
@@ -5033,10 +5033,27 @@ class AnthropicProvider:
 
         # Mutable container for rate_limit_info captured inside _do_complete
         captured_rate_limit_info: dict[str, Any] = {}
+        # Local to this completion (not the shared provider): each streamed
+        # attempt becomes potentially billable on its first SDK event. Until
+        # conversion records a cost, failure/cancellation must not leave the
+        # session contribution looking like an exact earlier subtotal.
+        stream_cost_pending = False
+
+        def _record_response_cost(cost: Decimal | None) -> None:
+            nonlocal stream_cost_pending
+            self._add_cost(cost)
+            stream_cost_pending = False
+
+        def _record_unaccounted_stream() -> None:
+            nonlocal stream_cost_pending
+            if stream_cost_pending:
+                stream_cost_pending = False
+                self._add_cost(None)
 
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
-            nonlocal captured_rate_limit_info
+            nonlocal captured_rate_limit_info, stream_cost_pending
+            response_returned = False
             try:
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
@@ -5107,6 +5124,7 @@ class AnthropicProvider:
                             ) as stream:
                                 async for event in stream:
                                     sdk_stream_started = True
+                                    stream_cost_pending = True
                                     etype = type(event).__name__
                                     idx = getattr(event, "index", None)
                                     if getattr(event, "type", None) == "message_start":
@@ -5285,6 +5303,7 @@ class AnthropicProvider:
                     )
 
                 captured_rate_limit_info = rate_limit_info
+                response_returned = True
                 return response
 
             except AnthropicRateLimitError as e:
@@ -5516,6 +5535,12 @@ class AnthropicProvider:
                     model=params["model"],
                     retryable=True,
                 ) from e
+            finally:
+                if not response_returned:
+                    # Synchronous accounting also runs for CancelledError,
+                    # without awaiting hooks or replacing its propagation.
+                    # A retry starts with a fresh, unaccounted attempt.
+                    _record_unaccounted_stream()
 
         async def _on_retry(attempt: int, delay: float, error: KernelLLMError):
             """Callback invoked before each retry sleep."""
@@ -5698,6 +5723,7 @@ class AnthropicProvider:
                 native_computer_adapter=assembly.native_computer_adapter,
                 neutral_function_names=assembly.neutral_function_names,
                 request_params=params,
+                _record_cost=_record_response_cost,
             )
 
             # Emit from canonical fields
@@ -5776,6 +5802,12 @@ class AnthropicProvider:
                     },
                 )
             raise
+
+        finally:
+            # Includes processing/cancellation after SDK return but before the
+            # converter recorded cost. Successful conversion clears the marker,
+            # so later hook failures cannot count that attempt twice.
+            _record_unaccounted_stream()
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         """
@@ -7424,6 +7456,7 @@ class AnthropicProvider:
         native_computer_adapter: NativeComputerAdapter | None = None,
         neutral_function_names: frozenset[str] | None = None,
         request_params: Mapping[str, Any] | None = None,
+        _record_cost: Callable[[Decimal | None], None] | None = None,
     ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
@@ -7725,8 +7758,6 @@ class AnthropicProvider:
             wire.update(extra)
         requested_speed = wire.get("speed")
         response_speed = getattr(response.usage, "speed", None)
-        if not isinstance(response_speed, str):
-            response_speed = None
         # Actual execution governs, including workspace-default routing and
         # a provider returning a different geo than requested. Omission from
         # both sources is not evidence of global routing on modern models.
@@ -7776,7 +7807,7 @@ class AnthropicProvider:
         )
         cost = cost_result.cost_usd
         usage = usage.model_copy(update={"cost_usd": cost})
-        self._add_cost(cost)
+        (_record_cost or self._add_cost)(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
         metadata: dict[str, Any] = {}

@@ -198,6 +198,9 @@ after any unknown-cost call, including when later calls have known costs. Its
 known subtotal is not reported as a complete total. External consumers that sum
 only known costs may still show an unchanged or incomplete total: provider
 accounting alone does not establish consumer/UI completeness or a free call.
+An interrupted or cancelled stream that has emitted an SDK event also records
+an unknown-cost attempt, even if a later retry succeeds. Validation failures and
+requests rejected before a stream starts do not fabricate a billable attempt.
 Costs do not determine model discovery ranking.
 Sonnet 5 now uses its permanent $2/$10 input/output rates, with $0.20 reads
 and $2.50/$4 writes. Fable 5.2 uses $8/$40, $0.20 reads, and $10/$16 writes.
