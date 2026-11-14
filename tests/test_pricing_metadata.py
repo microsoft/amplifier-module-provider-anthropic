@@ -6,11 +6,10 @@ import json
 from types import SimpleNamespace
 
 import pytest
-import httpx
+import httpx2 as httpx
 from anthropic import AsyncAnthropic
 from anthropic._models import construct_type
 from anthropic.types import Message as SDKMessage
-from anthropic.types import Usage as SDKUsage
 from amplifier_core import ModelInfo
 from amplifier_module_provider_anthropic import AnthropicProvider
 from amplifier_module_provider_anthropic._cost import (
