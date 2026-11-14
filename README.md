@@ -298,6 +298,41 @@ Paid native vendor checks, signed/account replay, actual final screenshots,
 platform/backend input and the required live-vision gate remain separate
 qualification requirements. Haiku pricing is unchanged and still unavailable.
 
+## Session media-v1 provider boundary
+
+Hosts may register the generic `experimental.media.v1` capability and prepare a
+private Core request before counting. Canonical history and suspended requests
+remain reference-only; this provider does not import Foundation, choose a media
+root, or resolve file paths.
+
+`get_media_request_support(*, model, request_options=None)` returns versioned
+position facts for the exact selected model. The explicit model catalogue is
+based on the [vendor vision reference](https://platform.claude.com/docs/en/build-with-claude/vision.md),
+not family-name guesses. Qualified forward media is static PNG/JPEG at its
+original user or call-bound tool-result position. Unknown model support and
+unsupported sources become explicit unavailable text before measurement. Native
+computer declarations retain their separate provenance and execution guards.
+
+Count and dispatch use the same image serialization. The provider validates the
+host's exact private request immediately before each count or transport attempt,
+including retries after backoff; changed, released, revoked or expired
+preparations refuse locally. It does not switch models or repair a prepared
+media candidate behind the host's count. Ambiguous transport loss is not
+automatically replayed, and no retry is permitted after a stream event.
+
+Raw opt-in diagnostics omit known image transport **before** `hooks.emit`, using
+an explicit not-retained marker. This is not a retrievable pixel reference.
+Thinking/signatures, tool input and arbitrary strings are not recursively parsed
+as images. Existing credential redaction still applies. Exception cause chains
+retain the existing Core debugging contract; this is not a guarantee about
+third-party traceback-local collectors.
+
+`tests/test_media_foundation_candidate.py` additionally exercises an installed
+media-v1 Foundation candidate with the actual SDK and an in-process transport.
+Absent that test-only candidate, the file skips explicitly. Neither those
+fixtures nor the standalone payload tests prove live vision, native desktop
+execution, or an accepted multi-repository integration graph.
+
 ## Configuration
 
 ```toml
@@ -308,7 +343,7 @@ config = {
     default_model = "claude-sonnet-5-5",
     max_tokens = 8192,
     temperature = 1.0,   # Silently ignored by models without sampling support (sonnet-5, opus-4.7+)
-    raw = false          # Include full request/response payloads in llm:* events
+    raw = false          # Opt-in redacted diagnostics; image transport is omitted
 }
 ```
 
