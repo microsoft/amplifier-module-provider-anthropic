@@ -202,7 +202,15 @@ Costs do not determine model discovery ranking.
 Sonnet 5 now uses its permanent $2/$10 input/output rates, with $0.20 reads
 and $2.50/$4 writes. Fable 5.2 uses $8/$40, $0.20 reads, and $10/$16 writes.
 Confirmed response fast mode doubles eligible model token costs, including
-Fable 5.2; effective final-wire US inference multiplies all categories by1.1.
+Fable 5.2; US inference multiplies all categories by1.1. Geography uses the
+recognized actual `usage.inference_geo` first, then an explicit effective
+final-wire value (including `extra_body` precedence) if actual geo is absent.
+An invalid nonnull actual geo remains unknown. When both are absent, current
+geo-capable models return `inference_geo_unavailable`: an omitted parameter uses
+the workspace default, which can be US. Legacy geo-incapable models retain
+standard prices. This does not change request defaults or force global routing.
+The standalone `compute_cost()` helper retains its documented global default;
+runtime conversion does not assume that workspace setting.
 Pricing support does not enable new request capabilities. These are standard
 first-party token charges, not invoices, negotiated discounts, or separate
 server-tool fees.

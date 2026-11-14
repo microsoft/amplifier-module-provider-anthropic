@@ -13,7 +13,7 @@ from anthropic.types import Message as SDKMessage
 from amplifier_core import ModelInfo
 from amplifier_module_provider_anthropic import AnthropicProvider
 from amplifier_module_provider_anthropic._cost import (
-    compute_cost, compute_cost_result, get_rates, pricing_metadata,
+    compute_cost, compute_cost_result, get_rates, pricing_metadata, resolve_inference_geo,
 )
 
 HAIKU = "claude-haiku-5-5"
@@ -146,14 +146,16 @@ def test_runtime_final_wire_geography_response_speed_and_unknown_reason():
         "inference_geo": "global", "extra_body": {"inference_geo": "us", "speed": "fast"}})
     assert result.usage.cost_usd == Decimal(".0176")
     r.usage.speed = None
-    result = p._convert_to_chat_response(r, request_params={"extra_body": {"speed": "fast"}})
+    result = p._convert_to_chat_response(r, request_params={
+        "inference_geo": "global", "extra_body": {"speed": "fast"}})
     assert result.usage.cost_usd is None
     assert result.metadata["anthropic_cost_unavailable"] == "response_speed_unavailable"
 
 
 def test_runtime_aggregate_ttl_uses_request_not_config():
     p = provider()
-    r = response(cache_creation_input_tokens=100, input_tokens=0, output_tokens=0)
+    r = response(cache_creation_input_tokens=100, input_tokens=0, output_tokens=0,
+                 inference_geo="global")
     assert p._convert_to_chat_response(r, request_params={}).usage.cost_usd is None
     result = p._convert_to_chat_response(r, request_params={
         "system": [{"type": "text", "text": "prefix", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]})
@@ -183,19 +185,36 @@ def test_real_sdk_absent_and_zero_cache_split_are_distinct(usage, reason):
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_real_sdk_transport_high_tier_cost_and_event_json(streaming):
+@pytest.mark.parametrize("actual,wire,final_geo,expected", [
+    ("us", "global", None, ".00552805"),
+    ("global", "us", None, ".0050255"),
+    (None, "us", None, ".00552805"),
+    (None, "global", None, ".0050255"),
+    (None, None, None, None),
+    ("invalid", "global", None, None),
+    ([], "us", None, None),
+    ("global", "global", "us", ".00552805"),
+])
+def test_real_sdk_transport_high_tier_cost_and_event_json(
+    streaming, actual, wire, final_geo, expected
+):
     from amplifier_core.message_models import ChatRequest, Message
     from tests._helpers import FakeCoordinator
 
     body = {"id": "msg_offline", "type": "message", "role": "assistant",
             "model": HAIKU, "content": [], "stop_reason": "end_turn", "stop_sequence": None,
             "usage": {"input_tokens": 1, "output_tokens": 10, "cache_read_input_tokens": 100_000,
-                      "cache_creation_input_tokens": 0}}
+                      "cache_creation_input_tokens": 0, "inference_geo": actual}}
     initial = {**body, "stop_reason": None, "usage": {**body["usage"], "output_tokens": 0}}
+    delta_usage = {"output_tokens": 10}
+    if final_geo is not None:
+        delta_usage["inference_geo"] = final_geo
+        # Nonstreaming final response directly contains the same final fact.
+        body["usage"]["inference_geo"] = final_geo
     events = [
         {"type": "message_start", "message": initial},
         {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-         "usage": {"output_tokens": 10}},
+         "usage": delta_usage},
         {"type": "message_stop"},
     ]
     sse = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
@@ -203,7 +222,9 @@ def test_real_sdk_transport_high_tier_cost_and_event_json(streaming):
     async def run():
         p = AnthropicProvider(api_key="offline-placeholder", config={
             "default_model": HAIKU, "use_streaming": streaming, "max_retries": 0,
-            "enable_prompt_caching": False}, coordinator=FakeCoordinator())
+            "enable_prompt_caching": False,
+            "extra_request_params": {"inference_geo": wire} if wire is not None else {},
+        }, coordinator=FakeCoordinator())
         p._client = AsyncAnthropic(api_key="offline-placeholder", max_retries=0,
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(
                 lambda req: httpx.Response(200, **(
@@ -211,10 +232,65 @@ def test_real_sdk_transport_high_tier_cost_and_event_json(streaming):
                     if streaming else {"json": body})))))
         try:
             result = await p.complete(ChatRequest(messages=[Message(role="user", content="hello")]))
-            assert result.usage.cost_usd == Decimal(".0050255")
+            assert result.usage.cost_usd == (Decimal(expected) if expected is not None else None)
             event = p.coordinator.hooks.payload_for("llm:response")
-            assert Decimal(json.loads(json.dumps(event))["usage"]["cost_usd"]) == Decimal(".0050255")
-            assert "anthropic_cost_unavailable" not in (result.metadata or {})
+            event_cost = json.loads(json.dumps(event))["usage"]["cost_usd"]
+            if expected is None:
+                assert event_cost is None
+                assert result.metadata["anthropic_cost_unavailable"] == "inference_geo_unavailable"
+                assert event["metadata"]["anthropic_cost_unavailable"] == "inference_geo_unavailable"
+            else:
+                assert Decimal(event_cost) == Decimal(expected)
+                assert "anthropic_cost_unavailable" not in (result.metadata or {})
         finally:
             await p.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("actual,requested,expected", [
+    ("us", "global", "us"), ("global", "us", "global"),
+    (None, "us", "us"), (None, "global", "global"),
+    (None, None, None), ("", "us", None), ([], "global", None),
+    ("future", "us", None), (None, {}, None),
+])
+def test_geography_authority_and_absence(actual, requested, expected):
+    assert resolve_inference_geo(FABLE, response_geo=actual, request_geo=requested) == expected
+    assert resolve_inference_geo("claude-sonnet-4-5-20250929") == "global"
+    # Standalone helper keeps the documented legacy default, unlike runtime.
+    assert compute_cost(FABLE, input_tokens=1000) == Decimal(".008")
+
+
+def test_actual_geo_precedes_expert_wire_and_stacks_confirmed_fast():
+    p = provider()
+    r = response(FABLE, input_tokens=1000, output_tokens=0,
+                 speed="fast", inference_geo="global")
+    params = {"inference_geo": "global", "extra_body": {"inference_geo": "us", "speed": "fast"}}
+    assert p._convert_to_chat_response(r, request_params=params).usage.cost_usd == Decimal(".016")
+    r.usage.inference_geo = "us"
+    assert p._convert_to_chat_response(r, request_params={}).usage.cost_usd == Decimal(".0176")
+    del r.usage.inference_geo
+    assert p._convert_to_chat_response(r, request_params=params).usage.cost_usd == Decimal(".0176")
+
+
+def test_missing_geo_keeps_session_total_incomplete_after_known_cost():
+    from amplifier_module_provider_anthropic import mount
+    from amplifier_core import ModuleCoordinator
+
+    async def run():
+        coordinator = ModuleCoordinator()
+        cleanup = await mount(coordinator, {"api_key": "offline-placeholder"})
+        p = coordinator.get("providers", "anthropic")
+        try:
+            # No transport: exact response conversion exercises the registered
+            # contribution without reading any account/workspace configuration.
+            known = response(FABLE, inference_geo="global")
+            assert p._convert_to_chat_response(known, request_params={}).usage.cost_usd is not None
+            unknown = response(FABLE)
+            result = p._convert_to_chat_response(unknown, request_params={})
+            assert result.usage.cost_usd is None
+            assert result.metadata["anthropic_cost_unavailable"] == "inference_geo_unavailable"
+            p._convert_to_chat_response(known, request_params={})
+            assert await coordinator.collect_contributions("session.cost") == [{"cost_usd": None}]
+        finally:
+            await cleanup()
     asyncio.run(run())

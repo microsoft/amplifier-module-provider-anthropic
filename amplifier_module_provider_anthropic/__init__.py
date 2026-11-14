@@ -66,7 +66,7 @@ from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
-from ._cost import compute_cost_result, get_rates, pricing_metadata
+from ._cost import compute_cost_result, get_rates, pricing_metadata, resolve_inference_geo
 
 
 class AnthropicModelInfo(ModelInfo):
@@ -5096,6 +5096,7 @@ class AnthropicProvider:
                     # even if it carries no displayable text or hook payload.
                     sdk_stream_started = False
                     stream_transformations = None
+                    stream_inference_geo = None
                     hooks_available = self.coordinator and hasattr(
                         self.coordinator, "hooks"
                     )
@@ -5109,11 +5110,25 @@ class AnthropicProvider:
                                     etype = type(event).__name__
                                     idx = getattr(event, "index", None)
                                     if getattr(event, "type", None) == "message_start":
+                                        stream_inference_geo = getattr(
+                                            getattr(getattr(event, "message", None), "usage", None),
+                                            "inference_geo", None,
+                                        )
                                         stream_transformations = input_transformations(
                                             getattr(getattr(event, "message", None),
                                                     "input_transformations", None)
                                         )
                                     elif getattr(event, "type", None) == "message_delta":
+                                        # SDK 1.12 accumulates token counts but
+                                        # may omit optional usage extensions on
+                                        # deltas. Preserve the final nonnull
+                                        # actual geography (including invalid
+                                        # values, which must yield unknown).
+                                        delta_geo = getattr(
+                                            getattr(event, "usage", None), "inference_geo", None
+                                        )
+                                        if delta_geo is not None:
+                                            stream_inference_geo = delta_geo
                                         final_transformations = input_transformations(
                                             getattr(event, "input_transformations", None)
                                         )
@@ -5226,6 +5241,8 @@ class AnthropicProvider:
 
                                 # Stream drained. Final message is now ready.
                                 response = await stream.get_final_message()
+                                if stream_inference_geo is not None:
+                                    response.usage.inference_geo = stream_inference_geo
                                 if stream_transformations is not None:
                                     # The stable SDK accumulator may omit beta
                                     # fields, especially a fallback's final delta.
@@ -7710,9 +7727,14 @@ class AnthropicProvider:
         response_speed = getattr(response.usage, "speed", None)
         if not isinstance(response_speed, str):
             response_speed = None
-        inference_geo = wire.get("inference_geo", "global")
-        if not isinstance(inference_geo, str):
-            inference_geo = None
+        # Actual execution governs, including workspace-default routing and
+        # a provider returning a different geo than requested. Omission from
+        # both sources is not evidence of global routing on modern models.
+        inference_geo = resolve_inference_geo(
+            response.model,
+            response_geo=getattr(response.usage, "inference_geo", None),
+            request_geo=wire.get("inference_geo"),
+        )
         # Aggregate-only cache counts cannot reveal mixed TTL. A single TTL
         # across final request cache controls is sufficient; otherwise unknown.
         ttls: set[str] = set()

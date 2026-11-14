@@ -440,6 +440,7 @@ def sdk_body(model=MODEL, content=None, stop="end_turn"):
         "usage": {
             "input_tokens": 1000,
             "output_tokens": 100,
+            "inference_geo": "global",
             "cache_read_input_tokens": 1_000_000,
             "cache_creation_input_tokens": 1000,
             "cache_creation": {
@@ -531,7 +532,7 @@ def recording_client(seen, *, zero_usage=False):
             return httpx2.Response(200, json={"input_tokens": 321})
         response = sdk_body(body.get("model", MODEL))
         if zero_usage:
-            response["usage"] = {"input_tokens": 0, "output_tokens": 0}
+            response["usage"] = {"input_tokens": 0, "output_tokens": 0, "inference_geo": "global"}
         return httpx2.Response(200, json=response)
 
     return AsyncAnthropic(

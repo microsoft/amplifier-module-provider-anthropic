@@ -258,6 +258,13 @@ _FAST_ELIGIBLE_MODELS: set[str] = {
 }
 
 _HAIKU_MODEL = "claude-haiku-5-5"
+_GEO_ELIGIBLE_MODELS = {
+    "claude-sonnet-4-6", "claude-sonnet-5", "claude-sonnet-5-5",
+    "claude-opus-4-6", "claude-opus-4-6-20260101", "claude-opus-4-7",
+    "claude-opus-4-7-20260416", "claude-opus-4-8", "claude-opus-5",
+    "claude-opus-5-5", "claude-fable-5", "claude-fable-5-1",
+    "claude-fable-5-2", _HAIKU_MODEL,
+}
 _HAIKU_THRESHOLD = 100_000
 _HAIKU_RATES = (
     {
@@ -288,6 +295,25 @@ def get_rates(model: str, *, prompt_tokens: int | None = None) -> dict[str, Deci
     return {**source, "cache_write_1h_per_m": source["input_per_m"] * 2}
 
 
+def resolve_inference_geo(
+    model: str, *, response_geo: object = None, request_geo: object = None,
+) -> str | None:
+    """Resolve billing geography without guessing a workspace's default.
+
+    The response reports where inference actually ran. Only when that is
+    absent/None may the explicit effective wire request be used. An invalid
+    nonnull response is unknown, not an invitation to mask it with the request.
+    Legacy priced models cannot use geo controls and retain standard rates.
+    https://platform.claude.com/docs/en/manage-claude/data-residency
+    """
+    for value in (response_geo, request_geo):
+        if value is not None:
+            return value if isinstance(value, str) and value in {"global", "us"} else None
+    if model in _RATES and model not in _GEO_ELIGIBLE_MODELS:
+        return "global"
+    return None
+
+
 def pricing_metadata(model: str) -> dict | None:
     """JSON-safe display contract in provider-local ModelInfo.pricing_details.
 
@@ -315,13 +341,7 @@ def pricing_metadata(model: str) -> dict | None:
         "basis": "standard_global",
         "modifiers": {},
     }
-    if model in {
-        "claude-sonnet-4-6", "claude-sonnet-5", "claude-sonnet-5-5",
-        "claude-opus-4-6", "claude-opus-4-6-20260101", "claude-opus-4-7",
-        "claude-opus-4-7-20260416", "claude-opus-4-8", "claude-opus-5",
-        "claude-opus-5-5", "claude-fable-5", "claude-fable-5-1",
-        "claude-fable-5-2", _HAIKU_MODEL,
-    }:
+    if model in _GEO_ELIGIBLE_MODELS:
         result["modifiers"]["us_inference"] = "1.1"
     if model in _FAST_ELIGIBLE_MODELS:
         result["modifiers"]["confirmed_fast"] = "2"
@@ -530,7 +550,12 @@ def compute_cost(
     requested_speed: str | None = None, cache_write_ttl: str | None = None,
     strict: bool = False,
 ) -> Decimal | None:
-    """Backward-compatible Decimal-or-None API; see compute_cost_result."""
+    """Backward-compatible Decimal-or-None helper.
+
+    Direct callers retain the historical standard/global default. Runtime
+    response conversion instead resolves actual response/explicit wire geo
+    and passes None when the workspace's default cannot be established.
+    """
     return compute_cost_result(
         model, input_tokens=input_tokens, output_tokens=output_tokens,
         cache_read_input_tokens=cache_read_input_tokens,

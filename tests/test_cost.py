@@ -74,6 +74,7 @@ def _make_response(
     response.usage.cache_read_input_tokens = cache_read_input_tokens
     response.usage.cache_creation_input_tokens = cache_creation_input_tokens
     response.usage.speed = speed
+    response.usage.inference_geo = "global"
     return response
 
 
@@ -622,6 +623,7 @@ def _make_response_with_ttl_split(
     response.usage.cache_read_input_tokens = 0
     response.usage.cache_creation_input_tokens = cache_creation_input_tokens
     response.usage.speed = None
+    response.usage.inference_geo = "global"
     if ephemeral_5m_input_tokens is None and ephemeral_1h_input_tokens is None:
         response.usage.cache_creation = None
     else:
