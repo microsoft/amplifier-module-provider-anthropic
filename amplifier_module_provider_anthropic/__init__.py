@@ -20,6 +20,7 @@ import os
 import re
 import time
 import uuid
+import weakref
 from decimal import Decimal
 from threading import Lock
 from typing import Any
@@ -67,6 +68,10 @@ from anthropic._exceptions import (
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 from ._cost import compute_cost
+from ._media import (
+    VISION_MODELS, diagnostic_copy, has_capability, has_media, safe_error_text,
+    tool_result_content, validate_attempt,
+)
 from ._model_listing import (
     DEFAULT_FILTERS, LIFECYCLES, ModelFilters, latest_models, model_identity, selector_schema,
 )
@@ -3354,14 +3359,17 @@ class AnthropicProvider:
             ChatResponse with content blocks, tool calls, usage
         """
         # Reject the effective Haiku envelope before repair, hooks, or transport.
+        # A host prepares even image-free/unsupported candidates. Preserve their
+        # exact private identity through initial native-tool declarations too.
+        media_request = has_media(request) or has_capability(self.coordinator)
         validation_options = dict(kwargs)
-        if self._fallback_on_overload:
+        if self._fallback_on_overload and not media_request:
             validation_options["model"], _ = self._resolve_effective_model(
                 str(kwargs.get("model", self.default_model))
             )
         is_haiku55 = self._prevalidate_haiku55_request(request, validation_options)
         self._prevalidate_sonnet_computer(request, validation_options)
-        if has_neutral_computer_intent(request.tools or []):
+        if has_neutral_computer_intent(request.tools or []) and not media_request:
             # Legacy repair mutates its input; neutral transport owns only a copy.
             request = request.model_copy(deep=True)
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
@@ -3372,6 +3380,12 @@ class AnthropicProvider:
         )
 
         if missing:
+            if media_request:
+                raise KernelInvalidRequestError(
+                    "Media request tool history requires repair before preparation "
+                    "and recount; request not sent.",
+                    provider="anthropic", retryable=False,
+                )
             logger.warning(
                 f"[PROVIDER] Anthropic: Detected {len(missing)} missing tool result(s). "
                 f"Injecting synthetic errors. This indicates a bug in context management. "
@@ -3398,6 +3412,10 @@ class AnthropicProvider:
                     },
                 )
 
+        if media_request:
+            # A model fallback changes the fitted projection identity. Never
+            # reroute prepared pixels or manufacture a witness for another model.
+            return await self._complete_chat_request(request, **kwargs)
         if not self._fallback_on_overload:
             response = await self._complete_chat_request(request, **kwargs)
             return await self._apply_refusal_fallback(
@@ -3710,10 +3728,8 @@ class AnthropicProvider:
                     self._extra_params_warned_keys.add(key)
                     logger.warning(
                         "[PROVIDER] extra_request_params overrides provider-computed "
-                        "'%s' (%r -> %r).",
+                        "'%s' (values omitted).",
                         key,
-                        params[key],
-                        value,
                     )
                 params[key] = copy.deepcopy(value)
             else:
@@ -3977,6 +3993,16 @@ class AnthropicProvider:
         prefix state only after this method has finished.
         """
         options = dict(request_options)
+        if has_media(request):
+            extra = self.extra_request_params.get("extra_body")
+            if "messages" in self.extra_request_params or (
+                isinstance(extra, dict) and "messages" in extra
+            ):
+                raise KernelInvalidRequestError(
+                    "Media message wire overrides bypass private preparation; "
+                    "remove the override and prepare/count the canonical candidate.",
+                    provider="anthropic", retryable=False,
+                )
         effective_model = options.get("model", self.default_model)
         try:
             neutral_model = neutral_effective_model(
@@ -4086,6 +4112,9 @@ class AnthropicProvider:
                 [message.model_dump() for message in conversation],
                 emit_warnings=emit_diagnostics,
                 native_computer_adapter=native_computer_adapter,
+                allow_images=bool(self.get_media_request_support(
+                    model=effective_model, request_options=options,
+                )["positions"]),
             ),
         ]
         observed_state = "disabled"
@@ -4706,6 +4735,32 @@ class AnthropicProvider:
             category,
         )
 
+    def get_media_request_support(
+        self, *, model: str, request_options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Explicit provider facts for the host's private media projector."""
+        selected = self.extra_request_params.get("model", model)
+        extra = self.extra_request_params.get("extra_body")
+        if isinstance(extra, dict):
+            selected = extra.get("model", selected)
+        supported = isinstance(selected, str) and selected in VISION_MODELS
+        return {
+            "v": 1,
+            "positions": ["user", "tool"] if supported else [],
+            "mime_types": ["image/png", "image/jpeg"],
+            "reason": None if supported else "selected model vision support is unknown",
+            "evidence": "https://platform.claude.com/docs/en/build-with-claude/vision.md",
+        }
+
+    def _media_transport_client(self):
+        """Prevent invisible SDK HTTP retries from bypassing the host witness."""
+        client = self.client
+        # The normal constructor already disables these. A supplied real SDK
+        # client may not: use its supported view without mutating shared state.
+        if isinstance(client, AsyncAnthropic) and client.max_retries != 0:
+            return client.with_options(max_retries=0)
+        return client
+
     async def request_budget(
         self,
         request: ChatRequest,
@@ -4767,10 +4822,13 @@ class AnthropicProvider:
             or output <= 0
         ):
             return None
+        count_params = self._count_tokens_params(params)
+        count_client = self._media_transport_client()
+        validate_attempt(self.coordinator, request, "count", options)
         try:
             token_count = await asyncio.wait_for(
-                self.client.messages.count_tokens(
-                    **self._count_tokens_params(params),
+                count_client.messages.count_tokens(
+                    **count_params,
                     timeout=_COUNT_TOKENS_TIMEOUT_SECONDS,
                 ),
                 timeout=_COUNT_TOKENS_TIMEOUT_SECONDS,
@@ -4792,6 +4850,18 @@ class AnthropicProvider:
         ):
             self._warn_count_unavailable(model, "malformed_response")
             return None
+        if has_media(request):
+            # Store only a weak candidate identity and short wire fingerprint,
+            # never a second image payload/cache. A candidate is released by
+            # the host and its final weak-key entry disappears with it.
+            records = getattr(self, "_media_counted", None)
+            if records is None:
+                records = self._media_counted = {}
+            key = id(request)
+            records[key] = (
+                weakref.ref(request, lambda _, key=key: records.pop(key, None)),
+                self._fingerprint(count_params),
+            )
         estimated = counted_input + _INPUT_BUDGET_SAFETY_RESERVE
         target = context_estimate
         if estimated > limit:
@@ -4944,6 +5014,16 @@ class AnthropicProvider:
         thinking_enabled = assembly.thinking_enabled
         thinking_budget = assembly.thinking_budget
         interleaved_thinking_enabled = assembly.interleaved_thinking_enabled
+        if has_media(request):
+            record = getattr(self, "_media_counted", {}).get(id(request))
+            if record is not None and record[0]() is request and (
+                record[1] != self._fingerprint(self._count_tokens_params(params))
+            ):
+                raise KernelInvalidRequestError(
+                    "Media wire controls changed after count; prepare and recount "
+                    "the request before transport.",
+                    provider="anthropic", retryable=False,
+                )
 
         # Keep only short fingerprints for a possible input-only server
         # rejection. The request reference adds an identity binding without
@@ -4974,7 +5054,7 @@ class AnthropicProvider:
                 "interleaved_thinking": interleaved_thinking_enabled,
             }
             if self.raw:
-                request_payload["raw"] = redact_secrets(params)
+                request_payload["raw"] = redact_secrets(diagnostic_copy(params))
             await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
@@ -4985,10 +5065,15 @@ class AnthropicProvider:
 
         # Mutable container for rate_limit_info captured inside _do_complete
         captured_rate_limit_info: dict[str, Any] = {}
+        media_stream_started = False
+        protected_request = has_media(request) or has_capability(self.coordinator)
+        transport_entered = False
 
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
             nonlocal captured_rate_limit_info
+            nonlocal media_stream_started
+            nonlocal transport_entered
             try:
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
@@ -5008,6 +5093,8 @@ class AnthropicProvider:
                 # SDK-only policy stays out of the assembled generation payload.
                 # Explicit transport overrides in extra_request_params win.
                 sdk_params = {"timeout": self._sdk_timeout, **params}
+                transport_client = self._media_transport_client()
+                validate_attempt(self.coordinator, request, "transport", kwargs)
                 if _use_streaming:
                     # ----- Streaming path with per-block event emission --------
                     # We iterate the SDK's event stream rather than calling
@@ -5053,11 +5140,13 @@ class AnthropicProvider:
                     )
                     try:
                         async with asyncio.timeout(self.timeout):
-                            async with self.client.messages.stream(
+                            transport_entered = True
+                            async with transport_client.messages.stream(
                                 **sdk_params
                             ) as stream:
                                 async for event in stream:
                                     sdk_stream_started = True
+                                    media_stream_started = True
                                     etype = type(event).__name__
                                     idx = getattr(event, "index", None)
                                     if getattr(event, "type", None) == "message_start":
@@ -5201,7 +5290,7 @@ class AnthropicProvider:
                                     "request_id": request_id,
                                     "error": {
                                         "type": type(e).__name__,
-                                        "msg": str(e),
+                                        "msg": safe_error_text(str(e), params),
                                     },
                                 },
                             )
@@ -5210,8 +5299,9 @@ class AnthropicProvider:
                     # Pass the timeout on the request too: this avoids hidden SDK
                     # deadlines and its max_tokens-based non-streaming estimate,
                     # including when a client is supplied by the host.
+                    transport_entered = True
                     raw_response = await asyncio.wait_for(
-                        self.client.messages.with_raw_response.create(**sdk_params),
+                        transport_client.messages.with_raw_response.create(**sdk_params),
                         timeout=self.timeout,
                     )
                     response = await raw_response.parse()
@@ -5227,6 +5317,7 @@ class AnthropicProvider:
                 retry_after = rate_info.get("retry_after_seconds")
                 body = getattr(e, "body", None)
                 msg = json.dumps(body) if body is not None else str(e)
+                msg = safe_error_text(msg, params)
                 raise KernelRateLimitError(
                     msg,
                     provider="anthropic",
@@ -5239,6 +5330,7 @@ class AnthropicProvider:
             except AnthropicAuthenticationError as e:
                 body = getattr(e, "body", None)
                 msg = json.dumps(body) if body is not None else str(e)
+                msg = safe_error_text(msg, params)
                 raise KernelAuthenticationError(
                     msg,
                     provider="anthropic",
@@ -5250,6 +5342,7 @@ class AnthropicProvider:
                 raw_msg = str(e).lower()
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = safe_error_text(error_msg, params)
                 if _is_context_overflow(raw_msg):
                     translated = KernelContextLengthError(
                         error_msg,
@@ -5304,6 +5397,7 @@ class AnthropicProvider:
             except AnthropicOverloadedError as e:
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = safe_error_text(error_msg, params)
                 retry_after: float | None = None
                 if hasattr(e, "response") and e.response:
                     raw = e.response.headers.get("retry-after")
@@ -5326,6 +5420,7 @@ class AnthropicProvider:
                 status = getattr(e, "status_code", 500)
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = safe_error_text(error_msg, params)
                 if status == 403:
                     # Distinguish Cloudflare bot challenges (transient) from
                     # real API 403s (permanent).  Cloudflare returns HTML
@@ -5388,14 +5483,22 @@ class AnthropicProvider:
 
             except asyncio.TimeoutError as e:
                 raise KernelLLMTimeoutError(
-                    f"Request timed out after {self.timeout}s",
+                    f"Request timed out after {self.timeout}s"
+                    + ("; transport outcome unknown, not automatically replayed"
+                       if protected_request else ""),
                     provider="anthropic",
                     model=params["model"],
-                    retryable=True,
+                    retryable=not protected_request,
                 ) from e
 
-            except KernelLLMError:
-                raise  # Already translated, don't double-wrap
+            except KernelLLMError as error:
+                error.args = tuple(
+                    safe_error_text(arg, params) if isinstance(arg, str) else arg
+                    for arg in error.args
+                )
+                if protected_request and transport_entered and error.status_code is None:
+                    error.retryable = False
+                raise  # Retain the existing error type and retry policy.
 
             except Exception as e:
                 body = getattr(e, "body", None)
@@ -5445,16 +5548,23 @@ class AnthropicProvider:
                     # value such a cause still has.
                     if not cause_text or cause_text not in error_msg:
                         error_msg = f"{error_msg} (caused by {type(cause).__name__}: {cause_text})"
+                error_msg = safe_error_text(error_msg, params)
+                if protected_request and transport_entered:
+                    error_msg += "; transport outcome unknown, not automatically replayed"
                 raise KernelLLMError(
                     error_msg,
                     provider="anthropic",
                     model=params["model"],
-                    retryable=True,
+                    retryable=not (protected_request and transport_entered),
                 ) from e
 
         async def _on_retry(attempt: int, delay: float, error: KernelLLMError):
             """Callback invoked before each retry sleep."""
+            if protected_request and media_stream_started:
+                error.retryable = False
+                raise error  # Never replay image inference after any SDK event.
             error_type = type(error).__name__
+            diagnostic_error = safe_error_text(str(error), params)
             retry_after = getattr(error, "retry_after", None)
 
             # Always log retries at WARNING level — visible even without hooks
@@ -5463,7 +5573,7 @@ class AnthropicProvider:
                 attempt,
                 active_retry_config.max_retries,
                 error_type,
-                str(error),
+                diagnostic_error,
                 delay,
                 f" (server retry-after: {retry_after}s)" if retry_after else "",
             )
@@ -5479,7 +5589,7 @@ class AnthropicProvider:
                         "delay": delay,
                         "retry_after": retry_after,
                         "error_type": error_type,
-                        "error_message": str(error),
+                        "error_message": diagnostic_error,
                     },
                 )
 
@@ -5667,7 +5777,9 @@ class AnthropicProvider:
                 if rate_limit_info:
                     response_event["rate_limits"] = rate_limit_info
                 if self.raw:
-                    response_event["raw"] = redact_secrets(response.model_dump())
+                    response_event["raw"] = redact_secrets(
+                        diagnostic_copy(response.model_dump())
+                    )
                 await self.coordinator.hooks.emit("llm:response", response_event)
 
             return chat_response  # Return the already-built response
@@ -5675,7 +5787,9 @@ class AnthropicProvider:
         except KernelLLMError as e:
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = safe_error_text(
+                str(e) or f"{type(e).__name__}: (no message)", params
+            )
             logger.error("[PROVIDER] Anthropic API error: %s", error_msg)
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -5694,7 +5808,9 @@ class AnthropicProvider:
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
             # Ensure error message is never empty
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = safe_error_text(
+                str(e) or f"{type(e).__name__}: (no message)", params
+            )
             logger.error(f"[PROVIDER] Anthropic response processing error: {error_msg}")
 
             # Emit error event
@@ -5928,6 +6044,7 @@ class AnthropicProvider:
         *,
         emit_warnings: bool = True,
         native_computer_adapter: NativeComputerAdapter | None = None,
+        allow_images: bool = True,
     ) -> list[dict[str, Any]]:
         """Convert messages to Anthropic format.
 
@@ -6057,8 +6174,9 @@ class AnthropicProvider:
                     if not tool_use_id or tool_use_id not in valid_tool_use_ids:
                         if emit_warnings:
                             logger.warning(
-                                f"Skipping orphaned tool_result (no matching tool_use): "
-                                f"tool_call_id={tool_use_id}, content_preview={str(tool_msg.get('content', ''))[:100]}"
+                                "Skipping orphaned tool_result (no matching tool_use): "
+                                "tool_call_id=%s",
+                                tool_use_id,
                             )
                         skipped_count += 1
                         i += 1
@@ -6069,6 +6187,8 @@ class AnthropicProvider:
                         "tool_use_id": tool_use_id,
                         "content": tool_msg.get("content", ""),
                     }
+                    if tool_msg.get("is_error") is not None:
+                        result["is_error"] = tool_msg["is_error"]
                     toolset_name = native_tool_use_ids.get(tool_use_id)
                     if (
                         native_computer_adapter is not None
@@ -6107,6 +6227,10 @@ class AnthropicProvider:
                                 and (cleaned := self._clean_content_block(mapped))
                                 is not None
                             ]
+                    else:
+                        result["content"] = tool_result_content(
+                            result["content"], allow_images=allow_images
+                        )
                     tool_results.append(result)
                     i += 1
 
@@ -6385,11 +6509,7 @@ class AnthropicProvider:
                         block = self._content_block_mapping(block)
                         if isinstance(block, dict):
                             block_type = block.get("type")
-                            if (
-                                block_type == "tool_result"
-                                and native_computer_adapter is not None
-                                and native_computer_adapter.neutral
-                            ):
+                            if block_type == "tool_result":
                                 # Core stores tool_call_id/output; the vendor wire
                                 # uses tool_use_id/content. Project without mutation.
                                 result_id = block.get(
@@ -6429,6 +6549,10 @@ class AnthropicProvider:
                                             provider="anthropic",
                                             status_code=400,
                                         )
+                                    projected_result["content"] = tool_result_content(
+                                        projected_result["content"],
+                                        allow_images=allow_images,
+                                    )
                                     content_blocks.append(projected_result)
                                 else:
                                     content_blocks.append(
@@ -6441,6 +6565,12 @@ class AnthropicProvider:
                                     {"type": "text", "text": block.get("text", "")}
                                 )
                             elif block_type == "image":
+                                if not allow_images:
+                                    content_blocks.append({
+                                        "type": "text",
+                                        "text": "[Image unavailable: selected model vision support is unknown; no pixels supplied]",
+                                    })
+                                    continue
                                 # Convert ImageBlock to Anthropic image format
                                 source = block.get("source", {})
                                 if source.get("type") == "base64":
@@ -6457,9 +6587,10 @@ class AnthropicProvider:
                                         }
                                     )
                                 else:
-                                    logger.warning(
-                                        f"Unsupported image source type: {source.get('type')}"
-                                    )
+                                    content_blocks.append({
+                                        "type": "text",
+                                        "text": "[Image unavailable: unsupported image source; no pixels supplied]",
+                                    })
                             elif block_type == "document":
                                 # Documents are already in Anthropic's input
                                 # shape. Preserve the source and nested cache
