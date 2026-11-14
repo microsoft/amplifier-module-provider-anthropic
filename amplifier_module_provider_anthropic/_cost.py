@@ -448,11 +448,13 @@ def compute_cost_result(
         return unknown("model_rates_unavailable")
     if not isinstance(inference_geo, str) or inference_geo not in {"global", "us"}:
         return unknown("inference_geo_unavailable")
-    if requested_speed is not None and not isinstance(requested_speed, str):
+    if requested_speed is not None and (
+        not isinstance(requested_speed, str) or requested_speed not in {"fast", "standard"}
+    ):
         return unknown("request_speed_unavailable")
-    if requested_speed == "fast" and speed not in {"fast", "standard"}:
-        return unknown("response_speed_unavailable")
     if speed is not None and (not isinstance(speed, str) or speed not in {"fast", "standard"}):
+        return unknown("response_speed_unavailable")
+    if requested_speed == "fast" and speed is None:
         return unknown("response_speed_unavailable")
     if strict and speed == "fast" and model not in _FAST_ELIGIBLE_MODELS:
         return unknown("fast_mode_rates_unavailable")

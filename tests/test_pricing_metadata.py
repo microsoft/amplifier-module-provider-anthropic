@@ -35,10 +35,14 @@ def test_fixed_model_info_uses_shared_rates(model):
     info = provider()._model_info(SimpleNamespace(id=model), model)
     assert isinstance(info, ModelInfo)
     rates = get_rates(model)
-    assert info.pricing.input_per_million == float(rates["input_per_m"])
-    assert info.pricing.output_per_million == float(rates["output_per_m"])
-    assert info.pricing.cache_read_per_million == float(rates["cache_read_per_m"])
-    assert info.pricing.cache_write_per_million == float(rates["cache_write_per_m"])
+    if "pricing" in ModelInfo.model_fields:
+        assert info.pricing.input_per_million == float(rates["input_per_m"])
+        assert info.pricing.output_per_million == float(rates["output_per_m"])
+        assert info.pricing.cache_read_per_million == float(rates["cache_read_per_m"])
+        assert info.pricing.cache_write_per_million == float(rates["cache_write_per_m"])
+    else:
+        # Locked Core predates Pricing; extension still supplies every rate.
+        assert "pricing" not in info.model_dump()
     data = json.loads(info.model_dump_json())
     assert data["pricing_details"] == pricing_metadata(model)
     assert data["pricing_details"]["kind"] == "fixed"
@@ -48,7 +52,7 @@ def test_fixed_model_info_uses_shared_rates(model):
 
 def test_tiered_model_is_not_flattened_and_metadata_is_fresh():
     info = provider()._model_info(SimpleNamespace(id=HAIKU), HAIKU)
-    assert info.pricing is None
+    assert getattr(info, "pricing", None) is None
     details = info.model_dump()["pricing_details"]
     assert details["version"] == 1 and details["basis"] == "standard_global"
     assert details["threshold_basis"] == "input_tokens+cache_read_input_tokens+cache_creation_input_tokens"
@@ -64,7 +68,7 @@ def test_no_guessed_prices(model):
     assert get_rates(model) is None
     assert pricing_metadata(model) is None
     info = provider()._model_info(SimpleNamespace(id=model), model)
-    assert info.pricing is None
+    assert getattr(info, "pricing", None) is None
     assert getattr(info, "pricing_details", None) is None
     assert compute_cost(model, input_tokens=1) is None
 
@@ -128,6 +132,8 @@ def test_fable_confirmed_fast_and_us_stack_all_categories():
     assert compute_cost(FABLE, speed="fast", inference_geo="us", **kwargs) == base * Decimal("2.2")
     assert compute_cost(FABLE, speed="standard", requested_speed="fast", **kwargs) == base
     assert compute_cost(FABLE, requested_speed="fast", **kwargs) is None
+    assert compute_cost(FABLE, requested_speed="fast", speed=[], **kwargs) is None
+    assert compute_cost(FABLE, requested_speed={}, **kwargs) is None
     assert compute_cost(FABLE, inference_geo="unknown", **kwargs) is None
     # Pricing support does not enable a new request capability.
     assert not provider()._get_capabilities(FABLE).supports_speed
