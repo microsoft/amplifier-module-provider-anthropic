@@ -396,6 +396,7 @@ BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
 BETA_HEADER_FAST_MODE = "fast-mode-2026-02-01"
 PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
+PROVIDER_TOKEN_COUNT_UNAVAILABLE = "provider:token_count_unavailable"
 FALLBACK_STATE_VERSION = 1
 
 # Overload/refusal fallback ladder: which family a request steps DOWN to.
@@ -847,6 +848,11 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             if _totals["has_data"]
             else None
         ),
+    )
+    coordinator.register_contributor(
+        "observability.events",
+        "provider-anthropic",
+        lambda: [PROVIDER_TOKEN_COUNT_UNAVAILABLE],
     )
     logger.info("Mounted AnthropicProvider")
 
@@ -1428,7 +1434,9 @@ class AnthropicProvider:
         )
 
         self._overflow_feedback_owner = object()
-        self._count_unavailable_warning_categories: set[tuple[str, str]] = set()
+        self._count_unavailable_warning_categories: set[
+            tuple[str, str, str | None, int | None]
+        ] = set()
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
         #
@@ -4746,17 +4754,22 @@ class AnthropicProvider:
     async def _warn_count_unavailable(
         self, model: str, category: str, error: Exception | None = None
     ) -> None:
-        """Log and capture safe metadata once per resolved model/category."""
-        if (model, category) in self._count_unavailable_warning_categories:
-            return
-        self._count_unavailable_warning_categories.add((model, category))
-        logger.warning(
-            "[PROVIDER] Anthropic token count unavailable for model %s (%s); "
-            "input count is unavailable.",
-            model,
-            category,
-        )
+        """Capture distinct safe failures, never keying suppression by request ID."""
         try:
+            error_type = type(error).__name__ if error is not None else None
+            status_code = (
+                error.status_code if isinstance(error, AnthropicAPIStatusError) else None
+            )
+            key = (model, category, error_type, status_code)
+            if key in self._count_unavailable_warning_categories:
+                return
+            self._count_unavailable_warning_categories.add(key)
+            logger.warning(
+                "[PROVIDER] Anthropic token count unavailable for model %s (%s); "
+                "input count is unavailable.",
+                model,
+                category,
+            )
             payload: dict[str, Any] = {
                 "provider": "anthropic",
                 "model": model,
@@ -4764,12 +4777,12 @@ class AnthropicProvider:
                 "category": category,
             }
             if error is not None:
-                payload["error_type"] = type(error).__name__
+                payload["error_type"] = error_type
                 if isinstance(error, AnthropicAPIStatusError):
-                    payload["status_code"] = error.status_code
+                    payload["status_code"] = status_code
                     if isinstance(error.request_id, str):
                         payload["request_id"] = error.request_id
-            await self._emit_provider_event("provider:token_count_unavailable", payload)
+            await self._emit_provider_event(PROVIDER_TOKEN_COUNT_UNAVAILABLE, payload)
         except Exception:  # noqa: BLE001 -- optional diagnostics cannot change None
             # Never log the observer exception: it may contain private data.
             # CancelledError is intentionally not caught.

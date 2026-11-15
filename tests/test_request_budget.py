@@ -3,6 +3,7 @@
 import asyncio
 import json
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -11,6 +12,7 @@ import anthropic
 import httpx2
 import pytest
 from amplifier_core import ModuleCoordinator
+from amplifier_core.events import ALL_EVENTS
 from amplifier_core.message_models import (
     ChatRequest,
     ImageBlock,
@@ -20,7 +22,7 @@ from amplifier_core.message_models import (
     ToolSpec,
 )
 
-from amplifier_module_provider_anthropic import AnthropicProvider
+from amplifier_module_provider_anthropic import AnthropicProvider, mount
 from tests._helpers import FakeCoordinator
 
 MODEL = "claude-sonnet-5"
@@ -617,3 +619,116 @@ class TestRequestBudget:
         count.assert_awaited_once()
         create.assert_not_called()
         assert emit.await_count == int(cancel_at == "observer")
+
+    def test_mount_contribution_reaches_real_core_subscriber_json_record(
+        self, tmp_path: Path
+    ) -> None:
+        """Core contract test; actual CI LoggingHandler proof is a paired gate."""
+        capture = tmp_path / "captured-count.jsonl"
+        private = "private-count-prompt-and-exception"
+
+        async def run() -> None:
+            coordinator = ModuleCoordinator()
+            assert await coordinator.collect_contributions("observability.events") == []
+            cleanup = await mount(coordinator, {
+                "api_key": "offline-placeholder", "default_model": MODEL,
+                "max_retries": 0,
+            })
+            unregister = []
+            try:
+                contributions = await coordinator.collect_contributions(
+                    "observability.events"
+                )
+                assert contributions == [[COUNT_UNAVAILABLE_EVENT]]
+                assert coordinator.channels["observability.events"][0]["name"] == (
+                    "provider-anthropic"
+                )
+                # Match Context Intelligence's canonical + contributed discovery.
+                # Do not subscribe directly to the event under test.
+                discovered = set(ALL_EVENTS)
+                for names in contributions:
+                    discovered.update(names)
+
+                async def record(event: str, data: dict[str, Any]) -> None:
+                    with capture.open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps({"event": event, "data": data}) + "\n")
+
+                for event in discovered:
+                    unregister.append(coordinator.hooks.register(
+                        event, record, priority=100, name="count-json-subscriber"
+                    ))
+                provider = coordinator.get("providers", "anthropic")
+                count = AsyncMock(side_effect=RuntimeError(private))
+                provider.client.messages.count_tokens = count
+                create = AsyncMock()
+                provider.client.messages.with_raw_response.create = create
+                request = _request().model_copy(
+                    update={"messages": [Message(role="user", content=private)]}
+                )
+                assert await provider.request_budget(
+                    request, context_estimate=200_000
+                ) is None
+                count.assert_awaited_once()
+                create.assert_not_called()
+            finally:
+                for unreg in unregister:
+                    unreg()
+                await cleanup()
+
+        asyncio.run(run())
+        serialized = capture.read_text(encoding="utf-8")
+        assert [json.loads(line) for line in serialized.splitlines()] == [{
+            "event": COUNT_UNAVAILABLE_EVENT,
+            "data": {
+                "provider": "anthropic",
+                "model": MODEL,
+                "source": "anthropic.messages.count_tokens",
+                "category": "request_error",
+                "error_type": "RuntimeError",
+            },
+        }]
+        assert private not in serialized
+
+    def test_changed_safe_failure_is_retained_but_new_request_ids_are_not_keys(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        provider = _provider()
+
+        def error(status: int, request_id: str) -> anthropic.APIStatusError:
+            response = httpx2.Response(
+                status,
+                request=httpx2.Request("POST", "https://synthetic.invalid/count"),
+                headers={"request-id": request_id},
+            )
+            return anthropic.APIStatusError(
+                "private-error-message", response=response, body={"private": "body"}
+            )
+
+        count = AsyncMock(side_effect=[
+            error(400, "req_first"),
+            error(500, "req_second"),
+            error(500, "req_third"),
+            RuntimeError("private-error-message"),
+        ])
+        provider.client.messages.count_tokens = count
+        create = AsyncMock()
+        provider.client.messages.with_raw_response.create = create
+        for _ in range(4):
+            assert asyncio.run(
+                provider.request_budget(_request(), context_estimate=200_000)
+            ) is None
+
+        events = cast(FakeCoordinator, provider.coordinator).hooks.events
+        assert [data.get("status_code") for _, data in events] == [400, 500, None]
+        assert [data["error_type"] for _, data in events] == [
+            "APIStatusError", "APIStatusError", "RuntimeError"
+        ]
+        assert [data.get("request_id") for _, data in events] == [
+            "req_first", "req_second", None
+        ]
+        assert all(name == COUNT_UNAVAILABLE_EVENT for name, _ in events)
+        assert len(provider._count_unavailable_warning_categories) == 3
+        assert "private-error-message" not in json.dumps(events) + caplog.text
+        assert "req_third" not in json.dumps(events)
+        assert count.await_count == 4
+        create.assert_not_called()
