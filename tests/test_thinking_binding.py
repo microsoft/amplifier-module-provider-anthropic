@@ -192,6 +192,18 @@ def test_explicit_native_controls_are_preserved_by_presence(thinking):
     assert params["thinking"] == thinking
 
 
+@pytest.mark.parametrize("extra_body", [False, True])
+def test_explicit_null_mode_is_not_rewritten_by_automatic_binding(extra_body):
+    params = {"model": MODEL}
+    target = params.setdefault("extra_body", {}) if extra_body else params
+    target["thinking"] = {"type": None}
+    configure_binding(params, base_url="https://api.anthropic.com")
+    if extra_body:
+        assert target["thinking"] == {"type": None}
+    effective = params["extra_body"]["thinking"] if extra_body else params["thinking"]
+    assert effective == {"type": None, "block_binding": DROP}
+
+
 @pytest.mark.parametrize("beta", ["", None, 17])
 def test_removed_or_malformed_beta_never_leaves_half_injected_control(beta):
     params = {"model":MODEL, "extra_headers":{"Anthropic-Beta":beta}}
