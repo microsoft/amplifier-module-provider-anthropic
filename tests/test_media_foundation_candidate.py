@@ -152,7 +152,7 @@ async def test_actual_store_wrapper_count_send_and_epoch_refusal(
 # Separate from the unchanged count-required fixture above. A missing published
 # window is an explicit assertion, never patched into a manufactured count.
 UNCOUNTED_MODELS = frozenset({
-    "claude-fable-5-2", "claude-mythos-5-2", "claude-mythos-preview",
+    "claude-mythos-5-2", "claude-mythos-preview",
 })
 
 

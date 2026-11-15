@@ -67,7 +67,7 @@ def sdk_message(content: list[dict], model: str = MODEL) -> dict:
         "stop_reason": "tool_use",
         "stop_sequence": None,
         "content": content,
-        "usage": {"input_tokens": 3, "output_tokens": 2},
+        "usage": {"input_tokens": 3, "output_tokens": 2, "inference_geo": "global"},
     }
 
 

@@ -27,7 +27,7 @@ from typing import Any
 from typing import ClassVar
 
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field
 
@@ -67,13 +67,21 @@ from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
-from ._cost import compute_cost
+from ._cost import compute_cost_result, get_rates, pricing_metadata, resolve_inference_geo
 from ._media import (
     bind_media_connection,
     bound_transport_client,
     VISION_MODELS, diagnostic_copy, has_capability, has_media, safe_error_text,
     tool_result_content, validate_attempt,
 )
+
+
+class AnthropicModelInfo(ModelInfo):
+    """Additive descriptive pricing extension; never an inference default."""
+
+    pricing_details: dict[str, Any] | None = None
+
+
 from ._model_listing import (
     DEFAULT_FILTERS, LIFECYCLES, ModelFilters, latest_models, model_identity, selector_schema,
 )
@@ -1212,8 +1220,8 @@ class AnthropicProvider:
         # the default: you don't need a beta header, and long-context
         # requests are billed at standard pricing."
         #
-        # Haiku 5.5 is an exception: it has prompt-length pricing tiers.
-        # Their precise billing predicate remains unverified; cost is unavailable.
+        # Haiku 5.5 is an exception: its per-request prompt-length tier includes
+        # fresh input, cache reads and cache writes (see _cost.py).
         # The context-1m-2025-08-07 beta header is gone from Anthropic's
         # docs and has been removed from this provider (C-01); sending an
         # unrecognised beta header is a hard 400.
@@ -1849,16 +1857,32 @@ class AnthropicProvider:
             # Runtime metadata describes the native ceiling, not the
             # operator's opt-in history-retention policy.
             context_window = 200000
-        return ModelInfo(
+        model_defaults: dict[str, Any] = {
+            "temperature": 0.7,
+            "max_tokens": caps.max_output_tokens,
+        }
+        metadata = pricing_metadata(model_id)
+        # Old Core versions lack Pricing. Keep import/mount compatibility and
+        # expose the provider-local extension there; never flatten Haiku's tiers.
+        pricing = {}
+        rates = get_rates(model_id)
+        if rates is not None and "pricing" in ModelInfo.model_fields:
+            pricing["pricing"] = {
+                "input_per_million": float(rates["input_per_m"]),
+                "output_per_million": float(rates["output_per_m"]),
+                "cache_read_per_million": float(rates["cache_read_per_m"]),
+                "cache_write_per_million": float(rates["cache_write_per_m"]),
+                "currency": "USD",
+            }
+        return AnthropicModelInfo(
             id=model_id,
             display_name=display_name,
             context_window=context_window,
             max_output_tokens=caps.max_output_tokens,
             capabilities=list(caps.capability_tags),
-            defaults={
-                "temperature": 0.7,
-                "max_tokens": caps.max_output_tokens,
-            },
+            defaults=model_defaults,
+            pricing_details=metadata,
+            **pricing,
         )
 
     async def _fetch_models(
@@ -2065,6 +2089,7 @@ class AnthropicProvider:
                 thinking_display_required=True,
                 supported_efforts=("low", "medium", "high", "xhigh", "max"),
                 supports_speed=False,
+                supports_forced_tool_choice=model_id != "claude-fable-5-2",
                 supports_inline_system=True,
                 default_thinking_budget=0,  # not used — adaptive only
                 # NOT verified: claude-fable-5 rejects every request in this
@@ -3766,6 +3791,8 @@ class AnthropicProvider:
         version = self._detect_version(model_id, family)
         runtime_info = self._runtime_model_info_cache.get(model_id)
         static = version in _STATIC_BUDGET_MODEL_VERSIONS.get(family, frozenset())
+        # Only the documented fixed Fable 5.2 ID; no guessed suffixes/aliases.
+        static = static or model_id == "claude-fable-5-2"
         if family == "haiku" and version == (5, 5) and model_id != "claude-haiku-5-5":
             static = False
         if not static and (
@@ -4218,10 +4245,13 @@ class AnthropicProvider:
                 )
             if (
                 not request_caps.supports_forced_tool_choice
+                # Fable 5.2 is checked after expert overrides below so the
+                # rejection reflects the actual model and tool choice on wire.
+                and effective_model != "claude-fable-5-2"
                 and normalized_tool_choice.get("type") in {"any", "tool"}
             ):
                 raise KernelInvalidRequestError(
-                    "claude-opus-5-5 supports only tool_choice 'auto' or "
+                    f"{effective_model} supports only tool_choice 'auto' or "
                     "'none'; required/any and named tool choice are unavailable.",
                     provider="anthropic",
                     model=effective_model,
@@ -4600,6 +4630,24 @@ class AnthropicProvider:
                 "anthropic-beta": ",".join(headers),
             }
         self._merge_extra_request_params(params, emit_warnings=emit_diagnostics)
+        # extra_body shadows typed SDK fields, including model and tool_choice.
+        # Keep this restriction exact-model/local rather than changing the
+        # expert-override policy for any previously supported model.
+        wire_extra = params.get("extra_body") or {}
+        wire_model = wire_extra.get("model", params.get("model"))
+        wire_choice = wire_extra.get("tool_choice", params.get("tool_choice"))
+        if (
+            wire_model == "claude-fable-5-2"
+            and isinstance(wire_choice, dict)
+            and wire_choice.get("type") in {"any", "tool"}
+        ):
+            raise KernelInvalidRequestError(
+                f"{wire_model} supports only tool_choice 'auto' or "
+                "'none'; required/any and named tool choice are unavailable.",
+                provider="anthropic",
+                model=wire_model,
+                status_code=400,
+            )
         if request.max_output_tokens is not None:
             params["max_tokens"] = min(request.max_output_tokens, model_ceiling)
         elif params.get("max_tokens") and params["max_tokens"] > model_ceiling:
@@ -5075,12 +5123,29 @@ class AnthropicProvider:
         media_stream_started = False
         protected_request = has_media(request) or has_capability(self.coordinator)
         transport_entered = False
+        # Local to this completion (not the shared provider): each streamed
+        # attempt becomes potentially billable on its first SDK event. Until
+        # conversion records a cost, failure/cancellation must not leave the
+        # session contribution looking like an exact earlier subtotal.
+        stream_cost_pending = False
+
+        def _record_response_cost(cost: Decimal | None) -> None:
+            nonlocal stream_cost_pending
+            self._add_cost(cost)
+            stream_cost_pending = False
+
+        def _record_unaccounted_stream() -> None:
+            nonlocal stream_cost_pending
+            if stream_cost_pending:
+                stream_cost_pending = False
+                self._add_cost(None)
 
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
-            nonlocal captured_rate_limit_info
+            nonlocal captured_rate_limit_info, stream_cost_pending
             nonlocal media_stream_started
             nonlocal transport_entered
+            response_returned = False
             try:
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
@@ -5142,6 +5207,7 @@ class AnthropicProvider:
                     # even if it carries no displayable text or hook payload.
                     sdk_stream_started = False
                     stream_transformations = None
+                    stream_inference_geo = None
                     hooks_available = self.coordinator and hasattr(
                         self.coordinator, "hooks"
                     )
@@ -5154,14 +5220,29 @@ class AnthropicProvider:
                                 async for event in stream:
                                     sdk_stream_started = True
                                     media_stream_started = True
+                                    stream_cost_pending = True
                                     etype = type(event).__name__
                                     idx = getattr(event, "index", None)
                                     if getattr(event, "type", None) == "message_start":
+                                        stream_inference_geo = getattr(
+                                            getattr(getattr(event, "message", None), "usage", None),
+                                            "inference_geo", None,
+                                        )
                                         stream_transformations = input_transformations(
                                             getattr(getattr(event, "message", None),
                                                     "input_transformations", None)
                                         )
                                     elif getattr(event, "type", None) == "message_delta":
+                                        # SDK 1.12 accumulates token counts but
+                                        # may omit optional usage extensions on
+                                        # deltas. Preserve the final nonnull
+                                        # actual geography (including invalid
+                                        # values, which must yield unknown).
+                                        delta_geo = getattr(
+                                            getattr(event, "usage", None), "inference_geo", None
+                                        )
+                                        if delta_geo is not None:
+                                            stream_inference_geo = delta_geo
                                         final_transformations = input_transformations(
                                             getattr(event, "input_transformations", None)
                                         )
@@ -5274,6 +5355,8 @@ class AnthropicProvider:
 
                                 # Stream drained. Final message is now ready.
                                 response = await stream.get_final_message()
+                                if stream_inference_geo is not None:
+                                    response.usage.inference_geo = stream_inference_geo
                                 if stream_transformations is not None:
                                     # The stable SDK accumulator may omit beta
                                     # fields, especially a fallback's final delta.
@@ -5317,6 +5400,7 @@ class AnthropicProvider:
                     )
 
                 captured_rate_limit_info = rate_limit_info
+                response_returned = True
                 return response
 
             except AnthropicRateLimitError as e:
@@ -5564,6 +5648,12 @@ class AnthropicProvider:
                     model=params["model"],
                     retryable=not (protected_request and transport_entered),
                 ) from e
+            finally:
+                if not response_returned:
+                    # Synchronous accounting also runs for CancelledError,
+                    # without awaiting hooks or replacing its propagation.
+                    # A retry starts with a fresh, unaccounted attempt.
+                    _record_unaccounted_stream()
 
         async def _on_retry(attempt: int, delay: float, error: KernelLLMError):
             """Callback invoked before each retry sleep."""
@@ -5749,6 +5839,8 @@ class AnthropicProvider:
                 response,
                 native_computer_adapter=assembly.native_computer_adapter,
                 neutral_function_names=assembly.neutral_function_names,
+                request_params=params,
+                _record_cost=_record_response_cost,
             )
 
             # Emit from canonical fields
@@ -5833,6 +5925,12 @@ class AnthropicProvider:
                     },
                 )
             raise
+
+        finally:
+            # Includes processing/cancellation after SDK return but before the
+            # converter recorded cost. Successful conversion clears the marker,
+            # so later hook failures cannot count that attempt twice.
+            _record_unaccounted_stream()
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         """
@@ -7495,6 +7593,8 @@ class AnthropicProvider:
         *,
         native_computer_adapter: NativeComputerAdapter | None = None,
         neutral_function_names: frozenset[str] | None = None,
+        request_params: Mapping[str, Any] | None = None,
+        _record_cost: Callable[[Decimal | None], None] | None = None,
     ) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
@@ -7788,7 +7888,43 @@ class AnthropicProvider:
         if not isinstance(cache_creation_1h, int):
             cache_creation_1h = None
 
-        cost = compute_cost(
+        # Price the actual response model with effective final wire modifiers.
+        # extra_body takes precedence over typed parameters in Anthropic's SDK.
+        wire = dict(request_params or {})
+        extra = wire.pop("extra_body", None)
+        if isinstance(extra, Mapping):
+            wire.update(extra)
+        requested_speed = wire.get("speed")
+        response_speed = getattr(response.usage, "speed", None)
+        # Actual execution governs, including workspace-default routing and
+        # a provider returning a different geo than requested. Omission from
+        # both sources is not evidence of global routing on modern models.
+        inference_geo = resolve_inference_geo(
+            response.model,
+            response_geo=getattr(response.usage, "inference_geo", None),
+            request_geo=wire.get("inference_geo"),
+        )
+        # Aggregate-only cache counts cannot reveal mixed TTL. A single TTL
+        # across final request cache controls is sufficient; otherwise unknown.
+        ttls: set[str] = set()
+
+        def cache_ttls(value: Any) -> None:
+            if isinstance(value, dict):
+                control = value.get("cache_control")
+                if isinstance(control, dict):
+                    value_ttl = control.get("ttl", "5m")
+                    ttls.add(value_ttl if isinstance(value_ttl, str) else "unknown")
+                for key, child in value.items():
+                    # Only API structure, not arbitrary tool argument content.
+                    if key in {"messages", "system", "tools", "content"}:
+                        cache_ttls(child)
+            elif isinstance(value, list):
+                for child in value:
+                    cache_ttls(child)
+
+        cache_ttls(wire)
+        ttl = next(iter(ttls)) if len(ttls) == 1 else None
+        cost_result = compute_cost_result(
             response.model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
@@ -7797,20 +7933,24 @@ class AnthropicProvider:
             )
             or 0,
             cache_creation_input_tokens=getattr(
-                response.usage, "cache_creation_input_tokens", 0
-            )
-            or 0,
+                response.usage, "cache_creation_input_tokens", None
+            ),
             cache_creation_5m_input_tokens=cache_creation_5m,
             cache_creation_1h_input_tokens=cache_creation_1h,
-            speed=getattr(response.usage, "speed", None),
+            speed=response_speed,
+            requested_speed=requested_speed,
+            inference_geo=inference_geo,
+            cache_write_ttl=ttl,
+            strict=request_params is not None,
         )
+        cost = cost_result.cost_usd
         usage = usage.model_copy(update={"cost_usd": cost})
-        self._add_cost(cost)
+        (_record_cost or self._add_cost)(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
         metadata: dict[str, Any] = {}
-        if response.model == "claude-haiku-5-5" and cost is None:
-            metadata["anthropic_cost_unavailable"] = "haiku55_prompt_tier_unverified"
+        if cost is None:
+            metadata["anthropic_cost_unavailable"] = cost_result.unavailable_reason
         transformations = input_transformations(
             getattr(response, "input_transformations", None)
         )

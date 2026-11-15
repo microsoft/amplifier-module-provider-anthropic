@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+from decimal import Decimal
 
 import httpx2 as httpx
 import pytest
@@ -137,7 +138,8 @@ async def test_real_sdk_closed_surface_count_dispatch_and_canonical_conversion(
             assert "diagnostics" not in json.dumps(body)
         assert req.model_dump_json() == original
         if model == "claude-haiku-5-5":
-            assert response.usage.cost_usd is None  # Pricing is separate, never zero.
+            # Synthetic usage is 3 fresh input + 2 output, below the tier.
+            assert response.usage.cost_usd == Decimal("0.0000013")
     finally:
         await wire.close()
 
