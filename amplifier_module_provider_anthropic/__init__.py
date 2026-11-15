@@ -57,6 +57,7 @@ from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolCall
 from anthropic import APIStatusError as AnthropicAPIStatusError
+from anthropic import APITimeoutError as AnthropicAPITimeoutError
 from anthropic import AsyncAnthropic
 from anthropic import AuthenticationError as AnthropicAuthenticationError
 from anthropic import BadRequestError as AnthropicBadRequestError
@@ -4742,8 +4743,10 @@ class AnthropicProvider:
             })
         return projected
 
-    def _warn_count_unavailable(self, model: str, category: str) -> None:
-        """Log each safe count-unavailable category once per resolved model."""
+    async def _warn_count_unavailable(
+        self, model: str, category: str, error: Exception | None = None
+    ) -> None:
+        """Log and capture safe metadata once per resolved model/category."""
         if (model, category) in self._count_unavailable_warning_categories:
             return
         self._count_unavailable_warning_categories.add((model, category))
@@ -4753,6 +4756,24 @@ class AnthropicProvider:
             model,
             category,
         )
+        try:
+            payload: dict[str, Any] = {
+                "provider": "anthropic",
+                "model": model,
+                "source": "anthropic.messages.count_tokens",
+                "category": category,
+            }
+            if error is not None:
+                payload["error_type"] = type(error).__name__
+                if isinstance(error, AnthropicAPIStatusError):
+                    payload["status_code"] = error.status_code
+                    if isinstance(error.request_id, str):
+                        payload["request_id"] = error.request_id
+            await self._emit_provider_event("provider:token_count_unavailable", payload)
+        except Exception:  # noqa: BLE001 -- optional diagnostics cannot change None
+            # Never log the observer exception: it may contain private data.
+            # CancelledError is intentionally not caught.
+            pass
 
     async def request_budget(
         self,
@@ -4823,14 +4844,14 @@ class AnthropicProvider:
                 ),
                 timeout=_COUNT_TOKENS_TIMEOUT_SECONDS,
             )
-        except asyncio.TimeoutError:
-            self._warn_count_unavailable(model, "timeout")
+        except (asyncio.TimeoutError, AnthropicAPITimeoutError) as error:
+            await self._warn_count_unavailable(model, "timeout", error)
             return None
-        except AnthropicRateLimitError:
-            self._warn_count_unavailable(model, "rate_limit")
+        except AnthropicRateLimitError as error:
+            await self._warn_count_unavailable(model, "rate_limit", error)
             return None
-        except Exception:  # noqa: BLE001 -- count failures must fail closed
-            self._warn_count_unavailable(model, "request_error")
+        except Exception as error:  # noqa: BLE001 -- count failures must fail closed
+            await self._warn_count_unavailable(model, "request_error", error)
             return None
         counted_input = getattr(token_count, "input_tokens", None)
         if (
@@ -4838,7 +4859,7 @@ class AnthropicProvider:
             or not isinstance(counted_input, int)
             or counted_input < 0
         ):
-            self._warn_count_unavailable(model, "malformed_response")
+            await self._warn_count_unavailable(model, "malformed_response")
             return None
         estimated = counted_input + _INPUT_BUDGET_SAFETY_RESERVE
         target = context_estimate

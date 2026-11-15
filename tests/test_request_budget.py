@@ -1,12 +1,14 @@
 """Focused offline contract tests for exact Anthropic request budgeting."""
 
 import asyncio
+import json
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import anthropic
+import httpx2
 import pytest
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import (
@@ -22,6 +24,7 @@ from amplifier_module_provider_anthropic import AnthropicProvider
 from tests._helpers import FakeCoordinator
 
 MODEL = "claude-sonnet-5"
+COUNT_UNAVAILABLE_EVENT = "provider:token_count_unavailable"
 
 
 def _provider(**config: Any) -> AnthropicProvider:
@@ -158,6 +161,7 @@ class TestRequestBudget:
         assert provider._prefix_fingerprints == prefix_before
         assert provider._client is None
         assert not hasattr(provider, "_input_token_ratio_by_model")
+        assert cast(FakeCoordinator, provider.coordinator).hooks.events == []
 
     def test_count_result_makes_budget_decision_with_fixed_reserve(self) -> None:
         provider = _provider()
@@ -383,6 +387,18 @@ class TestRequestBudget:
         ]
         assert "customer content" not in caplog.text
         assert "[REDACTED:SECRET]" not in caplog.text
+        assert cast(FakeCoordinator, provider.coordinator).hooks.events == [
+            (
+                COUNT_UNAVAILABLE_EVENT,
+                {
+                    "provider": "anthropic",
+                    "model": MODEL,
+                    "source": "anthropic.messages.count_tokens",
+                    "category": "request_error",
+                    "error_type": "RuntimeError",
+                },
+            )
+        ]
 
     def test_malformed_count_diagnostic_is_once_per_model_and_category(
         self, caplog: pytest.LogCaptureFixture
@@ -414,3 +430,185 @@ class TestRequestBudget:
             "[PROVIDER] Anthropic token count unavailable for model "
             "claude-sonnet-5 (malformed_response); input count is unavailable."
         ]
+        assert len(cast(FakeCoordinator, provider.coordinator).hooks.events) == 1
+
+    @pytest.mark.parametrize(
+        ("outcome", "category", "metadata"),
+        [
+            (
+                429,
+                "rate_limit",
+                {
+                    "error_type": "RateLimitError",
+                    "status_code": 429,
+                    "request_id": "req_count_synthetic",
+                },
+            ),
+            (
+                400,
+                "request_error",
+                {
+                    "error_type": "BadRequestError",
+                    "status_code": 400,
+                    "request_id": "req_count_synthetic",
+                },
+            ),
+            ("timeout", "timeout", {"error_type": "APITimeoutError"}),
+            ("malformed", "malformed_response", {}),
+            ("valid", None, {}),
+        ],
+    )
+    def test_real_sdk_count_diagnostics_are_json_safe_without_extra_requests(
+        self,
+        outcome: int | str,
+        category: str | None,
+        metadata: dict[str, Any],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Exercise real SDK error mapping, using only an in-memory transport."""
+        private = "private-prompt-body-headers-key-config-exception"
+        paths: list[str] = []
+
+        def handle(request: httpx2.Request) -> httpx2.Response:
+            paths.append(request.url.path)
+            if outcome == "timeout":
+                raise httpx2.ReadTimeout(private, request=request)
+            if isinstance(outcome, int):
+                return httpx2.Response(
+                    outcome,
+                    headers={"request-id": "req_count_synthetic", "x-private": private},
+                    json={
+                        "type": "error",
+                        "error": {
+                            "type": (
+                                "rate_limit_error" if outcome == 429
+                                else "invalid_request_error"
+                            ),
+                            "message": private,
+                        },
+                    },
+                )
+            return httpx2.Response(
+                200, json={"input_tokens": private if outcome == "malformed" else 123}
+            )
+
+        async def run() -> tuple[dict[str, Any] | None, list[tuple[str, dict]]]:
+            provider = _provider(extra_request_params={"metadata": {"user_id": private}})
+            async with anthropic.AsyncAnthropic(
+                api_key=private,
+                max_retries=0,
+                http_client=httpx2.AsyncClient(
+                    transport=httpx2.MockTransport(handle), trust_env=False
+                ),
+            ) as client:
+                provider._client = client
+                request = _request().model_copy(
+                    update={"messages": [Message(role="user", content=private)]}
+                )
+                before = request.model_dump()
+                result = await provider.request_budget(request, context_estimate=200_000)
+                assert request.model_dump() == before
+                return result, cast(FakeCoordinator, provider.coordinator).hooks.events
+
+        result, events = asyncio.run(run())
+
+        assert paths == ["/v1/messages/count_tokens"]
+        if category is None:
+            assert result is not None
+            assert result["measurement"]["input_tokens"] == 123
+            assert events == []
+        else:
+            assert result is None
+            assert events == [
+                (
+                    COUNT_UNAVAILABLE_EVENT,
+                    {
+                        "provider": "anthropic",
+                        "model": MODEL,
+                        "source": "anthropic.messages.count_tokens",
+                        "category": category,
+                        **metadata,
+                    },
+                )
+            ]
+        serialized = json.dumps(events)
+        assert json.loads(serialized) == [[name, data] for name, data in events]
+        assert private not in serialized
+        assert private not in caplog.text
+
+    @pytest.mark.parametrize("with_coordinator", [False, True])
+    def test_missing_or_failing_diagnostic_observer_preserves_unavailable(
+        self, with_coordinator: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        provider = _provider()
+        count = AsyncMock(side_effect=RuntimeError("private-count-error"))
+        provider.client.messages.count_tokens = count
+        create = AsyncMock()
+        provider.client.messages.with_raw_response.create = create
+        emit = AsyncMock(side_effect=RuntimeError("private-observer-error"))
+        provider.coordinator = (
+            cast(ModuleCoordinator, SimpleNamespace(hooks=SimpleNamespace(emit=emit)))
+            if with_coordinator else None
+        )
+
+        assert asyncio.run(
+            provider.request_budget(_request(), context_estimate=200_000)
+        ) is None
+
+        count.assert_awaited_once()
+        create.assert_not_called()
+        assert emit.await_count == int(with_coordinator)
+        assert "private-count-error" not in caplog.text
+        assert "private-observer-error" not in caplog.text
+
+    def test_outer_deadline_timeout_is_captured_without_waiting(self, monkeypatch) -> None:
+        provider = _provider()
+        count = AsyncMock()
+        provider.client.messages.count_tokens = count
+
+        async def expired(awaitable, *, timeout):
+            assert timeout == 5.0
+            awaitable.close()
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr(asyncio, "wait_for", expired)
+        assert asyncio.run(
+            provider.request_budget(_request(), context_estimate=200_000)
+        ) is None
+        assert count.call_count == 1
+        assert count.await_count == 0
+        assert cast(FakeCoordinator, provider.coordinator).hooks.payload_for(
+            COUNT_UNAVAILABLE_EVENT
+        ) == {
+            "provider": "anthropic",
+            "model": MODEL,
+            "source": "anthropic.messages.count_tokens",
+            "category": "timeout",
+            "error_type": "TimeoutError",
+        }
+
+    @pytest.mark.parametrize("cancel_at", ["count", "observer"])
+    def test_count_and_diagnostic_observer_cancellation_propagates(
+        self, cancel_at: str
+    ) -> None:
+        provider = _provider()
+        count = AsyncMock(
+            side_effect=(
+                asyncio.CancelledError() if cancel_at == "count"
+                else RuntimeError("private")
+            )
+        )
+        provider.client.messages.count_tokens = count
+        emit = AsyncMock(side_effect=asyncio.CancelledError())
+        provider.coordinator = cast(
+            ModuleCoordinator, SimpleNamespace(hooks=SimpleNamespace(emit=emit))
+        )
+        create = AsyncMock()
+        provider.client.messages.with_raw_response.create = create
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(provider.request_budget(_request(), context_estimate=200_000))
+
+        count.assert_awaited_once()
+        create.assert_not_called()
+        assert emit.await_count == int(cancel_at == "observer")
