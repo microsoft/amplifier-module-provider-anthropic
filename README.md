@@ -621,8 +621,19 @@ beta headers. The dispatch-only `max_tokens` value is never sent to count.
 Count calls have a five-second deadline and no retry. Unknown model windows,
 count errors (including 429), timeouts, and malformed count responses return
 `None`; no byte-ratio, character heuristic, cached count, or other estimate is
-used. Each unavailable reason emits one safe warning per resolved model, without
-request or response data. An explicit `ChatRequest.max_output_tokens` remains
+used. Count failures emit a safe warning and a best-effort
+`provider:token_count_unavailable` hook event once per resolved model, category,
+exception class, and HTTP status. Request IDs do not affect suppression, so a
+changed failure is visible without recording every repeated request. Categories
+are `timeout`, `rate_limit`, `request_error`, and `malformed_response`. Mount
+contributes the event to `observability.events` so observers such as Context
+Intelligence discover it when session startup finalizes subscriptions. The event
+contains only provider, model, count source, category, and (when available) the
+exception class and SDK HTTP status/request ID. It never includes messages,
+bodies, headers, credentials, configuration, or raw exception text. Observer
+errors do not change the unavailable result; cancellation still propagates.
+Pre-count declines (such as unknown model windows) do not emit this event.
+An explicit `ChatRequest.max_output_tokens` remains
 the wire output cap even when adaptive thinking would otherwise enlarge an
 implicit cap.
 
