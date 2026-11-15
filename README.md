@@ -320,12 +320,34 @@ preparations refuse locally. It does not switch models or repair a prepared
 media candidate behind the host's count. Ambiguous transport loss is not
 automatically replayed, and no retry is permitted after a stream event.
 
+Prepared requests also retain a weak original-request binding to the actual
+selected SDK client, static credentials, endpoint, routing headers and HTTP
+configuration before the first await, including when no count budget is known.
+Changes require a new preparation: hooks and retry/backoff cannot silently adopt
+another client or account. The media path uses a private real-SDK facade with
+SDK retries, native content tracing and redirects disabled, and an observer-free
+HTTP facade that delegates only to the frozen original connection's transport.
+It checks the host witness again at the physical transport handoff. The shared
+provider client and ordinary text redirect policy are not mutated, regardless of
+which request type initializes it first.
+
+Dynamic credential providers, SDK middleware, HTTP auth/event hooks, URL
+userinfo, native content tracing and SDK body-debug logging are not qualified for
+prepared media and refuse before count/send. Custom SDK preparation callbacks
+are not run by the private facade; this is not arbitrary custom-client parity or
+a monitor for hostile in-process Python. SDK 1.12 (declared floor) and 1.17 are
+checked separately; no intermediate-version or live-account inference is implied.
+
 Raw opt-in diagnostics omit known image transport **before** `hooks.emit`, using
 an explicit not-retained marker. This is not a retrievable pixel reference.
 Thinking/signatures, tool input and arbitrary strings are not recursively parsed
 as images. Existing credential redaction still applies. Exception cause chains
 retain the existing Core debugging contract; this is not a guarantee about
 third-party traceback-local collectors.
+Raw SDK models are serialized with Pydantic warnings disabled before diagnostic
+copying, so an unsupported typed response cannot print its pixel-bearing repr
+in a serialization warning. Original exception causes may still contain private
+transport data: hosts must not format unprojected cause chains into public logs.
 
 `tests/test_media_foundation_candidate.py` additionally exercises an installed
 media-v1 Foundation candidate with the actual SDK and an in-process transport.

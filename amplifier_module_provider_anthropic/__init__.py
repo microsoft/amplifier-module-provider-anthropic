@@ -69,6 +69,8 @@ from anthropic._exceptions import (
 
 from ._cost import compute_cost
 from ._media import (
+    bind_media_connection,
+    bound_transport_client,
     VISION_MODELS, diagnostic_copy, has_capability, has_media, safe_error_text,
     tool_result_content, validate_attempt,
 )
@@ -3347,6 +3349,7 @@ class AnthropicProvider:
         )
         return await self._complete_chat_request(fallback_request, **fallback_kwargs)
 
+    @bind_media_connection
     async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """
         Generate completion from ChatRequest.
@@ -4754,6 +4757,9 @@ class AnthropicProvider:
 
     def _media_transport_client(self):
         """Prevent invisible SDK HTTP retries from bypassing the host witness."""
+        bound = bound_transport_client(self)
+        if bound is not None:
+            return bound
         client = self.client
         # The normal constructor already disables these. A supplied real SDK
         # client may not: use its supported view without mutating shared state.
@@ -4761,6 +4767,7 @@ class AnthropicProvider:
             return client.with_options(max_retries=0)
         return client
 
+    @bind_media_connection
     async def request_budget(
         self,
         request: ChatRequest,
@@ -5778,7 +5785,7 @@ class AnthropicProvider:
                     response_event["rate_limits"] = rate_limit_info
                 if self.raw:
                     response_event["raw"] = redact_secrets(
-                        diagnostic_copy(response.model_dump())
+                        diagnostic_copy(response)
                     )
                 await self.coordinator.hooks.emit("llm:response", response_event)
 

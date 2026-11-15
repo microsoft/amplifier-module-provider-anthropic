@@ -378,3 +378,200 @@ async def test_prepared_initial_text_native_declaration_keeps_exact_identity():
     await provider.complete(req)
     assert witness.calls == ["transport"]
     provider._client.messages.with_raw_response.create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["key", "endpoint", "client", "headers", "auth"])
+@pytest.mark.parametrize("cut", ["after_count", "request_hook", "retry_hook"])
+async def test_prepared_media_binds_actual_sdk_connection(mutation, cut):
+    """Host identity staying unchanged must not authorize a different SDK account."""
+    captured = []
+
+    def handle(http_request):
+        captured.append((http_request.url.path, http_request.headers.get("x-api-key")))
+        if http_request.url.path.endswith("/count_tokens"):
+            return httpx2.Response(200, json={"input_tokens": 20})
+        if cut == "retry_hook":
+            return httpx2.Response(429, json={"type": "error", "error": {
+                "type": "rate_limit_error", "message": "offline retry"}})
+        return httpx2.Response(200, json={
+            "id": "msg_offline", "type": "message", "role": "assistant",
+            "model": MODEL, "content": [], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 20, "output_tokens": 1},
+        })
+
+    req = request()
+    provider, _ = guarded_provider(req)
+    provider._runtime_model_info_cache[MODEL] = None  # No discovery in this wire fixture.
+    client_a = AsyncAnthropic(api_key="account-A", base_url="https://a.invalid",
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handle)))
+    client_b = AsyncAnthropic(api_key="account-B", base_url="https://b.invalid",
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handle)))
+    provider._client = client_a
+
+    def change():
+        if mutation == "key":
+            client_a.api_key = "account-B"
+        elif mutation == "endpoint":
+            client_a.base_url = "https://b.invalid"
+        elif mutation == "client":
+            provider._client = client_b
+        elif mutation == "headers":
+            client_a._custom_headers["x-api-key"] = "account-B"
+        else:
+            client_a._client.auth = httpx2.BasicAuth("other-account", "offline")
+
+    original_emit = provider.coordinator.hooks.emit
+
+    async def emit(name, payload):
+        if name == {"request_hook": "llm:request", "retry_hook": "provider:retry"}.get(cut):
+            change()
+        return await original_emit(name, payload)
+
+    provider.coordinator.hooks.emit = emit
+    try:
+        assert await provider.request_budget(req, context_estimate=100)
+        if cut == "after_count":
+            change()
+        with pytest.raises(InvalidRequestError, match="request not sent"):
+            await provider.complete(req)
+        assert captured == [("/v1/messages/count_tokens", "account-A")] + (
+            [("/v1/messages", "account-A")] if cut == "retry_hook" else []
+        )
+    finally:
+        await client_a.close()
+        await client_b.close()
+
+
+def test_diagnostic_model_dump_does_not_warn_before_copy():
+    import warnings
+    from anthropic.types import Message as SDKMessage
+    from amplifier_module_provider_anthropic._media import diagnostic_copy
+
+    response = SDKMessage.model_construct(
+        id="msg_offline", type="message", role="assistant", model=MODEL,
+        content=[{"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": ENCODED[0]}}],
+        stop_reason="end_turn", stop_sequence=None,
+        usage={"input_tokens": 1, "output_tokens": 1},
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        copied = diagnostic_copy(response)
+    assert caught == []
+    assert ENCODED[0] not in json.dumps(copied)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["count", "send"])
+async def test_sdk_first_use_await_cannot_change_prepared_account(monkeypatch, phase):
+    """Exercise a genuine SDK scheduling cut, not a mocked create/count method."""
+    import anthropic._base_client as sdk_base
+
+    captured = []
+
+    def handle(http_request):
+        captured.append(http_request.url.path)
+        return httpx2.Response(200, json=(
+            {"input_tokens": 20} if http_request.url.path.endswith("/count_tokens")
+            else reply()
+        ))
+
+    req = request()
+    provider, _ = guarded_provider(req)
+    provider._runtime_model_info_cache[MODEL] = None
+    client = AsyncAnthropic(api_key="account-A", max_retries=0,
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handle)))
+    provider._client = client
+    reached, release = asyncio.Event(), asyncio.Event()
+    original_asyncify = sdk_base.asyncify
+
+    def asyncify(function):
+        if function is not sdk_base.get_platform:
+            return original_asyncify(function)
+
+        async def platform():
+            reached.set()
+            await release.wait()
+            return "Linux"
+        return platform
+
+    try:
+        if phase == "send":
+            assert await provider.request_budget(req, context_estimate=100)
+        monkeypatch.setattr(sdk_base, "asyncify", asyncify)
+        task = asyncio.create_task(
+            provider.request_budget(req, context_estimate=100)
+            if phase == "count" else provider.complete(req)
+        )
+        await asyncio.wait_for(reached.wait(), 2)
+        client.api_key = "account-B"
+        release.set()
+        with pytest.raises(InvalidRequestError, match="request not sent"):
+            await task
+        assert captured == ([] if phase == "count" else ["/v1/messages/count_tokens"])
+    finally:
+        release.set()
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observer", ["sdk_middleware", "http_hook", "trace", "debug", "userinfo"])
+async def test_private_media_refuses_unqualified_observer_before_count(observer, monkeypatch):
+    import logging
+    captured = []
+    provider, _ = guarded_provider(request())
+    client = AsyncAnthropic(api_key="account-A",
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(
+            lambda r: captured.append(r) or httpx2.Response(200, json={"input_tokens": 20})
+        )))
+    provider._client = client
+    if observer == "sdk_middleware":
+        client._middleware = (lambda *args: captured.append(args),)
+    elif observer == "http_hook":
+        client._client.event_hooks["request"].append(lambda r: captured.append(r))
+    elif observer == "trace":
+        if not hasattr(client, "_open_telemetry"):
+            # Older SDK has no native tracing surface; a future/configured
+            # content observer must nevertheless refuse before receiving pixels.
+            client._open_telemetry = {"traces": {}}
+        client._open_telemetry["traces"]["content_mode"] = "content"
+    elif observer == "debug":
+        monkeypatch.setattr(logging.getLogger("anthropic._base_client"), "level", logging.DEBUG)
+    else:
+        client.base_url = "https://name:password@a.invalid"
+    try:
+        with pytest.raises(InvalidRequestError, match="request not sent"):
+            await provider.request_budget(request(), context_estimate=100)
+        assert captured == []
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text_first", [False, True])
+async def test_default_provider_client_order_does_not_change_media_or_text_policy(text_first, monkeypatch):
+    req = request()
+    provider, _ = guarded_provider(req)
+    provider._runtime_model_info_cache[MODEL] = None
+    captured = []
+    if text_first:
+        original = provider.client
+    else:
+        original = None
+
+    async def handle(_transport, http_request):
+        captured.append(http_request.url.path)
+        return httpx2.Response(200, json={"input_tokens": 20})
+
+    # Actual default client construction before/inside media scope; replace only
+    # the physical bottom transport, never SDK create/count or HTTP send.
+    monkeypatch.setattr(httpx2.AsyncHTTPTransport, "handle_async_request", handle)
+    try:
+        assert await provider.request_budget(req, context_estimate=100)
+        assert captured == ["/v1/messages/count_tokens"]
+        if text_first:
+            assert provider.client is original
+        assert provider.client._client.follow_redirects is True
+    finally:
+        await provider.close()
