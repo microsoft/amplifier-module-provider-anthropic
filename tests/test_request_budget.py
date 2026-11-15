@@ -629,6 +629,7 @@ class TestRequestBudget:
 
         async def run() -> None:
             coordinator = ModuleCoordinator()
+            coordinator.hooks.set_default_fields(session_id="count-diagnostic-offline")
             assert await coordinator.collect_contributions("observability.events") == []
             cleanup = await mount(coordinator, {
                 "api_key": "offline-placeholder", "default_model": MODEL,
@@ -677,9 +678,16 @@ class TestRequestBudget:
 
         asyncio.run(run())
         serialized = capture.read_text(encoding="utf-8")
-        assert [json.loads(line) for line in serialized.splitlines()] == [{
+        records = [json.loads(line) for line in serialized.splitlines()]
+        assert len(records) == 1
+        # Core enriches every hook payload with a timestamp, independently of
+        # provider metadata. Keep every other recorded field strictly checked.
+        timestamp = records[0]["data"].pop("timestamp")
+        assert isinstance(timestamp, str) and timestamp
+        assert records == [{
             "event": COUNT_UNAVAILABLE_EVENT,
             "data": {
+                "session_id": "count-diagnostic-offline",
                 "provider": "anthropic",
                 "model": MODEL,
                 "source": "anthropic.messages.count_tokens",
