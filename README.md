@@ -623,16 +623,33 @@ count errors (including 429), timeouts, and malformed count responses return
 `None`; no byte-ratio, character heuristic, cached count, or other estimate is
 used. Count failures emit a safe warning and a best-effort
 `provider:token_count_unavailable` hook event once per resolved model, category,
-exception class, and HTTP status. Request IDs do not affect suppression, so a
-changed failure is visible without recording every repeated request. Categories
+exception class, and HTTP status. HTTP400 also includes `diagnostic_version: 1`
+and closed `api_error_type`, `reason_code`, `schema_path`, `detail_status`
+scalars. Recognized details require a complete anchored validation grammar and
+an allowlisted structural path (indices become `[]`); arbitrary tool names,
+schema keys and echoed values are not copied. Missing/malformed, oversized
+(over 1024 characters), and unrecognized detail remain explicit. This is a
+prospective observation, not reconstruction of an older discarded API reason.
+Request IDs do not affect suppression. Distinct normalized reason/path/status
+combinations remain visible; at most 128 distinct diagnostic keys are retained
+and attempted per provider instance. Further distinct diagnostics are suppressed,
+including when model variety exhausts that bound. Categories
 are `timeout`, `rate_limit`, `request_error`, and `malformed_response`. Mount
 contributes the event to `observability.events` so observers such as Context
 Intelligence discover it when session startup finalizes subscriptions. The event
-contains only provider, model, count source, category, and (when available) the
-exception class and SDK HTTP status/request ID. It never includes messages,
-bodies, headers, credentials, configuration, or raw exception text. Observer
+contains provider, model, count source, category, optional closed detail fields,
+and (when available) exception class and SDK HTTP status/request ID. Existing
+model/request-ID fields are bounded ASCII identifiers, not secret detection:
+callers must not put secrets in those public identifiers. It does not copy API
+messages, bodies, headers, configuration values, or raw exception text. Observer
 errors do not change the unavailable result; cancellation still propagates.
 Pre-count declines (such as unknown model windows) do not emit this event.
+Suppression is recorded before optional observation; observer failure or
+cancellation can suppress a later identical diagnostic. It is not an audit or
+delivery guarantee. No app UI automatically displays the new fields: a
+subscribing observer such as Context Intelligence must capture them, and a
+supported bounded reader may inspect the safe event. This change does not add
+a count-only live action, authorize provider calls, or resume a halted session.
 An explicit `ChatRequest.max_output_tokens` remains
 the wire output cap even when adaptive thinking would otherwise enlarge an
 implicit cap.

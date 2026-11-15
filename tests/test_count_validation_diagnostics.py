@@ -43,6 +43,7 @@ async def exercise(bodies):
 @pytest.mark.parametrize("outer", [True, False])
 @pytest.mark.parametrize("message,path,reason", [
     ("thinking.type: Field required", "thinking.type", "required_field"),
+    ("thinking: Unable to extract tag using discriminator 'type'", "thinking", "missing_discriminator"),
     ("thinking.block_binding: Extra inputs are not permitted", "thinking.block_binding", "extra_field"),
     ("messages.987.content.12.signature: Input should be a valid string", "messages.[].content.[].signature", "invalid_type"),
     ("output_config.effort: Input should be a valid string", "output_config.effort", "invalid_type"),
@@ -103,3 +104,54 @@ def test_body_inspection_is_nonrecursive_and_does_not_stringify_arbitrary_object
     assert validation_detail({"message": Poison(), "type": "invalid_request_error"})["detail_status"] == "malformed"
     recursive = {}; recursive["error"] = recursive
     assert validation_detail(recursive)["detail_status"] == "malformed"
+
+
+@pytest.mark.parametrize("outer", [True, False])
+def test_parser_recognizes_both_exact_dictionary_envelopes(outer):
+    from amplifier_module_provider_anthropic._count_diagnostics import validation_detail
+    body = {"type": "invalid_request_error", "message": "thinking.type: Field required"}
+    if outer:
+        body = {"error": body}
+    assert validation_detail(body) == {"diagnostic_version": 1, "api_error_type": "invalid_request_error",
+        "reason_code": "required_field", "schema_path": "thinking.type", "detail_status": "recognized"}
+
+
+def test_diagnostic_key_and_output_budget_is_bounded():
+    provider = AnthropicProvider(api_key="synthetic", config={"default_model": "claude-fable-5-2"})
+    coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, coordinator)
+
+    async def run():
+        for index in range(140):
+            await provider._warn_count_unavailable(f"model-{index}", "request_error", RuntimeError(CANARY))
+
+    asyncio.run(run())
+    assert len(provider._count_unavailable_warning_categories) == 128
+    assert len(coordinator.hooks.events) == 128
+    assert CANARY not in json.dumps(coordinator.hooks.events)
+
+
+@pytest.mark.parametrize("value,maximum,expected", [
+    ("req_ok-123", 128, "req_ok-123"), ("x" * 128, 128, "x" * 128),
+    ("x" * 129, 128, None), ("not safe\n", 128, None), ("nonascii-é", 128, None),
+    (True, 128, None), (None, 128, None), ({"secret": CANARY}, 128, None),
+])
+def test_existing_identifier_fields_are_bounded_not_coerced(value, maximum, expected):
+    from amplifier_module_provider_anthropic._count_diagnostics import bounded_identifier
+    assert bounded_identifier(value, maximum) == expected
+
+
+def test_throwing_status_attributes_cannot_change_count_failure_result(caplog):
+    class BrokenStatus(anthropic.APIStatusError):
+        def __getattribute__(self, name):
+            if name == "status_code":
+                raise RuntimeError(CANARY)
+            return super().__getattribute__(name)
+
+    error = BrokenStatus("private", response=httpx2.Response(400,
+        request=httpx2.Request("POST", "https://synthetic.invalid/")), body={})
+    provider = AnthropicProvider(api_key="synthetic")
+    coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, coordinator)
+    asyncio.run(provider._warn_count_unavailable("claude-fable-5-2", "request_error", error))
+    assert coordinator.hooks.events == [] and CANARY not in caplog.text

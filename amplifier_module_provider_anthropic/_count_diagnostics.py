@@ -18,6 +18,7 @@ _PATH = re.compile(
     r"|tools\.[0-9]{1,9}\.(?:name|input_schema))", re.ASCII)
 _REASONS = {
     "Field required": "required_field",
+    "Unable to extract tag using discriminator 'type'": "missing_discriminator",
     "Extra inputs are not permitted": "extra_field",
     "Input should be a valid string": "invalid_type",
     "Input should be a valid integer": "invalid_type",
