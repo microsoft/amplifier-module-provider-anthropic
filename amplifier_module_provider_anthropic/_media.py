@@ -18,6 +18,7 @@ from typing import Any
 
 from amplifier_core.llm_errors import InvalidRequestError
 from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
+import httpx2
 from pydantic import BaseModel
 
 
@@ -58,6 +59,29 @@ def _method_key(value: Any) -> tuple[int, int]:
     return id(getattr(value, "__self__", None)), id(getattr(value, "__func__", value))
 
 
+def _transport_state(transport: Any) -> tuple[Any, ...] | None:
+    if transport is None:
+        return None
+    if type(transport) not in (httpx2.AsyncHTTPTransport, httpx2.MockTransport):
+        _refuse_connection()
+    execution = {
+        name for base in type(transport).__mro__
+        for name, value in vars(base).items() if callable(value)
+    }
+    if execution.intersection(vars(transport)):
+        # A production/mounted transport wrapper runs AFTER HTTP client guards.
+        # Refuse before it can observe the private request, not after sending.
+        _refuse_connection()
+    if type(transport) is httpx2.AsyncHTTPTransport:
+        if getattr(getattr(transport, "_pool", None), "_retries", None) != 0:
+            _refuse_connection()
+    return (
+        id(transport),
+        _method_key(transport.handle_async_request),
+        _method_key(transport.aclose),
+    )
+
+
 def _connection(provider: Any) -> tuple[Any, ...]:
     if provider._client is None and provider._api_key is None:
         return ("unconfigured",)
@@ -67,7 +91,8 @@ def _connection(provider: Any) -> tuple[Any, ...]:
         return (id(client),)
     http = client._client
     if (
-        type(client.api_key) is not str or not client.api_key
+        http.is_closed
+        or type(client.api_key) is not str or not client.api_key
         or getattr(client, "credentials", None) is not None
         or getattr(client, "_token_cache", None) is not None
         or getattr(client, "_custom_auth", None) is not None
@@ -84,7 +109,9 @@ def _connection(provider: Any) -> tuple[Any, ...]:
         # bind selected account identity to the physical request.
         _refuse_connection()
     return (
-        id(client), id(http), id(http._transport),
+        id(client), id(http), _transport_state(http._transport),
+        tuple((id(pattern), _transport_state(transport))
+              for pattern, transport in http._mounts.items()),
         _digest({
             "key": client.api_key, "token": client.auth_token,
             "url": str(client.base_url),
