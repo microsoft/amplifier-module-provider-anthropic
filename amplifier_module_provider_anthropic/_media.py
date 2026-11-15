@@ -117,6 +117,8 @@ def _connection(provider: Any) -> tuple[Any, ...]:
             "content_mode", "metadata_only"
         ) != "metadata_only"
         or http.auth is not None
+        or getattr(http._transport_for_url, "__func__", None)
+        is not httpx2.AsyncClient._transport_for_url
         or any(http.event_hooks.values())
         or client.base_url.username or client.base_url.password
         or logging.getLogger("anthropic._base_client").isEnabledFor(logging.DEBUG)
@@ -142,7 +144,9 @@ def _connection(provider: Any) -> tuple[Any, ...]:
             "_prepare_options", "_prepare_request", "_build_request",
             "post", "request",
         )),
-        *(_method_key(getattr(http, name)) for name in ("send", "_send_single_request")),
+        *(_method_key(getattr(http, name)) for name in (
+            "send", "_send_single_request", "_transport_for_url",
+        )),
     )
 
 
@@ -189,7 +193,18 @@ class _BoundTransport:
                 self.scope.provider.coordinator, self.scope.request,
                 self.scope.purpose, self.scope.options,
             )
+        # A host validator is itself an extension point. Bind again after it,
+        # then qualify the actual routing result before exposing private bytes.
+        self.scope.check()
         transport = original._client._transport_for_url(request.url)
+        if not any(
+            transport is accepted
+            for accepted in (
+                original._client._transport, *original._client._mounts.values(),
+            )
+        ):
+            _refuse_connection()
+        _transport_state(transport)
         return await transport.handle_async_request(request)
 
     async def aclose(self):

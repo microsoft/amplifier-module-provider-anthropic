@@ -24,6 +24,74 @@ def sdk_capture(captured, key="account-A"):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mounted", [False, True])
+@pytest.mark.parametrize("cut", [
+    "before_count", "after_count", "request_hook", "platform_count", "platform_send",
+])
+async def test_original_transport_selector_cannot_invoke_unbound_transport(monkeypatch, mounted, cut):
+    import anthropic._base_client as sdk_base
+
+    physical, observed, armed = [], [], []
+    client = sdk_capture(physical)
+    http = client._client
+    if mounted:
+        from httpx2._utils import URLPattern
+        http._mounts[URLPattern("https://")] = http._transport
+    req = request()
+    provider, _ = guarded_provider(req)
+    provider._runtime_model_info_cache[MODEL] = None
+    provider._client = client
+
+    def alternate(wire):
+        observed.append(True)
+        return httpx2.Response(200, json=(
+            {"input_tokens": 20} if wire.url.path.endswith("/count_tokens") else reply()
+        ))
+
+    unbound = httpx2.MockTransport(alternate)
+    def mutate():
+        armed.append(len(physical))
+        http._transport_for_url = lambda url: unbound
+    asyncify = sdk_base.asyncify
+    def platform(function):
+        real = asyncify(function)
+        async def after_wait(*args, **kwargs):
+            value = await real(*args, **kwargs)
+            mutate()
+            return value
+        return after_wait
+    emit = provider.coordinator.hooks.emit
+    async def hook(name, payload):
+        if name == "llm:request":
+            if cut == "request_hook":
+                mutate()
+            else:
+                monkeypatch.setattr(sdk_base, "asyncify", platform)
+        return await emit(name, payload)
+    try:
+        if cut == "before_count":
+            mutate()
+        elif cut == "platform_count":
+            monkeypatch.setattr(sdk_base, "asyncify", platform)
+        else:
+            assert await provider.request_budget(req, context_estimate=100)
+            if cut == "after_count":
+                mutate()
+            else:
+                provider.coordinator.hooks.emit = hook
+        with pytest.raises(InvalidRequestError):
+            if cut in ("before_count", "platform_count"):
+                await provider.request_budget(req, context_estimate=100)
+            else:
+                await provider.complete(req)
+        assert observed == [] and len(armed) == 1
+        assert len(physical) == armed[0]
+    finally:
+        await client.close()
+        await unbound.aclose()
+
+
+@pytest.mark.asyncio
 async def test_new_facade_does_not_reread_constructor_routing_environment(monkeypatch):
     captured = []
     req = request()
