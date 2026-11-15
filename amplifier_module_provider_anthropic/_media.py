@@ -110,6 +110,7 @@ class _ConnectionScope:
         self.transport_client: AsyncAnthropic | None = None
         self.purpose: str | None = None
         self.options: dict[str, Any] = {}
+        self.expected_headers: dict[str, str] | None = None
 
     def check(self) -> None:
         actual = _connection(self.provider)
@@ -133,10 +134,10 @@ class _BoundTransport:
             or request.url.username or request.url.password
         ):
             _refuse_connection()
-        expected_headers = dict(original._client.headers)
-        expected_headers.update(original.default_headers)
-        expected_headers = {key.lower(): value for key, value in expected_headers.items()}
-        for key in ("x-api-key", "authorization", "anthropic-organization-id",
+        expected_headers = self.scope.expected_headers
+        if expected_headers is None:
+            _refuse_connection()
+        for key in ("host", "x-api-key", "authorization", "anthropic-organization-id",
                     "anthropic-workspace-id"):
             if request.headers.get(key) != expected_headers.get(key):
                 _refuse_connection()
@@ -168,6 +169,16 @@ class _BoundAnthropic(AsyncAnthropic):
         self._media_binding.check()
         result = await super()._prepare_options(options)
         self._media_binding.check()
+        # Capture the actual SDK's authorized request-level header layering
+        # after assembly, not just constructor defaults.
+        expected = dict(self._client.headers)
+        expected.update(self._build_headers(result))
+        self._media_binding.expected_headers = {
+            key.lower(): value for key, value in expected.items()
+        }
+        self._media_binding.expected_headers.setdefault(
+            "host", self.base_url.netloc.decode("ascii")
+        )
         return result
 
     async def _prepare_request(self, request):
@@ -198,6 +209,9 @@ def bound_transport_client(provider: Any) -> Any:
                 params=original._client.params, cookies=original._client.cookies,
             ),
         )
+        # SDK constructors also read ANTHROPIC_CUSTOM_HEADERS even with
+        # explicit credentials. Do not re-admit ambient routing after fit.
+        client._custom_headers = dict(original._custom_headers)
         client._media_binding = scope
         scope.transport_client = client
     return scope.transport_client
@@ -218,7 +232,13 @@ def bind_media_connection(operation):
     @wraps(operation)
     async def bound(provider, request, *args, **kwargs):
         if not (has_refs(request) or has_capability(provider.coordinator)):
-            return await operation(provider, request, *args, **kwargs)
+            # A plain nested completion is not part of its caller's private
+            # capability, including when it targets another provider/account.
+            token = _CONNECTION_SCOPE.set(None)
+            try:
+                return await operation(provider, request, *args, **kwargs)
+            finally:
+                _CONNECTION_SCOPE.reset(token)
         scope = _ConnectionScope(provider, request)
         token = _CONNECTION_SCOPE.set(scope)
         try:
@@ -235,7 +255,11 @@ def bind_media_connection(operation):
                 scope.connection,
             )
             result = await operation(provider, request, *args, **kwargs)
-            scope.check()
+            # Count results are still pre-send authority. A completed transport
+            # must not be relabeled "not sent" by a later response hook; the
+            # original retained binding will refuse the next use instead.
+            if operation.__name__ == "request_budget":
+                scope.check()
             return result
         finally:
             try:
