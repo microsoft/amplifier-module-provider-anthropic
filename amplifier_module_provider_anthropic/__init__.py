@@ -99,6 +99,7 @@ from ._computer_toolset import (
     translate_tools,
     validate_member,
 )
+from ._count_diagnostics import bounded_identifier, validation_detail
 from ._thinking import (
     NATIVE_PROVENANCE,
     PROVENANCE_KEY,
@@ -1435,7 +1436,7 @@ class AnthropicProvider:
 
         self._overflow_feedback_owner = object()
         self._count_unavailable_warning_categories: set[
-            tuple[str, str, str | None, int | None]
+            tuple
         ] = set()
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
@@ -4756,32 +4757,45 @@ class AnthropicProvider:
     ) -> None:
         """Capture distinct safe failures, never keying suppression by request ID."""
         try:
-            error_type = type(error).__name__ if error is not None else None
+            safe_model = bounded_identifier(model, 128) or "unknown"
+            error_type = bounded_identifier(type(error).__name__, 64) if error is not None else None
             status_code = (
                 error.status_code if isinstance(error, AnthropicAPIStatusError) else None
             )
-            key = (model, category, error_type, status_code)
+            status_code = status_code if type(status_code) is int and 100 <= status_code <= 599 else None
+            detail = (validation_detail(error.body) if status_code == 400
+                      and isinstance(error, AnthropicAPIStatusError) else {})
+            key = (safe_model, category, error_type, status_code,
+                   detail.get("reason_code"), detail.get("schema_path"), detail.get("detail_status"),
+                   detail.get("api_error_type"))
             if key in self._count_unavailable_warning_categories:
+                return
+            # A provider can select arbitrary model IDs over its lifetime.
+            # Bound both retained keys and emitted distinct diagnostics; after
+            # saturation the optional observer is silent, never a retry path.
+            if len(self._count_unavailable_warning_categories) >= 128:
                 return
             self._count_unavailable_warning_categories.add(key)
             logger.warning(
                 "[PROVIDER] Anthropic token count unavailable for model %s (%s); "
                 "input count is unavailable.",
-                model,
+                safe_model,
                 category,
             )
             payload: dict[str, Any] = {
                 "provider": "anthropic",
-                "model": model,
+                "model": safe_model,
                 "source": "anthropic.messages.count_tokens",
                 "category": category,
+                **detail,
             }
             if error is not None:
                 payload["error_type"] = error_type
                 if isinstance(error, AnthropicAPIStatusError):
                     payload["status_code"] = status_code
-                    if isinstance(error.request_id, str):
-                        payload["request_id"] = error.request_id
+                    request_id = bounded_identifier(error.request_id, 128)
+                    if request_id is not None:
+                        payload["request_id"] = request_id
             await self._emit_provider_event(PROVIDER_TOKEN_COUNT_UNAVAILABLE, payload)
         except Exception:  # noqa: BLE001 -- optional diagnostics cannot change None
             # Never log the observer exception: it may contain private data.
