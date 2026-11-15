@@ -383,8 +383,12 @@ HTTPS endpoint and documented preserved-thinking models (Fable/Mythos 5.1–5.2,
 Opus/Sonnet/Haiku 5.5), it sends
 `thinking.block_binding.prefix_mismatch_behavior: drop_block` with
 `thinking-binding-controls-2026-08-01`. This lets the server remove only failing
-thinking and its dependent chain; unchanged-prefix reasoning survives. Fable
-5.2 accepts this control without specifying a thinking mode. Sonnet/Haiku 5.5
+thinking and its dependent chain; unchanged-prefix reasoning survives. When
+automatic binding materializes a thinking object on a supported first-party
+model, an omitted mode is written as `type: adaptive` for both count and send.
+This preserves the documented adaptive default while satisfying the explicit
+object's discriminator; it does not change effort or the output allowance.
+Explicit native bindings and modes remain untouched. Sonnet/Haiku 5.5
 require adaptive mode; the provider does not change disabled/between-tools modes
 to enable the control. Unsupported modes/endpoints retain their native behavior,
 including nonretryable errors rather than speculative stripping or retries.
@@ -396,6 +400,11 @@ contract, or YAML `null` to leave vendor defaults unchanged. An explicit native
 `extra_request_params.extra_body.thinking` wins, including `error`, `{}` or `null`.
 Explicit null thinking and an explicitly emptied beta header are not repopulated.
 No API compatibility is claimed for custom endpoints.
+
+The [model configuration table](https://platform.claude.com/docs/en/build-with-claude/thinking#configuring-thinking)
+documents adaptive as both Fable 5.2's default and an accepted explicit mode.
+Offline transport checks establish the request shape and count/send parity,
+not the cause of any historical HTTP400 or successful live recovery.
 
 Responses retain the vendor's `input_transformations` in
 `metadata.anthropic_input_transformations`, including empty arrays. Streaming
