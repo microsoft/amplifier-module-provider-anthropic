@@ -467,10 +467,12 @@ class TestRequestBudget:
     ) -> None:
         """Exercise real SDK error mapping, using only an in-memory transport."""
         private = "private-prompt-body-headers-key-config-exception"
+        model = "claude-fable-5-2"
         paths: list[str] = []
 
         def handle(request: httpx2.Request) -> httpx2.Response:
             paths.append(request.url.path)
+            assert json.loads(request.content)["model"] == model
             if outcome == "timeout":
                 raise httpx2.ReadTimeout(private, request=request)
             if isinstance(outcome, int):
@@ -493,7 +495,10 @@ class TestRequestBudget:
             )
 
         async def run() -> tuple[dict[str, Any] | None, list[tuple[str, dict]]]:
-            provider = _provider(extra_request_params={"metadata": {"user_id": private}})
+            provider = _provider(
+                default_model=model,
+                extra_request_params={"metadata": {"user_id": private}},
+            )
             async with anthropic.AsyncAnthropic(
                 api_key=private,
                 max_retries=0,
@@ -524,7 +529,7 @@ class TestRequestBudget:
                     COUNT_UNAVAILABLE_EVENT,
                     {
                         "provider": "anthropic",
-                        "model": MODEL,
+                        "model": model,
                         "source": "anthropic.messages.count_tokens",
                         "category": category,
                         **metadata,
