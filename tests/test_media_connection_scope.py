@@ -187,6 +187,93 @@ async def test_normal_text_open_then_media_preserves_pool_ownership(monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mounted", [False, True])
+@pytest.mark.parametrize("after_count", [False, True])
+async def test_pool_execution_wrapper_never_receives_private_request(mounted, after_count):
+    import httpcore2
+    writes, observers = [], []
+    body = json.dumps(reply()).encode()
+    count_body = b'{"input_tokens":20}'
+    class Stream(httpcore2.AsyncMockStream):
+        async def write(self, buffer, timeout=None):
+            writes.append(buffer)
+    class Backend(httpcore2.AsyncMockBackend):
+        async def connect_tcp(self, *args, **kwargs):
+            data = count_body if not writes else body
+            packet = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                      b"Connection: close\r\nContent-Length: "
+                      + str(len(data)).encode() + b"\r\n\r\n" + data)
+            return Stream([packet])
+    transport = httpx2.AsyncHTTPTransport()
+    pool = transport._pool
+    pool._network_backend = Backend([])
+    http = httpx2.AsyncClient(trust_env=False,
+        **({"mounts": {"https://": transport}} if mounted else {"transport": transport}))
+    client = AsyncAnthropic(api_key="account-A", max_retries=0, http_client=http)
+    req = request()
+    provider, _ = guarded_provider(req)
+    provider._runtime_model_info_cache[MODEL] = None
+    provider._client = client
+    original = pool.handle_async_request
+    async def observer(wire):
+        observers.append(True)
+        return await original(wire)
+    try:
+        if after_count:
+            assert await provider.request_budget(req, context_estimate=100)
+        pool.handle_async_request = observer
+        before = len(writes)
+        with pytest.raises(InvalidRequestError, match="request not sent"):
+            if after_count:
+                await provider.complete(req)
+            else:
+                await provider.request_budget(req, context_estimate=100)
+        assert observers == [] and len(writes) == before
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mounted", [False, True])
+async def test_real_production_pool_network_backend_count_send_and_owner_close(mounted):
+    import httpcore2
+    writes, streams = [], []
+    class Stream(httpcore2.AsyncMockStream):
+        async def write(self, buffer, timeout=None):
+            writes.append(buffer)
+    class Backend(httpcore2.AsyncMockBackend):
+        async def connect_tcp(self, *args, **kwargs):
+            data = (b'{"input_tokens":20}' if not streams
+                    else json.dumps(reply()).encode())
+            packet = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                      b"Connection: close\r\nContent-Length: "
+                      + str(len(data)).encode() + b"\r\n\r\n" + data)
+            stream = Stream([packet])
+            streams.append(stream)
+            return stream
+    transport = httpx2.AsyncHTTPTransport()
+    pool = transport._pool
+    pool._network_backend = Backend([])
+    client = AsyncAnthropic(api_key="account-A", max_retries=0,
+        http_client=httpx2.AsyncClient(trust_env=False,
+            **({"mounts": {"https://": transport}} if mounted else {"transport": transport})))
+    req = request()
+    provider, _ = guarded_provider(req)
+    provider._runtime_model_info_cache[MODEL] = None
+    provider._client = client
+    try:
+        assert type(pool) is httpcore2.AsyncConnectionPool
+        assert await provider.request_budget(req, context_estimate=100)
+        await provider.complete(req)
+        assert len(streams) == 2 and any(b"/v1/messages/count_tokens" in w for w in writes)
+        assert any(b"POST /v1/messages " in w for w in writes)
+        assert not client.is_closed()
+        assert client._client._transport_for_url(client.base_url) is transport
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_response_hook_drift_does_not_relabel_completed_send_as_not_sent():
     captured = []
     req = request()

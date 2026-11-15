@@ -19,6 +19,7 @@ from typing import Any
 from amplifier_core.llm_errors import InvalidRequestError
 from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 import httpx2
+import httpcore2
 from pydantic import BaseModel
 
 
@@ -73,12 +74,27 @@ def _transport_state(transport: Any) -> tuple[Any, ...] | None:
         # Refuse before it can observe the private request, not after sending.
         _refuse_connection()
     if type(transport) is httpx2.AsyncHTTPTransport:
-        if getattr(getattr(transport, "_pool", None), "_retries", None) != 0:
+        pool = getattr(transport, "_pool", None)
+        if type(pool) not in (
+            httpcore2.AsyncConnectionPool, httpcore2.AsyncHTTPProxy, httpcore2.AsyncSOCKSProxy,
+        ):
             _refuse_connection()
+        pool_execution = {
+            name for base in type(pool).__mro__
+            for name, value in vars(base).items() if callable(value)
+        }
+        if pool_execution.intersection(vars(pool)) or pool._retries != 0:
+            _refuse_connection()
+        pool_state = (
+            id(pool), _method_key(pool.handle_async_request), _method_key(pool.aclose),
+        )
+    else:
+        pool_state = None
     return (
         id(transport),
         _method_key(transport.handle_async_request),
         _method_key(transport.aclose),
+        pool_state,
     )
 
 
