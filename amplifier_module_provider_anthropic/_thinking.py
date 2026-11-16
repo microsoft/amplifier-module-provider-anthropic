@@ -106,6 +106,13 @@ def configure_binding(
         return
     if not explicit:
         thinking = deepcopy(thinking) if isinstance(thinking, dict) else {}
+        # Omission of the entire thinking parameter selects adaptive mode on
+        # these models. Once we materialize an object for binding controls,
+        # use that same documented mode explicitly for the discriminated
+        # count/send schemas. Never rewrite an explicit native binding/mode or
+        # invent a mode for an unverified custom endpoint/model.
+        if supports_binding(model, base_url):
+            thinking.setdefault("type", "adaptive")
         thinking["block_binding"] = {
             "prefix_mismatch_behavior": "drop_block" if policy == "auto" else policy
         }

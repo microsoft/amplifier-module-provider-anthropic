@@ -4508,8 +4508,8 @@ class AnthropicProvider:
                 elif request_caps.thinking_always_on:
                     reason = (
                         f"{params['model']} always thinks and manages its own "
-                        "budget — the API rejects a thinking param on this "
-                        "model, so no budget can be sent and this value is "
+                        "budget — no manual thinking budget is sent for this "
+                        "model, so this value is "
                         "not used for anything"
                     )
                 elif resolved_thinking_type == "adaptive":

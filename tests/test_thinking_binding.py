@@ -58,6 +58,7 @@ def assemble(p, r, **options):
 def test_documented_models_receive_native_selective_control(model):
     params = assemble(provider(default_model=model), request())
     assert params["thinking"]["block_binding"] == DROP
+    assert params["thinking"]["type"] == "adaptive"
     assert BINDING_BETA in params["extra_headers"]["anthropic-beta"].split(",")
 
 
@@ -168,12 +169,39 @@ def test_null_policy_leaves_vendor_default_and_request_override_wins():
     assert "block_binding" not in assemble(p, request(), thinking_prefix_mismatch_behavior=None).get("thinking", {})
 
 
+@pytest.mark.parametrize("policy", ["auto", "drop_block", "error"])
+@pytest.mark.parametrize("extra_body", [False, True])
+def test_implicit_binding_object_uses_documented_default_mode(policy, extra_body):
+    params = {"model": MODEL}
+    if extra_body:
+        params["extra_body"] = {"thinking": {"display": "omitted"}}
+    configure_binding(params, base_url="https://api.anthropic.com", policy=policy)
+    effective = params["extra_body"]["thinking"] if extra_body else params["thinking"]
+    assert effective["type"] == "adaptive"
+    assert effective["block_binding"] == {
+        "prefix_mismatch_behavior": "drop_block" if policy == "auto" else policy}
+    if extra_body:
+        assert effective["display"] == "omitted"
+
+
 @pytest.mark.parametrize("thinking", [None, {"type":"disabled"}, {"block_binding":None},
     {"block_binding":{}}, {"type":"adaptive", "block_binding":{"prefix_mismatch_behavior":"error"}}])
 def test_explicit_native_controls_are_preserved_by_presence(thinking):
     params = {"model":MODEL, "thinking":deepcopy(thinking)}
     configure_binding(params, base_url="https://api.anthropic.com")
     assert params["thinking"] == thinking
+
+
+@pytest.mark.parametrize("extra_body", [False, True])
+def test_explicit_null_mode_is_not_rewritten_by_automatic_binding(extra_body):
+    params = {"model": MODEL}
+    target = params.setdefault("extra_body", {}) if extra_body else params
+    target["thinking"] = {"type": None}
+    configure_binding(params, base_url="https://api.anthropic.com")
+    if extra_body:
+        assert target["thinking"] == {"type": None}
+    effective = params["extra_body"]["thinking"] if extra_body else params["thinking"]
+    assert effective == {"type": None, "block_binding": DROP}
 
 
 @pytest.mark.parametrize("beta", ["", None, 17])

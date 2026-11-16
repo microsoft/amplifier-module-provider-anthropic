@@ -868,11 +868,15 @@ def test_always_on_models_do_not_gain_manual_thinking_mode_or_budget(
         model=model,
     )
 
-    assert not {"type", "budget_tokens"}.intersection(params.get("thinking", {}))
+    assert "budget_tokens" not in params.get("thinking", {})
     if model == FABLE_MODEL:
-        assert params["thinking"]["block_binding"] == {
-            "prefix_mismatch_behavior": "drop_block"
+        assert params["thinking"] == {
+            "type": "adaptive",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
         }
+    else:
+        assert "thinking" not in params
+    assert params["max_tokens"] == 123
 
 
 def test_opus55_real_sdk_mock_transport_receives_serialized_safe_request() -> None:

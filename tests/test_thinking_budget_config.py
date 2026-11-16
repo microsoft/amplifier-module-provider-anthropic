@@ -287,14 +287,16 @@ class TestConfigBudgetReachesTheWire:
         with caplog.at_level(logging.WARNING):
             params = _run(provider, reasoning_effort="high")
 
-        assert not {"type", "budget_tokens"}.intersection(params.get("thinking", {}))
-        assert params["thinking"]["block_binding"] == {
-            "prefix_mismatch_behavior": "drop_block"
+        assert params["thinking"] == {
+            "type": "adaptive",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
         }
         warnings = _budget_warnings(caplog)
         assert warnings
         assert "always thinks" in warnings[0]
         assert "max_tokens=" not in warnings[0]
+        assert "rejects a thinking param" not in warnings[0]
+        assert "manual thinking budget" in warnings[0]
 
     def test_zero_config_budget_is_not_silently_ignored(
         self, caplog: pytest.LogCaptureFixture
