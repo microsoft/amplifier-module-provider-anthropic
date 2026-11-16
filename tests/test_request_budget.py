@@ -535,6 +535,9 @@ class TestRequestBudget:
                         "source": "anthropic.messages.count_tokens",
                         "category": category,
                         **metadata,
+                        **({"diagnostic_version": 1, "api_error_type": "invalid_request_error",
+                            "reason_code": "unknown", "schema_path": "unknown",
+                            "detail_status": "unrecognized"} if outcome == 400 else {}),
                     },
                 )
             ]
