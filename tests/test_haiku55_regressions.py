@@ -546,8 +546,8 @@ def recording_client(seen, *, zero_usage=False):
     ([MODEL, "claude-sonnet-5-5"], False),
     ([MODEL], False),
     (["claude-sonnet-5-5", MODEL], True),
-    ([MODEL, "claude-mythos-5-2", MODEL], False),
-    (["claude-mythos-5-2", MODEL], True),
+    ([MODEL, "claude-mythos-5-2-latest", MODEL], False),
+    (["claude-mythos-5-2-latest", MODEL], True),
 ])
 def test_public_mount_cost_contribution_stays_unknown(models, zero):
     async def run():
@@ -565,7 +565,7 @@ def test_public_mount_cost_contribution_stays_unknown(models, zero):
             subtotal = Decimal("0")
             for model in models:
                 response = await p.complete(request(), model=model)
-                if model == "claude-mythos-5-2":
+                if model == "claude-mythos-5-2-latest":
                     unknown = True
                     assert response.usage.cost_usd is None
                     assert response.metadata["anthropic_cost_unavailable"] == (

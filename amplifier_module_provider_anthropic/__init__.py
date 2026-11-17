@@ -63,11 +63,78 @@ from anthropic import AuthenticationError as AnthropicAuthenticationError
 from anthropic import BadRequestError as AnthropicBadRequestError
 from anthropic import RateLimitError as AnthropicRateLimitError
 from anthropic import Timeout as AnthropicTimeout
+from anthropic._streaming import SSEDecoder
+try:
+    import httpx2 as _anthropic_httpx
+except ImportError:  # Older supported Anthropic SDK releases use httpx.
+    import httpx as _anthropic_httpx
 from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
-from ._cost import compute_cost_result, get_rates, pricing_metadata, resolve_inference_geo
+from ._cost import CostResult, compute_cost_result, get_rates, pricing_metadata, resolve_inference_geo
+
+
+def _cache_evidence_reason(usage: Mapping[str, Any]) -> str | None:
+    """Validate exact Mythos cache evidence without SDK numeric coercion."""
+    if any(
+        value is not None and (type(value) is not int or value < 0)
+        for value in (
+            usage.get("cache_read_input_tokens"),
+            usage.get("cache_creation_input_tokens"),
+        )
+    ):
+        return "invalid_usage_counts"
+    split = usage.get("cache_creation")
+    if split is not None:
+        values = [
+            split.get(key) if isinstance(split, Mapping) else getattr(split, key, None)
+            for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
+        ]
+        if any(value is None for value in values):
+            return "cache_write_ttl_split_incomplete"
+        if any(type(value) is not int or value < 0 for value in values):
+            return "invalid_usage_counts"
+    return None
+
+
+class _CacheEvidenceStream:
+    """Observe HTTP-decoded cache fields before SDK parsing/coercion."""
+
+    def __init__(self, source: Callable):
+        self.source = source
+        self.decoder = SSEDecoder()
+        self._pending = b""
+        self.model = None
+        self.usage: dict[str, Any] = {}
+        self.reason: str | None = None
+
+    async def aiter_bytes(self, chunk_size: int | None = None):
+        async for chunk in self.source(chunk_size=chunk_size):
+            # Decode incrementally with the SDK's SSE decoder. Do not buffer
+            # content or replace its normal error/event/accumulation behavior.
+            for line in chunk.splitlines(keepends=True):
+                self._pending += line
+                if not self._pending.endswith((b"\r\r", b"\n\n", b"\r\n\r\n")):
+                    continue
+                for raw_line in self._pending.splitlines():
+                    event = self.decoder.decode(raw_line.decode("utf-8"))
+                    if event is None or event.event not in ("message_start", "message_delta"):
+                        continue
+                    data = event.json()
+                    if event.event == "message_start":
+                        data = data.get("message", {})
+                        self.model = data.get("model")
+                    usage = data.get("usage")
+                    if self.model == "claude-mythos-5-2" and isinstance(usage, dict):
+                        self.reason = self.reason or _cache_evidence_reason(usage)
+                        self.usage.update({
+                            key: usage[key] for key in (
+                                "cache_read_input_tokens", "cache_creation_input_tokens", "cache_creation",
+                            ) if key in usage
+                        })
+                self._pending = b""
+            yield chunk
 
 
 class AnthropicModelInfo(ModelInfo):
@@ -2143,6 +2210,7 @@ class AnthropicProvider:
                 supports_inline_system=True,
                 default_thinking_budget=0,  # not used — adaptive only
                 min_cacheable_tokens=2048 if is_preview else 512,
+                supports_forced_tool_choice=model_id != "claude-mythos-5-2",
                 capability_tags=(
                     "tools",
                     "thinking",
@@ -3377,6 +3445,32 @@ class AnthropicProvider:
         )
         return await self._complete_chat_request(fallback_request, **fallback_kwargs)
 
+    @staticmethod
+    def _normalized_tool_choice(
+        request: ChatRequest, options: Mapping[str, Any], model: str,
+    ) -> dict[str, Any] | None:
+        """Resolve ordinary choice once; explicit None retains request choice."""
+        choice = options.get("tool_choice")
+        if choice is None:
+            choice = request.tool_choice
+        if choice is None:
+            return None
+        if isinstance(choice, dict):
+            return dict(choice)
+        if isinstance(choice, str):
+            choices = {"none": "none", "auto": "auto", "required": "any"}
+            if choice in choices:
+                return {"type": choices[choice]}
+            message = (
+                f"Unsupported tool_choice {choice!r}; use 'none', 'auto', "
+                "'required', or an Anthropic wire dictionary."
+            )
+        else:
+            message = f"Unsupported tool_choice type {type(choice).__name__}."
+        raise KernelInvalidRequestError(
+            message, provider="anthropic", model=model, status_code=400,
+        )
+
     async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """
         Generate completion from ChatRequest.
@@ -3393,6 +3487,30 @@ class AnthropicProvider:
         if self._fallback_on_overload:
             validation_options["model"], _ = self._resolve_effective_model(
                 str(kwargs.get("model", self.default_model))
+            )
+        # Validate exact 5.2 final-wire restrictions before Models lookup or
+        # client creation. The shared assembler retains expert precedence.
+        selected_model = validation_options.get("model", self.default_model)
+        wire_model = self.extra_request_params.get("model", selected_model)
+        extra_body = self.extra_request_params.get("extra_body")
+        if isinstance(extra_body, dict):
+            wire_model = extra_body.get("model", wire_model)
+        wire_choice = self.extra_request_params.get(
+            "tool_choice",
+            self._normalized_tool_choice(request, validation_options, selected_model),
+        )
+        if isinstance(extra_body, dict):
+            wire_choice = extra_body.get("tool_choice", wire_choice)
+        forced = wire_choice == "required" or (
+            isinstance(wire_choice, dict)
+            and wire_choice.get("type") in {"any", "tool"}
+        )
+        if wire_model in {"claude-fable-5-2", "claude-mythos-5-2"} and forced:
+            self._assemble_request_params(
+                request,
+                request_options=validation_options,
+                request_caps=self._get_capabilities(selected_model),
+                emit_diagnostics=False,
             )
         is_haiku55 = self._prevalidate_haiku55_request(request, validation_options)
         self._prevalidate_sonnet_computer(request, validation_options)
@@ -3782,8 +3900,8 @@ class AnthropicProvider:
         version = self._detect_version(model_id, family)
         runtime_info = self._runtime_model_info_cache.get(model_id)
         static = version in _STATIC_BUDGET_MODEL_VERSIONS.get(family, frozenset())
-        # Only the documented fixed Fable 5.2 ID; no guessed suffixes/aliases.
-        static = static or model_id == "claude-fable-5-2"
+        # Only documented fixed 5.2 IDs; no guessed suffixes/aliases.
+        static = static or model_id in {"claude-fable-5-2", "claude-mythos-5-2"}
         if family == "haiku" and version == (5, 5) and model_id != "claude-haiku-5-5":
             static = False
         if not static and (
@@ -4190,42 +4308,15 @@ class AnthropicProvider:
                 params["model"],
             )
 
-        choice = (
-            options["tool_choice"]
-            if options.get("tool_choice") is not None
-            else request.tool_choice
+        normalized_tool_choice = self._normalized_tool_choice(
+            request, options, effective_model
         )
-        normalized_tool_choice: dict[str, Any] | None = None
-        if choice is not None:
-            if isinstance(choice, str):
-                normalized_choices = {
-                    "none": {"type": "none"},
-                    "auto": {"type": "auto"},
-                    "required": {"type": "any"},
-                }
-                if choice not in normalized_choices:
-                    raise KernelInvalidRequestError(
-                        f"Unsupported tool_choice {choice!r}; use 'none', 'auto', "
-                        "'required', or an Anthropic wire dictionary.",
-                        provider="anthropic",
-                        model=effective_model,
-                        status_code=400,
-                    )
-                normalized_tool_choice = normalized_choices[choice]
-            elif isinstance(choice, dict):
-                normalized_tool_choice = dict(choice)
-            else:
-                raise KernelInvalidRequestError(
-                    f"Unsupported tool_choice type {type(choice).__name__}.",
-                    provider="anthropic",
-                    model=effective_model,
-                    status_code=400,
-                )
+        if normalized_tool_choice is not None:
             if (
                 not request_caps.supports_forced_tool_choice
-                # Fable 5.2 is checked after expert overrides below so the
+                # Exact 5.2 IDs are checked after expert overrides below so the
                 # rejection reflects the actual model and tool choice on wire.
-                and effective_model != "claude-fable-5-2"
+                and effective_model not in {"claude-fable-5-2", "claude-mythos-5-2"}
                 and normalized_tool_choice.get("type") in {"any", "tool"}
             ):
                 raise KernelInvalidRequestError(
@@ -4615,7 +4706,7 @@ class AnthropicProvider:
         wire_model = wire_extra.get("model", params.get("model"))
         wire_choice = wire_extra.get("tool_choice", params.get("tool_choice"))
         if (
-            wire_model == "claude-fable-5-2"
+            wire_model in {"claude-fable-5-2", "claude-mythos-5-2"}
             and isinstance(wire_choice, dict)
             and wire_choice.get("type") in {"any", "tool"}
         ):
@@ -5170,6 +5261,14 @@ class AnthropicProvider:
                             async with self.client.messages.stream(
                                 **sdk_params
                             ) as stream:
+                                raw_cache_stream = None
+                                if isinstance(getattr(stream, "response", None), _anthropic_httpx.Response):
+                                    # HTTPX owns all content decoding (including
+                                    # stacked encodings) and response lifecycle.
+                                    # Observe its public decoded iterator, not
+                                    # Response.stream's compressed wire bytes.
+                                    raw_cache_stream = _CacheEvidenceStream(stream.response.aiter_bytes)
+                                    stream.response.aiter_bytes = raw_cache_stream.aiter_bytes
                                 async for event in stream:
                                     sdk_stream_started = True
                                     stream_cost_pending = True
@@ -5307,6 +5406,11 @@ class AnthropicProvider:
 
                                 # Stream drained. Final message is now ready.
                                 response = await stream.get_final_message()
+                                if response.model == "claude-mythos-5-2" and raw_cache_stream is not None:
+                                    response.usage = response.usage.model_copy(
+                                        update=raw_cache_stream.usage
+                                    )
+                                    response._cache_evidence_reason = raw_cache_stream.reason
                                 if stream_inference_geo is not None:
                                     response.usage.inference_geo = stream_inference_geo
                                 if stream_transformations is not None:
@@ -5346,6 +5450,23 @@ class AnthropicProvider:
                         timeout=self.timeout,
                     )
                     response = await raw_response.parse()
+                    # SDK permissive parsing can coerce booleans/strings into
+                    # integers. Preserve exact Mythos cache evidence before
+                    # conversion so malformed wire values cannot become prices.
+                    if response.model == "claude-mythos-5-2":
+                        http_response = getattr(raw_response, "http_response", None)
+                        if http_response is not None:
+                            raw_usage = http_response.json().get("usage")
+                            if isinstance(raw_usage, dict):
+                                response.usage = response.usage.model_copy(update={
+                                    key: raw_usage[key]
+                                    for key in (
+                                        "cache_read_input_tokens",
+                                        "cache_creation_input_tokens",
+                                        "cache_creation",
+                                    )
+                                    if key in raw_usage
+                                })
                     rate_limit_info = self._extract_rate_limit_headers(
                         raw_response.headers
                     )
@@ -7750,15 +7871,34 @@ class AnthropicProvider:
         # backward compatibility.  reasoning_tokens is intentionally None:
         # Anthropic does not provide a separate reasoning token count (thinking
         # tokens are included in output_tokens).
+        raw_cache_read = getattr(response.usage, "cache_read_input_tokens", None)
+        raw_cache_creation = getattr(response.usage, "cache_creation_input_tokens", None)
+        cache_evidence_reason = None
+        # Only the newly priced exact observed model gets this raw-evidence
+        # guard. Legacy conversion stays unchanged. None remains optional
+        # absence; falsy malformed evidence is not evidence of zero.
+        if response.model == "claude-mythos-5-2":
+            cache_evidence_reason = getattr(response, "_cache_evidence_reason", None) or _cache_evidence_reason({
+                "cache_read_input_tokens": raw_cache_read,
+                "cache_creation_input_tokens": raw_cache_creation,
+                "cache_creation": getattr(response.usage, "cache_creation", None),
+            })
+            # Keep malformed evidence out of Core's numeric display fields,
+            # but retain its unknown billing verdict below.
+            safe_read = raw_cache_read if type(raw_cache_read) is int and raw_cache_read >= 0 else 0
+            safe_creation = (
+                raw_cache_creation
+                if type(raw_cache_creation) is int and raw_cache_creation >= 0 else None
+            )
+        else:
+            safe_read, safe_creation = raw_cache_read, raw_cache_creation
         input_tokens = response.usage.input_tokens + (
-            getattr(response.usage, "cache_read_input_tokens", None) or 0
+            safe_read or 0
         )
         output_tokens = response.usage.output_tokens
 
-        cache_creation = (
-            getattr(response.usage, "cache_creation_input_tokens", None) or None
-        )
-        cache_read = getattr(response.usage, "cache_read_input_tokens", None) or None
+        cache_creation = safe_creation or None
+        cache_read = safe_read or None
 
         usage_kwargs: dict[str, Any] = {
             # Required fields
@@ -7793,6 +7933,9 @@ class AnthropicProvider:
         cache_creation_1h = getattr(
             cache_creation_ttl_split, "ephemeral_1h_input_tokens", None
         )
+        if response.model == "claude-mythos-5-2" and isinstance(cache_creation_ttl_split, dict):
+            cache_creation_5m = cache_creation_ttl_split.get("ephemeral_5m_input_tokens")
+            cache_creation_1h = cache_creation_ttl_split.get("ephemeral_1h_input_tokens")
         if not isinstance(cache_creation_5m, int):
             cache_creation_5m = None
         if not isinstance(cache_creation_1h, int):
@@ -7853,6 +7996,8 @@ class AnthropicProvider:
             cache_write_ttl=ttl,
             strict=request_params is not None,
         )
+        if cache_evidence_reason is not None:
+            cost_result = CostResult(None, cache_evidence_reason)
         cost = cost_result.cost_usd
         usage = usage.model_copy(update={"cost_usd": cost})
         (_record_cost or self._add_cost)(cost)
