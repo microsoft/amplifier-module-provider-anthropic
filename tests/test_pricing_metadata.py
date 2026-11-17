@@ -504,7 +504,7 @@ def test_mythos_raw_cache_evidence_transport_unknown_session(counts, reason, wir
     asyncio.run(run())
 
 
-def _cache_evidence_transport(body, wire_mode, counts, encoding=None):
+def _cache_evidence_transport(body, wire_mode, counts, encoding=None, delta_usage=None):
     if wire_mode == "json":
         return httpx.Response(200, json=body)
     start = json.loads(json.dumps(body))
@@ -516,7 +516,8 @@ def _cache_evidence_transport(body, wire_mode, counts, encoding=None):
     events = [
         {"type": "message_start", "message": start},
         {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-         "usage": {"output_tokens": 0, **(counts if wire_mode != "start" else {})}},
+         "usage": delta_usage if delta_usage is not None else {
+             "output_tokens": 0, **(counts if wire_mode != "start" else {})}},
     ]
     if wire_mode == "delta_then_valid":
         # Later valid/absent fields must not launder earlier malformed evidence.
@@ -628,6 +629,72 @@ def test_mythos_valid_cache_transport_boundaries(wire_mode, encoding, requested,
             contributions = await coordinator.collect_contributions("session.cost")
             assert len(contributions) == 1
             assert Decimal(contributions[0]["cost_usd"]) == Decimal(expected)
+        finally:
+            await cleanup()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("delta_counts", [
+    {},
+    {"cache_read_input_tokens": None},
+    {"cache_creation_input_tokens": None},
+    {"cache_creation": None},
+    {"cache_read_input_tokens": None, "cache_creation_input_tokens": None, "cache_creation": None},
+])
+@pytest.mark.parametrize("start_counts,expected_write,expected_cost", [
+    ({"cache_creation_input_tokens": 0}, None, ".0014"),
+    ({"cache_creation_input_tokens": 10}, 10, ".0015"),
+    ({"cache_creation_input_tokens": 10, "cache_creation": {
+        "ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 6}}, 10, ".001536"),
+])
+def test_mythos_stream_optional_delta_preserves_measured_cache(
+    delta_counts, start_counts, expected_write, expected_cost
+):
+    from amplifier_core import ModuleCoordinator
+    from amplifier_core.message_models import ChatRequest, Message
+
+    from amplifier_module_provider_anthropic import mount
+    from tests._helpers import FakeCoordinator
+
+    body = {
+        "id": "msg_cache_preserved", "type": "message", "role": "assistant",
+        "model": MYTHOS, "content": [], "stop_reason": None, "stop_sequence": None,
+        "usage": {"input_tokens": 100, "output_tokens": 0, "inference_geo": "global",
+                  "cache_read_input_tokens": 1000, **start_counts},
+    }
+
+    async def run():
+        coordinator = ModuleCoordinator()
+        cleanup = await mount(coordinator, {
+            "api_key": "offline-placeholder", "default_model": MYTHOS,
+            "use_streaming": True, "enable_prompt_caching": False, "max_retries": 0,
+            "extra_request_params": {"system": [{
+                "type": "text", "text": "prefix",
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            }]},
+        })
+        p = coordinator.get("providers", "anthropic")
+        p.coordinator = FakeCoordinator()
+        p._client = AsyncAnthropic(
+            api_key="offline-placeholder", max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda req: _cache_evidence_transport(
+                    body, "start", {}, delta_usage={"output_tokens": 10, **delta_counts}))),
+        )
+        try:
+            result = await p.complete(ChatRequest(messages=[Message(role="user", content="hello")]))
+            event = p.coordinator.hooks.payload_for("llm:response")
+            for usage in (json.loads(result.model_dump_json())["usage"], event["usage"]):
+                assert usage["input_tokens"] == 1100
+                assert usage["output_tokens"] == 10
+                assert usage["cache_read_tokens"] == 1000
+                assert usage.get("cache_write_tokens") == expected_write
+                assert Decimal(usage["cost_usd"]) == Decimal(expected_cost)
+            assert "anthropic_cost_unavailable" not in (result.metadata or {})
+            contributions = await coordinator.collect_contributions("session.cost")
+            assert len(contributions) == 1
+            assert Decimal(contributions[0]["cost_usd"]) == Decimal(expected_cost)
         finally:
             await cleanup()
 

@@ -128,10 +128,12 @@ class _CacheEvidenceStream:
                     usage = data.get("usage")
                     if self.model == "claude-mythos-5-2" and isinstance(usage, dict):
                         self.reason = self.reason or _cache_evidence_reason(usage)
+                        # Optional null deltas mean no update, as in the SDK
+                        # accumulator; retain measured counts and TTL evidence.
                         self.usage.update({
                             key: usage[key] for key in (
                                 "cache_read_input_tokens", "cache_creation_input_tokens", "cache_creation",
-                            ) if key in usage
+                            ) if key in usage and usage[key] is not None
                         })
                 self._pending = b""
             yield chunk
