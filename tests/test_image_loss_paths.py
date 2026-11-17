@@ -376,3 +376,49 @@ async def test_bodyless_error_and_cause_omit_signed_image_url_before_credential_
     assert "private.png" not in observed and "private-query" not in observed
     assert "password" not in observed and OMITTED in observed
     await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", [0, False, "", None, []])
+async def test_business_output_mapping_survives_public_entry_sdk(output):
+    p = provider()
+    sdk = install_sdk(p, MODELS[0])
+    business = {
+        "success": False, "output": output,
+        "record_id": "r1", "error": "business-field",
+    }
+    req = ChatRequest(messages=history(Message(role="user", content=[
+        ToolResultBlock(tool_call_id="call_a", output=business)
+    ])), max_output_tokens=200)
+    before = req.model_dump()
+    await p.request_budget(req, context_estimate=100)
+    await p.complete(req)
+    result = sdk.call_args.kwargs["messages"][-1]["content"][0]
+    assert result["tool_use_id"] == "call_a"
+    assert json.loads(result["content"]) == business
+    assert "is_error" not in result  # Application data is not transport status.
+    assert req.model_dump() == before
+    assert p.client.messages.count_tokens.call_args.kwargs["messages"] == sdk.call_args.kwargs["messages"]
+    await p.close()
+
+
+@pytest.mark.asyncio
+async def test_known_core_toolresult_transport_envelope_still_unwraps():
+    from amplifier_core import ToolResult
+
+    p = provider()
+    sdk = install_sdk(p, MODELS[0])
+    envelope = ToolResult(
+        success=False, error={"message": "known execution error"},
+        output=[{"type": "image", "source": SOURCES[0]}],
+    ).model_dump()
+    req = ChatRequest(messages=history(Message(role="user", content=[
+        ToolResultBlock(tool_call_id="call_a", output=envelope)
+    ])), max_output_tokens=200)
+    await p.request_budget(req, context_estimate=100)
+    await p.complete(req)
+    result = sdk.call_args.kwargs["messages"][-1]["content"][0]
+    assert result["is_error"] is True and result["tool_use_id"] == "call_a"
+    assert result["content"] == [{"type": "image", "source": SOURCES[0]}]
+    assert p.client.messages.count_tokens.call_args.kwargs["messages"] == sdk.call_args.kwargs["messages"]
+    await p.close()

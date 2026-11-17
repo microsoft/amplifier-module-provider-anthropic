@@ -70,7 +70,7 @@ from anthropic._exceptions import (
 from ._cost import compute_cost_result, get_rates, pricing_metadata, resolve_inference_geo
 from ._image_content import (
     content_envelope, diagnostic_copy, image_block, image_values,
-    text_position, tool_content, unavailable,
+    output_envelope, text_position, tool_content, unavailable,
 )
 
 
@@ -6069,7 +6069,7 @@ class AnthropicProvider:
                 nested = inner.get("output", inner.get("content", ""))
             elif content_envelope(inner):
                 nested = inner["content"]
-            elif "output" in inner and ("success" in inner or "error" in inner):
+            elif output_envelope(inner):
                 nested = inner["output"]
             else:
                 break

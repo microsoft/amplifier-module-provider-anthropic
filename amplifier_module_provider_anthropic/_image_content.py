@@ -95,7 +95,7 @@ def tool_content(output: Any) -> Any:
             return tool_content(block.get("output", block.get("content", "")))
         if content_envelope(block):
             return tool_content(block["content"])
-        if "output" in block and ("success" in block or "error" in block):
+        if output_envelope(block):
             return tool_content(block["output"])
         if image_values(block):
             return [unavailable()]
@@ -133,6 +133,16 @@ def content_envelope(value: dict[str, Any]) -> bool:
     return (
         set(value) <= {"content", "success", "error", "is_error", "metadata"}
         and rich_content(value.get("content"))
+    )
+
+
+def output_envelope(value: dict[str, Any]) -> bool:
+    """Recognize the Core ToolResult fields, not application/business mappings."""
+    return (
+        set(value) <= {"output", "success", "error", "is_error"}
+        and "output" in value
+        and type(value.get("success")) is bool
+        and (value.get("error") is None or isinstance(value["error"], dict))
     )
 
 
