@@ -68,6 +68,10 @@ from anthropic._exceptions import (
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 from ._cost import compute_cost_result, get_rates, pricing_metadata, resolve_inference_geo
+from ._image_content import (
+    content_envelope, diagnostic_copy, image_block, image_values,
+    text_position, tool_content, unavailable,
+)
 
 
 class AnthropicModelInfo(ModelInfo):
@@ -3692,7 +3696,7 @@ class AnthropicProvider:
 
         # Combine into single text (preserves current behavior)
         combined = "\n\n".join(
-            m.content if isinstance(m.content, str) else "" for m in system_msgs
+            text_position(m.content) for m in system_msgs
         )
 
         if not combined:
@@ -4113,7 +4117,7 @@ class AnthropicProvider:
                     "role": "user",
                     "content": (
                         "<context_file>\n"
-                        f"{message.content if isinstance(message.content, str) else ''}"
+                        f"{text_position(message.content)}"
                         "\n</context_file>"
                     ),
                 }
@@ -5053,6 +5057,18 @@ class AnthropicProvider:
             kwargs if _overflow_request_options is None else _overflow_request_options
         )
         overflow_assembly_fingerprint = self._fingerprint(params)
+        diagnostic_images = image_values(request.model_dump()) + image_values(params)
+
+        def safe_error(error: Any) -> str:
+            body = getattr(error, "body", None)
+            if body is not None:
+                return json.dumps(diagnostic_copy(body, diagnostic_images))
+            return _redact_url_credentials(
+                diagnostic_copy(
+                    str(error) or f"{type(error).__name__}: (no message)",
+                    diagnostic_images,
+                )
+            )
 
         logger.info(
             f"[PROVIDER] Anthropic API call - model: {params['model']}, messages: {len(params['messages'])}, system: {bool(system_blocks)}, tools: {len(params.get('tools', []))}, thinking: {thinking_enabled}"
@@ -5070,7 +5086,9 @@ class AnthropicProvider:
                 "interleaved_thinking": interleaved_thinking_enabled,
             }
             if self.raw:
-                request_payload["raw"] = redact_secrets(params)
+                request_payload["raw"] = redact_secrets(
+                    diagnostic_copy(params, diagnostic_images)
+                )
             await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
@@ -5332,7 +5350,7 @@ class AnthropicProvider:
                                     "request_id": request_id,
                                     "error": {
                                         "type": type(e).__name__,
-                                        "msg": str(e),
+                                        "msg": safe_error(e),
                                     },
                                 },
                             )
@@ -5358,7 +5376,7 @@ class AnthropicProvider:
                 rate_info = self._parse_rate_limit_info(e)
                 retry_after = rate_info.get("retry_after_seconds")
                 body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
+                msg = safe_error(e)
                 raise KernelRateLimitError(
                     msg,
                     provider="anthropic",
@@ -5370,7 +5388,7 @@ class AnthropicProvider:
 
             except AnthropicAuthenticationError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
+                msg = safe_error(e)
                 raise KernelAuthenticationError(
                     msg,
                     provider="anthropic",
@@ -5381,7 +5399,7 @@ class AnthropicProvider:
             except AnthropicBadRequestError as e:
                 raw_msg = str(e).lower()
                 body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = safe_error(e)
                 if _is_context_overflow(raw_msg):
                     translated = KernelContextLengthError(
                         error_msg,
@@ -5435,7 +5453,7 @@ class AnthropicProvider:
 
             except AnthropicOverloadedError as e:
                 body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = safe_error(e)
                 retry_after: float | None = None
                 if hasattr(e, "response") and e.response:
                     raw = e.response.headers.get("retry-after")
@@ -5457,7 +5475,7 @@ class AnthropicProvider:
             except AnthropicAPIStatusError as e:
                 status = getattr(e, "status_code", 500)
                 body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = safe_error(e)
                 if status == 403:
                     # Distinguish Cloudflare bot challenges (transient) from
                     # real API 403s (permanent).  Cloudflare returns HTML
@@ -5531,11 +5549,7 @@ class AnthropicProvider:
 
             except Exception as e:
                 body = getattr(e, "body", None)
-                error_msg = (
-                    json.dumps(body)
-                    if body is not None
-                    else (str(e) or f"{type(e).__name__}: (no message)")
-                )
+                error_msg = safe_error(e)
                 # GAP-016: the Anthropic SDK's own APIConnectionError carries a
                 # fixed, generic message ("Connection error.") regardless of
                 # *why* the underlying httpx/httpcore call failed -- DNS
@@ -5565,7 +5579,7 @@ class AnthropicProvider:
                     # then apply the same redact_secrets() treatment the raw
                     # request/response payloads already get elsewhere in this
                     # file.
-                    cause_text = redact_secrets(_redact_url_credentials(str(cause)))
+                    cause_text = redact_secrets(safe_error(cause))
                     # Compare on the redacted text -- comparing on the raw text
                     # would suppress the suffix whenever the unredacted string
                     # happened to appear, which is not the question being asked.
@@ -5807,7 +5821,9 @@ class AnthropicProvider:
                 if rate_limit_info:
                     response_event["rate_limits"] = rate_limit_info
                 if self.raw:
-                    response_event["raw"] = redact_secrets(response.model_dump())
+                    response_event["raw"] = redact_secrets(
+                        diagnostic_copy(response.model_dump(), diagnostic_images)
+                    )
                 await self.coordinator.hooks.emit("llm:response", response_event)
 
             return chat_response  # Return the already-built response
@@ -5815,7 +5831,7 @@ class AnthropicProvider:
         except KernelLLMError as e:
             # Phase 2: Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = safe_error(e)
             logger.error("[PROVIDER] Anthropic API error: %s", error_msg)
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -5834,7 +5850,7 @@ class AnthropicProvider:
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
             # Ensure error message is never empty
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = safe_error(e)
             logger.error(f"[PROVIDER] Anthropic response processing error: {error_msg}")
 
             # Emit error event
@@ -6020,6 +6036,76 @@ class AnthropicProvider:
         result["content"] = projected
         return result
 
+    def _ordinary_tool_result(self, block: dict[str, Any]) -> dict[str, Any]:
+        """Project known Core result envelopes without a computer-tool dependency."""
+        result_id = block.get("tool_call_id", block.get("tool_use_id"))
+        if any(
+            block[key] != result_id
+            for key in ("tool_call_id", "tool_use_id") if key in block
+        ):
+            raise KernelInvalidRequestError(
+                "Tool result envelope disagrees with its call binding.",
+                provider="anthropic", status_code=400,
+            )
+        output = block.get("output", block.get("content", ""))
+        is_error = block.get("is_error")
+        # Validate every known nested envelope before unwrapping it. Inner IDs
+        # and error status cannot silently replace the outer call association.
+        while True:
+            inner = self._content_block_mapping(output)
+            if isinstance(output, list) and len(output) == 1:
+                candidate = self._content_block_mapping(output[0])
+                if candidate and candidate.get("type") == "tool_result":
+                    inner = candidate
+            if inner is None:
+                break
+            if inner.get("type") == "tool_result":
+                ids = [inner[k] for k in ("tool_call_id", "tool_use_id") if k in inner]
+                if not ids or any(value != result_id for value in ids):
+                    raise KernelInvalidRequestError(
+                        "Tool result envelope disagrees with its call binding.",
+                        provider="anthropic", status_code=400,
+                    )
+                nested = inner.get("output", inner.get("content", ""))
+            elif content_envelope(inner):
+                nested = inner["content"]
+            elif "output" in inner and ("success" in inner or "error" in inner):
+                nested = inner["output"]
+            else:
+                break
+            status = inner.get("is_error")
+            if (
+                status is not None
+                and type(inner.get("success")) is bool
+                and status != (not inner["success"])
+            ):
+                raise KernelInvalidRequestError(
+                    "Tool result envelopes disagree on boolean error status.",
+                    provider="anthropic", status_code=400,
+                )
+            if status is None and type(inner.get("success")) is bool:
+                status = not inner["success"]
+            if status is not None:
+                if type(status) is not bool or (is_error is not None and status != is_error):
+                    raise KernelInvalidRequestError(
+                        "Tool result envelopes disagree on boolean error status.",
+                        provider="anthropic", status_code=400,
+                    )
+                is_error = status
+            output = nested
+        if is_error is not None and type(is_error) is not bool:
+            raise KernelInvalidRequestError(
+                "Tool result is_error must be boolean.",
+                provider="anthropic", status_code=400,
+            )
+        result = {
+            "type": "tool_result", "tool_use_id": result_id,
+            "content": tool_content(output),
+        }
+        if is_error is not None:
+            result["is_error"] = is_error
+        return result
+
     @staticmethod
     def _compatibility_native_tool_use(
         block: dict[str, Any],
@@ -6203,8 +6289,8 @@ class AnthropicProvider:
                     if not tool_use_id or tool_use_id not in valid_tool_use_ids:
                         if emit_warnings:
                             logger.warning(
-                                f"Skipping orphaned tool_result (no matching tool_use): "
-                                f"tool_call_id={tool_use_id}, content_preview={str(tool_msg.get('content', ''))[:100]}"
+                                "Skipping orphaned tool_result (no matching tool_use); "
+                                "content omitted."
                             )
                         skipped_count += 1
                         i += 1
@@ -6253,6 +6339,8 @@ class AnthropicProvider:
                                 and (cleaned := self._clean_content_block(mapped))
                                 is not None
                             ]
+                    elif not toolset_name:
+                        result = self._ordinary_tool_result(tool_msg)
                     tool_results.append(result)
                     i += 1
 
@@ -6293,6 +6381,11 @@ class AnthropicProvider:
                             "thinking",
                             "redacted_thinking",
                         }
+                        if block.get("type") == "image":
+                            # This adapter does not qualify generic assistant images.
+                            # Keep a model-visible marker in the original position.
+                            content_blocks.append(unavailable())
+                            continue
                         try:
                             cleaned = native_wire_tool_use(
                                 block, native_computer_adapter
@@ -6520,7 +6613,7 @@ class AnthropicProvider:
                 i += 1
             elif role == "developer":
                 # Developer messages -> XML-wrapped user messages (context files)
-                wrapped = f"<context_file>\n{content}\n</context_file>"
+                wrapped = f"<context_file>\n{text_position(content)}\n</context_file>"
                 anthropic_messages.append({"role": "user", "content": wrapped})
                 i += 1
             else:
@@ -6531,11 +6624,7 @@ class AnthropicProvider:
                         block = self._content_block_mapping(block)
                         if isinstance(block, dict):
                             block_type = block.get("type")
-                            if (
-                                block_type == "tool_result"
-                                and native_computer_adapter is not None
-                                and native_computer_adapter.neutral
-                            ):
+                            if block_type == "tool_result":
                                 # Core stores tool_call_id/output; the vendor wire
                                 # uses tool_use_id/content. Project without mutation.
                                 result_id = block.get(
@@ -6560,6 +6649,11 @@ class AnthropicProvider:
                                         provider="anthropic",
                                         status_code=400,
                                     )
+                                if any(b.get("type") != "tool_result" for b in content_blocks):
+                                    raise KernelInvalidRequestError(
+                                        "Tool results must precede other user content.",
+                                        provider="anthropic", status_code=400,
+                                    )
                                 family = native_tool_use_ids.get(result_id)
                                 if not family:
                                     if projected_result.get("toolset_name") is not None:
@@ -6575,7 +6669,7 @@ class AnthropicProvider:
                                             provider="anthropic",
                                             status_code=400,
                                         )
-                                    content_blocks.append(projected_result)
+                                    content_blocks.append(self._ordinary_tool_result(block))
                                 else:
                                     content_blocks.append(
                                         self._neutral_computer_result(
@@ -6587,25 +6681,7 @@ class AnthropicProvider:
                                     {"type": "text", "text": block.get("text", "")}
                                 )
                             elif block_type == "image":
-                                # Convert ImageBlock to Anthropic image format
-                                source = block.get("source", {})
-                                if source.get("type") == "base64":
-                                    content_blocks.append(
-                                        {
-                                            "type": "image",
-                                            "source": {
-                                                "type": "base64",
-                                                "media_type": source.get(
-                                                    "media_type", "image/jpeg"
-                                                ),
-                                                "data": source.get("data"),
-                                            },
-                                        }
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"Unsupported image source type: {source.get('type')}"
-                                    )
+                                content_blocks.append(image_block(block))
                             elif block_type == "document":
                                 # Documents are already in Anthropic's input
                                 # shape. Preserve the source and nested cache
@@ -6621,7 +6697,35 @@ class AnthropicProvider:
                     anthropic_messages.append({"role": "user", "content": content})
                 i += 1
 
-        return anthropic_messages
+        # Core can store ordinary results as user ToolResultBlocks or role-tool
+        # messages. Adjacent result-only chunks are one Anthropic result batch.
+        batched = []
+        for message in anthropic_messages:
+            if (
+                batched and message["role"] == batched[-1]["role"] == "user"
+                and isinstance(message["content"], list)
+                and any(b.get("type") == "tool_result" for b in message["content"])
+                and (
+                    not isinstance(batched[-1]["content"], list)
+                    or any(b.get("type") != "tool_result" for b in batched[-1]["content"])
+                )
+            ):
+                raise KernelInvalidRequestError(
+                    "Tool results must precede other user content in their batch.",
+                    provider="anthropic", status_code=400,
+                )
+            if (
+                batched
+                and message["role"] == batched[-1]["role"] == "user"
+                and isinstance(message["content"], list)
+                and isinstance(batched[-1]["content"], list)
+                and all(b.get("type") == "tool_result" for b in message["content"])
+                and all(b.get("type") == "tool_result" for b in batched[-1]["content"])
+            ):
+                batched[-1]["content"].extend(message["content"])
+            else:
+                batched.append(message)
+        return batched
 
     def _convert_tools_from_request(self, tools: list) -> list[dict[str, Any]]:
         """Convert ToolSpec objects from ChatRequest to Anthropic format.
