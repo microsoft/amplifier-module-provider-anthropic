@@ -100,6 +100,100 @@ class TestDetectVersion:
     def test_unparseable_returns_zero(self):
         assert AnthropicProvider._detect_version("claude-opus-latest", "opus") == (0, 0)
 
+    # Claude 3-generation ids put the version before the family. The family word
+    # therefore sits directly against the snapshot date, which the major-only
+    # fallback used to read as the major version (major 20241022 and friends).
+
+    def test_legacy_haiku_35(self):
+        assert AnthropicProvider._detect_version(
+            "claude-3-5-haiku-20241022", "haiku"
+        ) == (3, 5)
+
+    def test_legacy_sonnet_35(self):
+        assert AnthropicProvider._detect_version(
+            "claude-3-5-sonnet-20241022", "sonnet"
+        ) == (3, 5)
+
+    def test_legacy_sonnet_37(self):
+        assert AnthropicProvider._detect_version(
+            "claude-3-7-sonnet-20250219", "sonnet"
+        ) == (3, 7)
+
+    def test_legacy_haiku_3_major_only(self):
+        assert AnthropicProvider._detect_version(
+            "claude-3-haiku-20240307", "haiku"
+        ) == (3, 0)
+
+    def test_legacy_opus_3_major_only(self):
+        assert AnthropicProvider._detect_version(
+            "claude-3-opus-20240229", "opus"
+        ) == (3, 0)
+
+    # Family-first ids must keep parsing exactly as before.
+
+    def test_modern_major_only_id_with_snapshot(self):
+        assert AnthropicProvider._detect_version(
+            "claude-opus-4-20250514", "opus"
+        ) == (4, 0)
+
+    def test_modern_major_minor_id_with_snapshot(self):
+        assert AnthropicProvider._detect_version(
+            "claude-sonnet-4-5-20250929", "sonnet"
+        ) == (4, 5)
+
+    def test_bare_family_major(self):
+        assert AnthropicProvider._detect_version("claude-fable-5", "fable") == (5, 0)
+
+
+class TestLegacyModelCapabilities:
+    """Claude 3-generation ids must land on the conservative capability tier.
+
+    Before the version parse was fixed these ids reported majors like 20241022,
+    which cleared every ``>=`` gate and handed retired models the newest tier —
+    1M context, adaptive thinking, ``speed``, native computer use — none of
+    which those models accept.
+    """
+
+    def test_haiku_35_has_no_thinking_or_computer_use(self):
+        caps = AnthropicProvider._get_capabilities("claude-3-5-haiku-20241022")
+        assert caps.supports_thinking is False
+        assert caps.supports_native_computer_use is False
+        assert caps.default_thinking_budget == 0
+
+    def test_haiku_3_has_no_thinking_or_computer_use(self):
+        caps = AnthropicProvider._get_capabilities("claude-3-haiku-20240307")
+        assert caps.supports_thinking is False
+        assert caps.supports_native_computer_use is False
+
+    def test_sonnet_37_is_not_treated_as_latest(self):
+        caps = AnthropicProvider._get_capabilities("claude-3-7-sonnet-20250219")
+        assert caps.supports_1m is False
+        assert caps.supports_adaptive_thinking is False
+        assert caps.max_output_tokens == 64000
+        assert caps.supported_efforts == ("low", "medium", "high")
+
+    def test_opus_3_is_not_treated_as_latest(self):
+        caps = AnthropicProvider._get_capabilities("claude-3-opus-20240229")
+        assert caps.supports_1m is False
+        assert caps.supports_speed is False
+        assert caps.supports_native_computer_use is False
+        assert caps.max_output_tokens == 64000
+
+    def test_current_models_keep_their_capabilities(self):
+        opus = AnthropicProvider._get_capabilities("claude-opus-4-8")
+        assert opus.supports_speed is True
+        assert opus.supports_1m is True
+        assert opus.max_output_tokens == 128000
+
+        sonnet = AnthropicProvider._get_capabilities("claude-sonnet-4-5-20250929")
+        assert sonnet.supports_1m is False
+        assert sonnet.max_output_tokens == 64000
+        assert sonnet.supported_efforts == ("low", "medium", "high")
+
+        fable = AnthropicProvider._get_capabilities("claude-fable-5")
+        assert fable.supports_1m is True
+        assert fable.supports_adaptive_thinking is True
+
 
 class TestGetCapabilitiesOpus:
     """Tests for Opus model capabilities — the core of the issue #52 fix."""
