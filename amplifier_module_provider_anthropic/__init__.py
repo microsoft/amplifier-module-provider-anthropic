@@ -56,6 +56,7 @@ from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolCall
+from anthropic import APIConnectionError as AnthropicAPIConnectionError
 from anthropic import APIStatusError as AnthropicAPIStatusError
 from anthropic import APITimeoutError as AnthropicAPITimeoutError
 from anthropic import AsyncAnthropic
@@ -68,6 +69,17 @@ from anthropic._exceptions import (
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 from ._cost import compute_cost_result, get_rates, pricing_metadata, resolve_inference_geo
+
+
+class TokenCountError(RuntimeError):
+    """Bounded diagnostics for a caller that requires an exact input count."""
+
+    def __init__(self, category: str, status: int | None = None):
+        super().__init__("Cannot measure the Anthropic request input")
+        self.context_count_unavailable = category in {"timeout", "connection", "service", "rate_limit"}
+        self.count_failure = {"category": category, "retryable": self.context_count_unavailable}
+        if status is not None:
+            self.count_failure["httpStatus"] = status
 
 
 class AnthropicModelInfo(ModelInfo):
@@ -4808,14 +4820,20 @@ class AnthropicProvider:
         *,
         context_estimate: int,
         request_options: Mapping[str, Any] | None = None,
+        require_measurement: bool = False,
     ) -> dict[str, Any] | None:
-        """Return an exact Anthropic input decision or unavailable."""
+        """Optional callers may decline counting. Exact callers receive a classified failure."""
+        def unavailable(category: str, status: int | None = None) -> None:
+            if require_measurement:
+                raise TokenCountError(category, status) from None
+            return None
+
         if (
             isinstance(context_estimate, bool)
             or not isinstance(context_estimate, int)
             or context_estimate < 0
         ):
-            return None
+            return unavailable("invalid_request")
         options = dict(request_options or {})
         if has_neutral_computer_intent(request.tools or []):
             self._prevalidate_sonnet_computer(request, options)
@@ -4835,25 +4853,25 @@ class AnthropicProvider:
             wire_model = extra_body.get("model", wire_model)
         caps = self._budget_capabilities_for(budget_model)
         if caps is None:
-            return None
+            return unavailable("invalid_request")
         if self._client is None and self._api_key is None:
             # Counting is optional and cannot construct a credential-free SDK
             # client. In particular, endpoint-gated binding policy must not turn
             # an unavailable preflight into an invalid-request error.
-            return None
+            return unavailable("authentication")
         assembly = self._assemble_request_params(
             request, request_options=options, request_caps=caps
         )
         if assembly is None:
-            return None
+            return unavailable("invalid_request")
         if wire_model != budget_model:
             # Validate the envelope first (native tool preflight must still
             # reject sensitive overrides), then decline a stale-window count.
-            return None
+            return unavailable("invalid_request")
         params = assembly.params
         model = params.get("model")
         if not isinstance(model, str):
-            return None
+            return unavailable("invalid_request")
         limit = self._budget_input_limit(model, caps)
         output = params.get("max_tokens")
         if (
@@ -4862,7 +4880,7 @@ class AnthropicProvider:
             or not isinstance(output, int)
             or output <= 0
         ):
-            return None
+            return unavailable("invalid_request")
         try:
             token_count = await asyncio.wait_for(
                 self.client.messages.count_tokens(
@@ -4873,13 +4891,21 @@ class AnthropicProvider:
             )
         except (asyncio.TimeoutError, AnthropicAPITimeoutError) as error:
             await self._warn_count_unavailable(model, "timeout", error)
-            return None
+            return unavailable("timeout")
         except AnthropicRateLimitError as error:
             await self._warn_count_unavailable(model, "rate_limit", error)
-            return None
+            return unavailable("rate_limit", 429)
         except Exception as error:  # noqa: BLE001 -- count failures must fail closed
             await self._warn_count_unavailable(model, "request_error", error)
-            return None
+            if isinstance(error, AnthropicAPIConnectionError):
+                return unavailable("connection")
+            if isinstance(error, AnthropicAPIStatusError):
+                status = error.status_code
+                category = {401: "authentication", 403: "permission", 408: "timeout"}.get(
+                    status, "service" if status >= 500 else "invalid_request"
+                )
+                return unavailable(category, status)
+            return unavailable("invalid_response")
         counted_input = getattr(token_count, "input_tokens", None)
         if (
             isinstance(counted_input, bool)
@@ -4887,7 +4913,7 @@ class AnthropicProvider:
             or counted_input < 0
         ):
             await self._warn_count_unavailable(model, "malformed_response")
-            return None
+            return unavailable("invalid_response")
         estimated = counted_input + _INPUT_BUDGET_SAFETY_RESERVE
         target = context_estimate
         if estimated > limit:
@@ -4896,6 +4922,7 @@ class AnthropicProvider:
                 max(0, math.floor(context_estimate * limit / estimated) - 1),
             )
         return {
+            **({"input_limit_independent_of_output": True} if require_measurement else {}),
             "estimated_input_tokens": estimated,
             "input_limit_tokens": limit,
             "context_token_budget": target,

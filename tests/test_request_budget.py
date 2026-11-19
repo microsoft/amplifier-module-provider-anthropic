@@ -22,7 +22,7 @@ from amplifier_core.message_models import (
     ToolSpec,
 )
 
-from amplifier_module_provider_anthropic import AnthropicProvider, mount
+from amplifier_module_provider_anthropic import AnthropicProvider, TokenCountError, mount
 from tests._helpers import FakeCoordinator
 
 MODEL = "claude-sonnet-5"
@@ -186,6 +186,31 @@ class TestRequestBudget:
                 "input_tokens": 250_000,
             },
         }
+
+    def test_exact_budget_identifies_input_ceiling_independent_of_output(self) -> None:
+        provider = _provider()
+        provider.client.messages.count_tokens = AsyncMock(return_value=SimpleNamespace(input_tokens=250_000))
+        for cap in (12_345, 256):
+            decision = asyncio.run(provider.request_budget(
+                _request(cap=cap), context_estimate=200_000, require_measurement=True))
+            assert decision["input_limit_independent_of_output"] is True
+            assert decision["estimated_input_tokens"] > decision["input_limit_tokens"] == 200_000
+
+    @pytest.mark.parametrize(("reply", "category", "transient"), [
+        (asyncio.TimeoutError(), "timeout", True),
+        (SimpleNamespace(input_tokens=False), "invalid_response", False),
+        (RuntimeError("private material"), "invalid_response", False),
+    ])
+    def test_exact_count_returns_bounded_diagnostic(self, reply, category, transient) -> None:
+        provider = _provider()
+        provider.client.messages.count_tokens = (AsyncMock(side_effect=reply) if isinstance(reply, Exception)
+                                                else AsyncMock(return_value=reply))
+        with pytest.raises(TokenCountError) as caught:
+            asyncio.run(provider.request_budget(_request(), context_estimate=100, require_measurement=True))
+        assert caught.value.count_failure == {"category": category, "retryable": transient}
+        assert caught.value.context_count_unavailable is transient
+        assert "private material" not in str(caught.value)
+        assert provider.client.messages.count_tokens.await_count == 1
 
     def test_provider_count_measurement_preserves_raw_zero_and_reserve(self) -> None:
         provider = _provider()
