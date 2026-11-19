@@ -196,6 +196,15 @@ _RATES: dict[str, dict[str, Decimal]] = {
         "cache_read_per_m": Decimal("0.20"),
         "cache_write_per_m": Decimal("10.00"),
     },
+    # Exact Mythos 5.2 standard rates, observed 2026-11-15:
+    # https://platform.claude.com/docs/en/models/mythos-5-2/overview
+    # One-hour writes are derived as 2x input ($16/MTok); Fast is unqualified.
+    "claude-mythos-5-2": {
+        "input_per_m": Decimal("8.00"),
+        "output_per_m": Decimal("40.00"),
+        "cache_read_per_m": Decimal("0.20"),
+        "cache_write_per_m": Decimal("10.00"),
+    },
     # ------------------------------------------------------------------
     # Claude Haiku 3.5  ($0.80 / $4.00 / $0.08 / $1.00)
     # ------------------------------------------------------------------
@@ -263,7 +272,7 @@ _GEO_ELIGIBLE_MODELS = {
     "claude-opus-4-6", "claude-opus-4-6-20260101", "claude-opus-4-7",
     "claude-opus-4-7-20260416", "claude-opus-4-8", "claude-opus-5",
     "claude-opus-5-5", "claude-fable-5", "claude-fable-5-1",
-    "claude-fable-5-2", _HAIKU_MODEL,
+    "claude-fable-5-2", "claude-mythos-5-2", _HAIKU_MODEL,
 }
 _HAIKU_THRESHOLD = 100_000
 _HAIKU_RATES = (
