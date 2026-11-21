@@ -65,13 +65,18 @@ def load_block(message, model, scope):
     return copy.deepcopy(block)
 
 
-def add_header(params):
+def request_params(assembled):
+    """Use the same native input for authoritative count and signed summary creation."""
+    params = {key: assembled[key] for key in
+              ("model", "messages", "system", "tools", "max_tokens", "extra_headers")
+              if key in assembled}
     headers = dict(params.get("extra_headers") or {})
     betas = [v for v in headers.get("anthropic-beta", "").split(",") if v]
     if BETA not in betas:
         betas.append(BETA)
     headers["anthropic-beta"] = ",".join(betas)
     params["extra_headers"] = headers
+    return params
 
 
 async def summarize(client, params):

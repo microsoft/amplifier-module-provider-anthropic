@@ -4885,10 +4885,7 @@ class AnthropicProvider:
             raise ValueError("Claude compaction requires a supported request envelope")
         # Preserve the conversation's system and tools. The summary endpoint does not
         # accept foreground-only settings such as forced tool choice or stop sequences.
-        params = {key: assembly.params[key] for key in
-                  ("model", "messages", "system", "tools", "max_tokens", "extra_headers")
-                  if key in assembly.params}
-        _compaction.add_header(params)
+        params = _compaction.request_params(assembly.params)
         response = await _compaction.summarize(self.client, params)
         if response.stop_reason != "compaction" or len(response.content) != 1:
             raise ValueError("Claude did not return a complete native compaction result")
@@ -4918,7 +4915,14 @@ class AnthropicProvider:
             or context_estimate < 0
         ):
             return unavailable("invalid_request")
-        options = dict(request_options or {})
+        metadata = request.metadata or {}
+        # Managed Context marks the operation even when there is no foreground
+        # template. Portable summary calls only carry the shared purpose field.
+        native_summary = (metadata.get("purpose") == "context-compaction"
+                          and type(metadata.get("native_compaction_request_context")) is bool)
+        options = {"model": request.model or self.default_model} if native_summary else dict(request_options or {})
+        if native_summary and not self.supports_native_compaction(model=options["model"]):
+            return unavailable("invalid_request")
         if has_neutral_computer_intent(request.tools or []):
             self._prevalidate_sonnet_computer(request, options)
             options["model"] = neutral_effective_model(
@@ -4952,7 +4956,7 @@ class AnthropicProvider:
             # Validate the envelope first (native tool preflight must still
             # reject sensitive overrides), then decline a stale-window count.
             return unavailable("invalid_request")
-        params = assembly.params
+        params = _compaction.request_params(assembly.params) if native_summary else assembly.params
         model = params.get("model")
         if not isinstance(model, str):
             return unavailable("invalid_request")
