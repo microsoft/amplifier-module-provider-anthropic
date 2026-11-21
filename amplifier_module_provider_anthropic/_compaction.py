@@ -29,8 +29,10 @@ def scope_for(client):
     # Their signed blocks cannot be qualified by the provider's API key.
     http = getattr(client, "_client", None)
     configured_headers = [*getattr(client, "_custom_headers", {}), *getattr(http, "headers", {})]
-    if (getattr(client, "auth_token", None) or getattr(http, "auth", None) is not None
-            or {"authorization", "x-api-key"}.intersection(map(str.lower, configured_headers))):
+    identity_headers = {"authorization", "x-api-key", "anthropic-workspace-id", "anthropic-user-profile-id"}
+    if (getattr(client, "auth_token", None) or getattr(client, "custom_auth", None) is not None
+            or getattr(http, "auth", None) is not None
+            or identity_headers.intersection(map(str.lower, configured_headers))):
         return None
     return hmac.digest(key.encode(), b"anthropic:compaction:api.anthropic.com:v1", "sha256").hex()
 

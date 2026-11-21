@@ -84,10 +84,27 @@ async def test_signed_checkpoint_scope_first_block_and_beta_through_sdk(source, 
 
 
 @pytest.mark.parametrize("config", [{"base_url": "https://proxy.example/v1"},
-                                    {"extra_request_params": {"extra_body": {"model": "other"}}}])
+                                    {"extra_request_params": {"extra_body": {"model": "other"}}},
+                                    {"extra_request_params": {"workspace_id": "other-workspace"}},
+                                    {"extra_request_params": {"user_profile_id": "other-profile"}}])
 def test_unqualified_connection_and_override_fail_closed_locally(config):
     raw = AnthropicProvider(api_key="test-key", config=config)
     assert not raw.supports_native_compaction(model=SONNET)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", ["Anthropic-Workspace-Id", "Anthropic-User-Profile-Id"])
+async def test_identity_headers_decline_native_replay(header):
+    provider = AnthropicProvider(api_key="test-key", config={"default_model": SONNET})
+    plain_scope = _compaction.scope_for(provider.client)
+    source = _compaction.saved_message(FABLE, plain_scope, BLOCK)
+    await provider.close()
+    provider._client = AsyncAnthropic(api_key="test-key", default_headers={header: "other-identity"})
+    try:
+        assert not provider.supports_native_compaction(model=SONNET)
+        assert provider.rebind_compacted_context(source, source_model=FABLE, model=SONNET) is None
+    finally:
+        await provider.close()
 
 
 @pytest.mark.asyncio

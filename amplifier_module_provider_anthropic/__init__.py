@@ -4854,7 +4854,7 @@ class AnthropicProvider:
         # These expert controls can replace the model, prefix, route or beta on the wire.
         overrides = self.extra_request_params
         unsupported = {"model", "messages", "system", "tools", "context_management", "compaction",
-                       "extra_headers", "extra_query", "output_config"}
+                       "extra_headers", "extra_query", "output_config", "workspace_id", "user_profile_id"}
         if unsupported.intersection(overrides) or unsupported.intersection(overrides.get("extra_body") or {}):
             return False
         return _compaction.scope_for(self.client) is not None
