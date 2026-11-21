@@ -26,8 +26,10 @@ def scope_for(client):
 def saved_message(model, scope, block):
     validate_block(block)
     return {
-        "role": "assistant",
-        "content": block["content"],
+        # Managed Context persists this derived row separately from real turns.
+        # The Messages adapter expands it to the signed assistant block on the wire.
+        "role": "user",
+        "content": "Summary of earlier conversation (historical reference):\n" + block["content"],
         "metadata": {
             "ephemeral": True, "persisted": True, "source": "context-managed",
             KEY: {"version": 1, "model": model, "scope": scope, "block": copy.deepcopy(block)},

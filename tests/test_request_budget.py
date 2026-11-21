@@ -239,7 +239,10 @@ class TestRequestBudget:
 
         capabilities = provider.get_info().capabilities
 
-        assert capabilities == [*shared_tags_before, "request_budget:provider_count"]
+        assert capabilities == [*shared_tags_before, "prompt-cache:model-scoped",
+                                "prompt-cache:top-level-tools-prefix", "request_budget:provider_count"]
+        assert "prompt-cache:model-scoped" not in _provider(enable_prompt_caching=False).get_info().capabilities
+        assert "prompt-cache:top-level-tools-prefix" not in _provider(base_url="https://proxy.example").get_info().capabilities
         assert provider._default_caps.capability_tags == shared_tags_before
         assert "request_budget:provider_count" not in shared_tags_before
 
