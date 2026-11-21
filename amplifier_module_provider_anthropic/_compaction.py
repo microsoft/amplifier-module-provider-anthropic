@@ -21,6 +21,13 @@ def scope_for(client):
     key = getattr(client, "api_key", None)
     if endpoint != "https://api.anthropic.com" or not isinstance(key, str) or not key:
         return None
+    # SDK or HTTP auth overrides can select a different account on the same URL.
+    # Their signed blocks cannot be qualified by the provider's API key.
+    http = getattr(client, "_client", None)
+    configured_headers = [*getattr(client, "_custom_headers", {}), *getattr(http, "headers", {})]
+    if (getattr(client, "auth_token", None) or getattr(http, "auth", None) is not None
+            or {"authorization", "x-api-key"}.intersection(map(str.lower, configured_headers))):
+        return None
     return hmac.digest(key.encode(), b"anthropic:compaction:api.anthropic.com:v1", "sha256").hex()
 
 

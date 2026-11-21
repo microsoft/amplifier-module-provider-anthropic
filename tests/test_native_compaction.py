@@ -59,6 +59,10 @@ async def test_signed_checkpoint_scope_first_block_and_beta_through_sdk(source, 
         rebound = raw.rebind_compacted_context(result["message"], source_model=source, model=target)
         assert rebound["metadata"][_compaction.KEY]["block"] == BLOCK
         assert "test-key" not in json.dumps(rebound)
+        overridden = AnthropicProvider(api_key="test-key", config={"default_model": target})
+        overridden._client = raw.client.with_options(default_headers={"X-API-Key": "overridden-key"})
+        assert not overridden.supports_native_compaction(model=target)
+        assert overridden.rebind_compacted_context(result["message"], source_model=source, model=target) is None
         assert len(calls) == 1
         request = ChatRequest(messages=[Message(role="developer", content="New instruction."),
                                         Message(**rebound), Message(role="user", content="What was the decision?")])
