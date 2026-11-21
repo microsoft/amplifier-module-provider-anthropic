@@ -531,8 +531,37 @@ a typo does not raise out of every request.
 
 `debug` and `raw_debug` never existed as real keys -- this section documented
 them in error for a long time. The real key is `raw` (boolean, default
-`false`): when `true`, full request/response payloads are attached to the
-`llm:request` / `llm:response` events for inspection.
+`false`): when `true`, diagnostic copies of request/response payloads are attached
+to `llm:request` / `llm:response`. Image objects and exact echoes of request image
+data/URLs are omitted before the first hook subscriber. The actual SDK request
+is unchanged. This is not a general-purpose redactor for arbitrary text or SDK
+tracing outside the provider's events.
+
+### Ordinary chat images
+
+User images (including earlier user turns) and call-bound tool results use native
+ordered Anthropic text/image blocks. URL sources forward HTTP(S) URLs to the API;
+the provider does not fetch them. Base64 sources accept JPEG, PNG, GIF and WebP
+MIME types and syntactically valid nonempty base64; actual decoding, size limits
+and visual understanding remain API concerns. Ordinary tool results do not need
+a native-computer declaration. Canonical role-tool text/image lists and known
+`ToolResultBlock.output` content/output envelopes retain the call ID and boolean
+error status, with adjacent result-only messages batched together.
+
+Malformed or other image sources (including Files API sources not implemented
+here), and generic assistant/system/developer images, become payload-free
+model-visible **image unavailable** text in the original slot. This is this
+adapter's boundary, not a claim Anthropic universally forbids assistant images.
+It does not delete saved history or relocate pixels into a new user turn; plain
+followups remain usable. Native-computer replay keeps its existing stricter
+contract. Shared request assembly supplies the same projection to count and send.
+
+Protocol sources: [vision](https://platform.claude.com/docs/en/build-with-claude/vision.md)
+and [tool results](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls.md).
+These shapes do not establish model/account/custom-endpoint acceptance. In
+particular, documented Bedrock and Google-managed hosting support base64 only;
+this direct Anthropic adapter does not qualify those separate transports.
+The required live-vision gate above remains separate and unmet by offline tests.
 
 ### Retry and Error Handling
 
