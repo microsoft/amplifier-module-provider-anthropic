@@ -3,6 +3,10 @@
 import copy
 import hmac
 
+from amplifier_core.llm_errors import LLMError
+
+from ._image_content import image_values
+
 KEY = "anthropic:compaction"
 BETA = "compact-2026-09-04"
 PORTABLE = "context-managed:portable-summary"
@@ -66,6 +70,19 @@ def add_header(params):
         betas.append(BETA)
     headers["anthropic-beta"] = ",".join(betas)
     params["extra_headers"] = headers
+
+
+async def summarize(client, params):
+    try:
+        return await client.messages.create(**params, extra_body={"compaction": {"type": "summarize"}})
+    except Exception as exc:
+        if not image_values(params):
+            raise
+        # Even a generic SDK error holds the image-bearing HTTP request. Keep
+        # only the HTTP status, and leave the handler before raising to detach it.
+        error = LLMError("Anthropic native image compaction failed", provider="anthropic",
+                         model=params["model"], status_code=getattr(exc, "status_code", None))
+    raise error
 
 
 def compaction_usage(usage):

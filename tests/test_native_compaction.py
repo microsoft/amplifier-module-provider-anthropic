@@ -1,12 +1,15 @@
 """Exercise qualification, SDK wire replay and billing without any live discovery."""
 
 import json
+import traceback
 
 from anthropic import AsyncAnthropic
 import httpx2 as httpx
 import pytest
 
 from amplifier_core import ChatRequest, Message
+from amplifier_core.llm_errors import LLMError
+from amplifier_core.message_models import ImageBlock
 from amplifier_module_provider_anthropic import AnthropicProvider, _compaction
 
 SONNET = "claude-sonnet-5-5"
@@ -85,3 +88,34 @@ async def test_signed_checkpoint_scope_first_block_and_beta_through_sdk(source, 
 def test_unqualified_connection_and_override_fail_closed_locally(config):
     raw = AnthropicProvider(api_key="test-key", config=config)
     assert not raw.supports_native_compaction(model=SONNET)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("echo", [False, True])
+async def test_failed_image_compaction_does_not_expose_sdk_request(echo):
+    url = "https://example.invalid/private-compaction-image.png"
+    requests = []
+
+    def reject(request):
+        requests.append(json.loads(request.content))
+        detail = url.replace("/", r"\/") if echo else "invalid image"
+        return httpx.Response(400, json={"type": "error", "error": {
+            "type": "invalid_request_error", "message": detail,
+        }})
+
+    provider = AnthropicProvider(api_key="test-key", config={"default_model": SONNET})
+    provider._client = AsyncAnthropic(api_key="test-key", max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(reject)))
+    try:
+        image = ImageBlock(source={"type": "url", "url": url})
+        request = ChatRequest(messages=[Message(role="user", content=[image])], max_output_tokens=512)
+        with pytest.raises(LLMError) as caught:
+            await provider.compact_context(request)
+        assert requests[0]["messages"][0]["content"][0]["source"]["url"] == url
+        error = caught.value
+        assert error.status_code == 400
+        assert error.__cause__ is None and error.__context__ is None
+        assert "private-compaction-image" not in "".join(traceback.format_exception(error))
+        assert not hasattr(error, "request") and not hasattr(error, "response")
+    finally:
+        await provider.close()

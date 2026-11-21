@@ -4889,7 +4889,7 @@ class AnthropicProvider:
                   ("model", "messages", "system", "tools", "max_tokens", "extra_headers")
                   if key in assembly.params}
         _compaction.add_header(params)
-        response = await self.client.messages.create(**params, extra_body={"compaction": {"type": "summarize"}})
+        response = await _compaction.summarize(self.client, params)
         if response.stop_reason != "compaction" or len(response.content) != 1:
             raise ValueError("Claude did not return a complete native compaction result")
         block = response.content[0].model_dump(mode="json", exclude_unset=True)
