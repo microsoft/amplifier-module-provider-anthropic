@@ -50,6 +50,10 @@ async def test_signed_checkpoint_scope_first_block_and_beta_through_sdk(source, 
                                    "total_tokens": 69, "output_tokens": 12}
         assert result["input_tokens"] == 61
         assert raw.validate_compacted_context(result["message"], model=source)
+        assert result["message"]["metadata"][_compaction.PORTABLE] is True
+        assert result["message"]["content"] == BLOCK["content"]
+        with pytest.raises(ValueError, match="differs"):
+            raw.validate_compacted_context({**result["message"], "content": "changed"}, model=source)
         assert other.rebind_compacted_context(result["message"], source_model=source, model=target) is None
         assert raw.rebind_compacted_context(result["message"], source_model=source, model="other") is None
         rebound = raw.rebind_compacted_context(result["message"], source_model=source, model=target)

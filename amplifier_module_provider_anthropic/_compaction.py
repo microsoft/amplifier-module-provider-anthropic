@@ -5,6 +5,7 @@ import hmac
 
 KEY = "anthropic:compaction"
 BETA = "compact-2026-09-04"
+PORTABLE = "context-managed:portable-summary"
 MODELS = frozenset({"claude-sonnet-5-5", "claude-fable-5-2"})
 
 
@@ -29,9 +30,9 @@ def saved_message(model, scope, block):
         # Managed Context persists this derived row separately from real turns.
         # The Messages adapter expands it to the signed assistant block on the wire.
         "role": "user",
-        "content": "Summary of earlier conversation (historical reference):\n" + block["content"],
+        "content": block["content"],
         "metadata": {
-            "ephemeral": True, "persisted": True, "source": "context-managed",
+            "ephemeral": True, "persisted": True, "source": "context-managed", PORTABLE: True,
             KEY: {"version": 1, "model": model, "scope": scope, "block": copy.deepcopy(block)},
         },
     }
@@ -45,6 +46,9 @@ def load_block(message, model, scope):
         return None
     block = state.get("block")
     validate_block(block)
+    metadata = message["metadata"]
+    if PORTABLE in metadata and (metadata[PORTABLE] is not True or message.get("content") != block["content"]):
+        raise ValueError("Claude portable summary differs from its signed native content")
     return copy.deepcopy(block)
 
 
