@@ -165,6 +165,18 @@ def image_values(value: Any) -> tuple[str, ...]:
     return tuple(values)
 
 
+def image_echoes(*payloads: Any) -> tuple[str, ...]:
+    """Prepare literal and JSON-escaped image strings once for this request."""
+    values = {value for payload in payloads for value in image_values(payload)}
+    variants = values.copy()
+    for value in values:
+        if value.isascii() and value.isprintable() and '"' not in value and "\\" not in value:
+            continue  # Base64 and ordinary ASCII URLs already have their JSON spelling.
+        variants.add(json.dumps(value, ensure_ascii=False)[1:-1])
+        variants.add(json.dumps(value)[1:-1])
+    return tuple(sorted(variants, key=len, reverse=True))
+
+
 def diagnostic_copy(value: Any, images: tuple[str, ...] = ()) -> Any:
     """Omit image objects before any subscriber, including exact textual echoes.
 
@@ -182,3 +194,27 @@ def diagnostic_copy(value: Any, images: tuple[str, ...] = ()) -> Any:
             value = value.replace(image, OMITTED)
         return value
     return copy.deepcopy(value)
+
+
+def sanitize_image_error(error: Exception, images: tuple[str, ...]) -> None:
+    """Preserve clean cause chains and omit media in public errors before retry."""
+    if not images:
+        return
+    cursor: BaseException | None = error
+    seen = set()
+    while cursor is not None and id(cursor) not in seen:
+        seen.add(id(cursor))
+        body = getattr(cursor, "body", None)
+        text = str(cursor)
+        if diagnostic_copy(text, images) != text or (
+            body is not None and diagnostic_copy(body, images) != body
+        ):
+            error.args = tuple(diagnostic_copy(arg, images) for arg in error.args)
+            for name in ("message", "body"):
+                if hasattr(error, name):
+                    setattr(error, name, diagnostic_copy(getattr(error, name), images))
+            error.__cause__ = None
+            error.__context__ = None
+            error.__suppress_context__ = True
+            return
+        cursor = cursor.__cause__ or cursor.__context__

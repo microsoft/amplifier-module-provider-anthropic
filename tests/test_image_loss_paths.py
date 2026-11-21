@@ -2,6 +2,7 @@
 
 import base64
 import json
+import traceback
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -38,10 +39,10 @@ def provider(model=MODELS[0], stream=False, raw=False):
     return p
 
 
-def install_sdk(p, model, stream=False, error=None):
+def install_sdk(p, model, stream=False, error=None, reply="fixture answer"):
     response = anthropic.types.Message(
         id="msg_fixture", model=model, role="assistant",
-        content=[{"type": "text", "text": "fixture answer"}],
+        content=[{"type": "text", "text": reply}],
         stop_reason="end_turn", type="message",
         usage={"input_tokens": 25, "output_tokens": 2},
     )
@@ -243,6 +244,60 @@ async def test_error_echo_body_and_log_omit_pixels_and_urls(caplog):
     assert PIXELS not in observed and URL not in observed
     assert "echo" in observed and OMITTED in observed
     await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("error", [False, True])
+async def test_json_escaped_image_url_in_response_and_error_is_private(stream, error, caplog):
+    p = provider(stream=stream, raw=True)
+    url = "https://images.example.test/private-probe/résumé.png"
+    echoed = json.dumps(url)[1:-1]
+    failure = anthropic.BadRequestError(
+        f"echo: {echoed}",
+        response=httpx2.Response(400, request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages")),
+        body={"error": {"type": "invalid_request_error", "message": echoed}},
+    ) if error else None
+    sdk = install_sdk(p, MODELS[0], stream=stream, error=failure, reply=echoed)
+    image = ImageBlock(source={"type": "url", "url": url})
+    req = ChatRequest(messages=[Message(role="user", content=[image])], max_output_tokens=200)
+    try:
+        trace = ""
+        if error:
+            with pytest.raises(InvalidRequestError) as caught:
+                await p.complete(req)
+            assert caught.value.status_code == 400
+            trace = "".join(traceback.format_exception(caught.value))
+        else:
+            answer = await p.complete(req)
+            assert answer.content[0].text == echoed
+        assert sdk.call_args.kwargs["messages"][0]["content"][0]["source"]["url"] == url
+        observed = json.dumps(p.coordinator.hooks.events) + caplog.text + trace
+        assert "private-probe" not in observed
+        assert OMITTED in observed
+    finally:
+        await p.close()
+
+
+def test_escaped_spelling_is_prepared_once_for_a_long_image_history(monkeypatch):
+    from amplifier_module_provider_anthropic import _image_content
+
+    url = "https://images.example.test/private/résumé.png"
+    escaped = json.dumps(url)[1:-1]
+    image = {"type": "image", "source": {"type": "url", "url": url}}
+    history = [{"role": "user", "content": "ordinary text"} for _ in range(800)] + [image]
+    encoded = []
+    dumps = json.dumps
+
+    def count_dumps(value, **kwargs):
+        encoded.append(value)
+        return dumps(value, **kwargs)
+
+    monkeypatch.setattr(_image_content, "json", SimpleNamespace(dumps=count_dumps))
+    patterns = _image_content.image_echoes(history, history)
+    assert _image_content.diagnostic_copy(history, patterns)[-1]["text"] == OMITTED
+    assert _image_content.diagnostic_copy({"echo": escaped}, patterns) == {"echo": OMITTED}
+    assert encoded == [url, url]
 
 
 def test_result_binding_and_user_order_fail_without_payloads():

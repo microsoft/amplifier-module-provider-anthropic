@@ -70,8 +70,8 @@ from anthropic._exceptions import (
 
 from ._cost import compute_cost_result, get_rates, pricing_metadata, resolve_inference_geo
 from ._image_content import (
-    content_envelope, diagnostic_copy, image_block, image_values,
-    output_envelope, text_position, tool_content, unavailable,
+    content_envelope, diagnostic_copy, image_block, image_echoes,
+    output_envelope, sanitize_image_error, text_position, tool_content, unavailable,
 )
 
 
@@ -5084,7 +5084,7 @@ class AnthropicProvider:
             kwargs if _overflow_request_options is None else _overflow_request_options
         )
         overflow_assembly_fingerprint = self._fingerprint(params)
-        diagnostic_images = image_values(request.model_dump()) + image_values(params)
+        diagnostic_images = image_echoes(request.model_dump(), params)
 
         def safe_error(error: Any) -> str:
             body = getattr(error, "body", None)
@@ -5143,7 +5143,7 @@ class AnthropicProvider:
                 stream_cost_pending = False
                 self._add_cost(None)
 
-        async def _do_complete():
+        async def _sdk_complete():
             """Single API call attempt with SDK → kernel error translation."""
             nonlocal captured_rate_limit_info, stream_cost_pending
             response_returned = False
@@ -5402,7 +5402,6 @@ class AnthropicProvider:
             except AnthropicRateLimitError as e:
                 rate_info = self._parse_rate_limit_info(e)
                 retry_after = rate_info.get("retry_after_seconds")
-                body = getattr(e, "body", None)
                 msg = safe_error(e)
                 raise KernelRateLimitError(
                     msg,
@@ -5414,7 +5413,6 @@ class AnthropicProvider:
                 ) from e
 
             except AnthropicAuthenticationError as e:
-                body = getattr(e, "body", None)
                 msg = safe_error(e)
                 raise KernelAuthenticationError(
                     msg,
@@ -5425,7 +5423,6 @@ class AnthropicProvider:
 
             except AnthropicBadRequestError as e:
                 raw_msg = str(e).lower()
-                body = getattr(e, "body", None)
                 error_msg = safe_error(e)
                 if _is_context_overflow(raw_msg):
                     translated = KernelContextLengthError(
@@ -5479,7 +5476,6 @@ class AnthropicProvider:
                     ) from e
 
             except AnthropicOverloadedError as e:
-                body = getattr(e, "body", None)
                 error_msg = safe_error(e)
                 retry_after: float | None = None
                 if hasattr(e, "response") and e.response:
@@ -5501,7 +5497,6 @@ class AnthropicProvider:
 
             except AnthropicAPIStatusError as e:
                 status = getattr(e, "status_code", 500)
-                body = getattr(e, "body", None)
                 error_msg = safe_error(e)
                 if status == 403:
                     # Distinguish Cloudflare bot challenges (transient) from
@@ -5575,7 +5570,6 @@ class AnthropicProvider:
                 raise  # Already translated, don't double-wrap
 
             except Exception as e:
-                body = getattr(e, "body", None)
                 error_msg = safe_error(e)
                 # GAP-016: the Anthropic SDK's own APIConnectionError carries a
                 # fixed, generic message ("Connection error.") regardless of
@@ -5630,6 +5624,13 @@ class AnthropicProvider:
                     # without awaiting hooks or replacing its propagation.
                     # A retry starts with a fresh, unaccounted attempt.
                     _record_unaccounted_stream()
+
+        async def _do_complete():
+            try:
+                return await _sdk_complete()
+            except Exception as error:
+                sanitize_image_error(error, diagnostic_images)
+                raise
 
         async def _on_retry(attempt: int, delay: float, error: KernelLLMError):
             """Callback invoked before each retry sleep."""
@@ -5875,6 +5876,7 @@ class AnthropicProvider:
             raise
 
         except Exception as e:
+            sanitize_image_error(e, diagnostic_images)
             elapsed_ms = int((time.time() - start_time) * 1000)
             # Ensure error message is never empty
             error_msg = safe_error(e)
