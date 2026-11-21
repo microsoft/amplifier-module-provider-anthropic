@@ -9,12 +9,51 @@ import pytest
 
 from amplifier_core import ChatRequest, Message
 from amplifier_core.llm_errors import LLMError
-from amplifier_core.message_models import ImageBlock
+from amplifier_core.message_models import ImageBlock, ToolSpec
 from amplifier_module_provider_anthropic import AnthropicProvider, _compaction
 
 SONNET = "claude-sonnet-5-5"
 FABLE = "claude-fable-5-2"
 BLOCK = {"type": "compaction", "content": "The earlier decision was amber.", "signature": "test-signature"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_template", [False, True])
+async def test_native_preflight_counts_exact_summary_input_and_portable_preflight_keeps_thinking(has_template):
+    calls = []
+
+    def serve(request):
+        body = json.loads(request.content)
+        calls.append((request.url.path, body, request.headers.get("anthropic-beta", "")))
+        if request.url.path.endswith("/count_tokens"):
+            return httpx.Response(200, json={"input_tokens": 200})
+        return httpx.Response(200, json={"type": "message", "id": "msg_compact", "role": "assistant",
+            "model": FABLE, "content": [BLOCK], "stop_reason": "compaction", "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0}})
+
+    provider = AnthropicProvider(api_key="test-key", config={"default_model": SONNET})
+    provider._client = AsyncAnthropic(api_key="test-key",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(serve)))
+    request = ChatRequest(model=FABLE, max_output_tokens=4096, reasoning_effort="high",
+        messages=[Message(role="system", content="Instructions"), Message(role="user", content="Keep amber.")],
+        tools=[ToolSpec(name="read", description="Read the record", parameters={"type": "object"})],
+        metadata={"purpose": "context-compaction", "native_compaction_request_context": has_template})
+    try:
+        budget = await provider.request_budget(request, context_estimate=0, require_measurement=True)
+        assert budget["measurement"]["input_tokens"] == 200
+        await provider.compact_context(request)
+        portable = request.model_copy(update={"metadata": {"purpose": "context-compaction"}})
+        await provider.request_budget(portable, context_estimate=0, request_options={"model": FABLE},
+                                      require_measurement=True)
+        counted, compacted, ordinary = calls
+        assert counted[0].endswith("/count_tokens") and compacted[0].endswith("/messages")
+        assert counted[1] == {k: v for k, v in compacted[1].items() if k not in {"compaction", "max_tokens"}}
+        assert counted[1]["model"] == FABLE and counted[1]["system"] and counted[1]["tools"]
+        assert _compaction.BETA in counted[2].split(",") and counted[2] == compacted[2]
+        assert "thinking" in ordinary[1] and "thinking" not in counted[1]
+        assert _compaction.BETA not in ordinary[2].split(",")
+    finally:
+        await provider.close()
 
 
 @pytest.mark.asyncio
