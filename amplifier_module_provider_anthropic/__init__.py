@@ -88,6 +88,7 @@ class AnthropicModelInfo(ModelInfo):
     pricing_details: dict[str, Any] | None = None
 
 
+from . import _compaction
 from ._model_listing import (
     DEFAULT_FILTERS, LIFECYCLES, ModelFilters, latest_models, model_identity, selector_schema,
 )
@@ -1572,12 +1573,20 @@ class AnthropicProvider:
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
+        endpoint = (getattr(self._client, "base_url", None) if self._client is not None else
+                    self._base_url or os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com")
+        cache_traits = []
+        if (type(self) is AnthropicProvider and self.enable_prompt_caching
+                and str(endpoint).rstrip("/") == "https://api.anthropic.com" and not self.extra_request_params):
+            # Claude hashes the tool definitions, then the system, then messages.
+            cache_traits = ["prompt-cache:model-scoped", "prompt-cache:top-level-tools-prefix"]
         return ProviderInfo(
             id="anthropic",
             display_name="Anthropic",
             credential_env_vars=["ANTHROPIC_API_KEY"],
             capabilities=[
                 *self._default_caps.capability_tags,
+                *cache_traits,
                 "request_budget:provider_count",
             ],
             defaults={
@@ -4115,6 +4124,20 @@ class AnthropicProvider:
             for message in request.messages
             if message.role in ("user", "assistant", "tool")
         ]
+        # The signed block has to be first on the wire. Current developer context
+        # is reasserted after it. Cache breakpoints may decorate a signed block.
+        compacted = [msg for msg in conversation if _compaction.KEY in (getattr(msg, "metadata", None) or {})]
+        native_block = None
+        if compacted:
+            if len(compacted) != 1 or conversation[0] is not compacted[0]:
+                raise ValueError("Claude compaction must cover a single leading conversation prefix")
+            if self.supports_native_compaction(model=effective_model):
+                native_block = _compaction.load_block(
+                    compacted[0].model_dump(), effective_model, _compaction.scope_for(self.client)
+                )
+            if native_block is None:
+                raise ValueError("Claude compaction does not match this model and connection")
+            conversation = conversation[1:]
         unstable_suffix_len, has_ephemeral_signal = self._unstable_suffix_length(
             conversation
         )
@@ -4137,6 +4160,8 @@ class AnthropicProvider:
                 native_computer_adapter=native_computer_adapter,
             ),
         ]
+        if native_block is not None:
+            all_messages.insert(0, {"role": "assistant", "content": [native_block]})
         observed_state = "disabled"
         if self.enable_prompt_caching:
             self._normalize_content_for_cache_stability(all_messages)
@@ -4614,6 +4639,8 @@ class AnthropicProvider:
             fast_mode=fast_mode,
             tools=params.get("tools"),
         )
+        if native_block is not None:
+            headers = self._dedupe_headers([*headers, _compaction.BETA])
         if headers:
             params["extra_headers"] = {
                 **dict(params.get("extra_headers", {})),
@@ -4813,6 +4840,59 @@ class AnthropicProvider:
             # Never log the observer exception: it may contain private data.
             # CancelledError is intentionally not caught.
             pass
+
+    def supports_native_compaction(self, *, model: str | None = None) -> bool:
+        """Local qualification for signed-block creation and replay, with no discovery."""
+        if type(self) is not AnthropicProvider or (model or self.default_model) not in _compaction.MODELS:
+            return False
+        if self._client is None and not self._api_key:
+            return False
+        # These expert controls can replace the model, prefix, route or beta on the wire.
+        overrides = self.extra_request_params
+        unsupported = {"model", "messages", "system", "tools", "context_management", "compaction",
+                       "extra_headers", "extra_query", "output_config"}
+        if unsupported.intersection(overrides) or unsupported.intersection(overrides.get("extra_body") or {}):
+            return False
+        return _compaction.scope_for(self.client) is not None
+
+    def validate_compacted_context(self, message, *, model=None):
+        target = model or self.default_model
+        return self.supports_native_compaction(model=target) and _compaction.load_block(
+            message, target, _compaction.scope_for(self.client)
+        ) is not None
+
+    def rebind_compacted_context(self, message, *, source_model, model):
+        if source_model not in _compaction.MODELS or not self.supports_native_compaction(model=model):
+            return None
+        scope = _compaction.scope_for(self.client)
+        block = _compaction.load_block(message, source_model, scope)
+        return _compaction.saved_message(model, scope, block) if block else None
+
+    async def compact_context(self, request: ChatRequest) -> dict[str, Any]:
+        """Issue one on-demand summary against the selected Messages connection."""
+        model = request.model or self.default_model
+        if not self.supports_native_compaction(model=model):
+            raise NotImplementedError("Native compaction is unavailable for this Claude connection and model")
+        assembly = self._assemble_request_params(
+            request, request_options={"model": model},
+            request_caps=self._budget_capabilities_for(model) or self._get_capabilities(model),
+        )
+        if assembly is None:
+            raise ValueError("Claude compaction requires a supported request envelope")
+        # Preserve the conversation's system and tools. The summary endpoint does not
+        # accept foreground-only settings such as forced tool choice or stop sequences.
+        params = {key: assembly.params[key] for key in
+                  ("model", "messages", "system", "tools", "max_tokens", "extra_headers")
+                  if key in assembly.params}
+        _compaction.add_header(params)
+        response = await self.client.messages.create(**params, extra_body={"compaction": {"type": "summarize"}})
+        if response.stop_reason != "compaction" or len(response.content) != 1:
+            raise ValueError("Claude did not return a complete native compaction result")
+        block = response.content[0].model_dump(mode="json", exclude_unset=True)
+        message = _compaction.saved_message(model, _compaction.scope_for(self.client), block)
+        usage = _compaction.compaction_usage(response.usage.model_dump(mode="json", exclude_unset=True))
+        return {"kind": "native", "message": message, "usage": usage,
+                "input_tokens": sum(usage.get(k, 0) for k in ("input_tokens", "cache_write_tokens"))}
 
     async def request_budget(
         self,
