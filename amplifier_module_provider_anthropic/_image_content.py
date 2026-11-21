@@ -174,6 +174,8 @@ def image_echoes(*payloads: Any) -> tuple[str, ...]:
             continue  # Base64 and ordinary ASCII URLs already have their JSON spelling.
         variants.add(json.dumps(value, ensure_ascii=False)[1:-1])
         variants.add(json.dumps(value)[1:-1])
+    # JSON permits escaped slashes in URLs and base64 text.
+    variants |= {value.replace("/", r"\/") for value in variants if "/" in value}
     return tuple(sorted(variants, key=len, reverse=True))
 
 
@@ -197,24 +199,13 @@ def diagnostic_copy(value: Any, images: tuple[str, ...] = ()) -> Any:
 
 
 def sanitize_image_error(error: Exception, images: tuple[str, ...]) -> None:
-    """Preserve clean cause chains and omit media in public errors before retry."""
+    """Detach SDK errors from image requests before public reporting or retry."""
     if not images:
         return
-    cursor: BaseException | None = error
-    seen = set()
-    while cursor is not None and id(cursor) not in seen:
-        seen.add(id(cursor))
-        body = getattr(cursor, "body", None)
-        text = str(cursor)
-        if diagnostic_copy(text, images) != text or (
-            body is not None and diagnostic_copy(body, images) != body
-        ):
-            error.args = tuple(diagnostic_copy(arg, images) for arg in error.args)
-            for name in ("message", "body"):
-                if hasattr(error, name):
-                    setattr(error, name, diagnostic_copy(getattr(error, name), images))
-            error.__cause__ = None
-            error.__context__ = None
-            error.__suppress_context__ = True
-            return
-        cursor = cursor.__cause__ or cursor.__context__
+    error.args = tuple(diagnostic_copy(arg, images) for arg in error.args)
+    for name in ("message", "body"):
+        if hasattr(error, name):
+            setattr(error, name, diagnostic_copy(getattr(error, name), images))
+    # Even a clean HTTP error retains the outgoing media in its SDK request.
+    error.__cause__ = error.__context__ = None
+    error.__suppress_context__ = True

@@ -279,6 +279,47 @@ async def test_json_escaped_image_url_in_response_and_error_is_private(stream, e
         await p.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("echo_media", [False, True])
+async def test_http_error_detaches_sdk_request_and_redacts_slash_escapes(echo_media, caplog):
+    pixels = base64.b64encode(b"private-image-\xff\xff\xff").decode("ascii")
+    url = "https://example.invalid/private-file.png?token=private-url"
+    escaped = [value.replace("/", r"\/") for value in (pixels, url)]
+    message = "invalid input" if not echo_media else "invalid input: " + " ".join(escaped)
+    wire = []
+    def transport(request):
+        if request.method == "GET":
+            return httpx2.Response(404, json={"error": {"type": "not_found_error"}})
+        wire.append(json.loads(request.content)["messages"])
+        return httpx2.Response(400, json={"type": "error", "error": {
+            "type": "invalid_request_error", "message": message,
+        }})
+
+    p = provider(raw=True)
+    p._client = anthropic.AsyncAnthropic(
+        api_key="offline", max_retries=0,
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(transport)),
+    )
+    request = ChatRequest(messages=[Message(role="user", content=[
+        ImageBlock(source={"type": "base64", "media_type": "image/png", "data": pixels}),
+        ImageBlock(source={"type": "url", "url": url}),
+    ])], max_output_tokens=200)
+    try:
+        with pytest.raises(InvalidRequestError) as caught:
+            await p.complete(request)
+        error = caught.value
+        assert wire[-1][0]["content"][0]["source"]["data"] == pixels
+        assert wire[-1][0]["content"][1]["source"]["url"] == url
+        assert error.__cause__ is None and error.__context__ is None
+        assert error.status_code == 400 and "invalid input" in str(error)
+        trace = "".join(traceback.format_exception(error))
+        observed = trace + caplog.text + json.dumps(p.coordinator.hooks.events)
+        assert "private-file" not in observed
+        assert all(value not in observed for value in [pixels, *escaped])
+    finally:
+        await p.close()
+
+
 def test_escaped_spelling_is_prepared_once_for_a_long_image_history(monkeypatch):
     from amplifier_module_provider_anthropic import _image_content
 
