@@ -175,3 +175,53 @@ async def test_failed_image_compaction_does_not_expose_sdk_request(echo):
         assert not hasattr(error, "request") and not hasattr(error, "response")
     finally:
         await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stop", "blocks", "expected_reason"), [
+    ("max_tokens", [], "max_tokens"),
+    ("unexpected-private-reply", [{"type": "text", "text": "private-text"}], "unknown"),
+    ("compaction", [BLOCK], "compaction"),
+    ("compaction", [BLOCK, BLOCK], "compaction"),
+])
+async def test_compaction_receipt_contains_only_safe_response_metadata(stop, blocks, expected_reason, caplog):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    calls = []
+    def respond(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={
+            "id": "private-message-id", "type": "message", "role": "assistant", "model": FABLE,
+            "stop_reason": stop, "stop_sequence": None, "content": blocks,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "iterations": [
+                {"type": "compaction", "input_tokens": 12, "output_tokens": 3,
+                 "cache_read_input_tokens": 4, "cache_creation_input_tokens": 2},
+                {"type": "compaction", "input_tokens": 1, "output_tokens": 0},
+            ]},
+        })
+
+    # Even a broken observer must preserve the provider's original outcome.
+    hook = AsyncMock(side_effect=RuntimeError("private-observer-error"))
+    provider = AnthropicProvider("test-key", {"default_model": FABLE},
+                                 coordinator=SimpleNamespace(hooks=SimpleNamespace(emit=hook)))
+    provider._client = AsyncAnthropic(api_key="test-key", max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)))
+    caplog.set_level("INFO", logger="amplifier_module_provider_anthropic")
+    try:
+        request = ChatRequest(messages=[Message(role="user", content="private-input")], max_output_tokens=512)
+        if stop == "compaction" and len(blocks) == 1:
+            result = await provider.compact_context(request)
+            assert result["message"]["content"] == BLOCK["content"]
+        else:
+            with pytest.raises(ValueError, match="complete native compaction"):
+                await provider.compact_context(request)
+        hook.assert_awaited_once_with("provider:compaction_response", {
+            "provider": "anthropic", "model": FABLE, "stop_reason": expected_reason, "block_count": len(blocks),
+            "billed_usage": {"input_tokens": 13, "output_tokens": 3, "cache_read_tokens": 4, "cache_write_tokens": 2},
+        })
+        assert len(calls) == 1 and "billed_usage" in caplog.text
+        for marker in ("private-", BLOCK["content"], BLOCK["signature"], "test-key"):
+            assert marker not in caplog.text
+    finally:
+        await provider.close()

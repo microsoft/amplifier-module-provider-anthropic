@@ -92,17 +92,23 @@ async def summarize(client, params):
     raise error
 
 
-def compaction_usage(usage):
+def billed_usage(usage):
     """A standalone summary reports billed usage in iterations, with zero top-level usage."""
     totals = {}
     keys = {"input_tokens": "input_tokens", "output_tokens": "output_tokens",
             "cache_creation_input_tokens": "cache_write_tokens", "cache_read_input_tokens": "cache_read_tokens"}
     for iteration in usage.get("iterations") or []:
-        if iteration.get("type") == "compaction":
+        if isinstance(iteration, dict) and iteration.get("type") == "compaction":
             for source, dest in keys.items():
                 count = iteration.get(source)
                 if type(count) is int and count >= 0:
                     totals[dest] = totals.get(dest, 0) + count
+    return totals
+
+
+def compaction_usage(billed):
+    """The Core usage contract includes cache reads in input_tokens."""
+    totals = dict(billed)
     if totals:
         totals["input_tokens"] = totals.get("input_tokens", 0) + totals.get("cache_read_tokens", 0)
         totals["total_tokens"] = totals["input_tokens"] + totals.get("output_tokens", 0)

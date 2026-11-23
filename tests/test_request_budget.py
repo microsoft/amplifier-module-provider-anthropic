@@ -671,7 +671,7 @@ class TestRequestBudget:
                 contributions = await coordinator.collect_contributions(
                     "observability.events"
                 )
-                assert contributions == [[COUNT_UNAVAILABLE_EVENT]]
+                assert contributions == [[COUNT_UNAVAILABLE_EVENT, "provider:compaction_response"]]
                 assert coordinator.channels["observability.events"][0]["name"] == (
                     "provider-anthropic"
                 )
