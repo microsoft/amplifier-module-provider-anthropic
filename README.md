@@ -102,6 +102,14 @@ otherwise `filtered: false` means unfiltered and `filtered: true` uses the
 recommendation defaults. Config and call filters are copied immutably.
 `get_model_list_info()` exposes fresh v1 metadata, including `filters_schema`,
 `default_filters`, `unfiltered: {}`, and `override: "replace"`.
+Its optional `purpose_recommendations` maps `prompt-suggestions` to the ordered
+exact ID list `["claude-haiku-5-5"]` for the native provider on the standard
+`https://api.anthropic.com` endpoint. Custom endpoints and provider subclasses
+receive an empty mapping. This is offline provider policy, not inventory,
+availability or an inference-support guarantee. Hosts must intersect these IDs
+with the exact selected connection's current catalog, respecting its filters
+and explicit user model selection. Metadata reads perform no discovery, create
+no SDK client, and do not change listing, inference, fallback or saved defaults.
 
 The SDK floor and lock are `anthropic==1.12.0` (dependency range remains `<2`).
 Its native `lifecycle` filter accepts `active`, `deprecated`, and `retired`;

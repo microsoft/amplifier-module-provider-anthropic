@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import FrozenInstanceError
 import inspect
 import traceback
+from types import SimpleNamespace
 
 import httpx2
 import pytest
@@ -51,28 +52,85 @@ def test_invalid_filters_fail_closed(filters):
         AnthropicProvider(config={"model_filters": filters})
 
 
-def test_filter_snapshot_and_fresh_metadata():
+def test_filter_snapshot_and_fresh_metadata(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     values = {"include": ["claude-haiku-*"]}
     provider = AnthropicProvider(config={"model_filters": values, "filtered": True})
     values["include"].append("*")
     info = provider.get_model_list_info()
     assert set(info) == {
         "version", "source", "filters_keyword", "filters_schema",
-        "default_filters", "unfiltered", "override",
+        "default_filters", "unfiltered", "override", "purpose_recommendations",
     }
     assert info["source"] == "provider-api"
     assert info["override"] == "replace"
     assert info["filters_keyword"] == "filters"
     assert info["default_filters"]["include"] == ["claude-haiku-*"]
+    assert info["purpose_recommendations"] == {"prompt-suggestions": ["claude-haiku-5-5"]}
     before = deepcopy(info)
     info["default_filters"]["include"].append("*")
     info["filters_schema"]["properties"].clear()
+    info["purpose_recommendations"]["prompt-suggestions"].append("caller-mutation")
+    info["purpose_recommendations"]["other-purpose"] = []
     assert provider.get_model_list_info() == before
     assert provider._client is None
     with pytest.raises(FrozenInstanceError):
         provider._model_filters.hide_dated = True
     assert AnthropicProvider(config={"filtered": False})._model_filters == ModelFilters()
     assert AnthropicProvider(config={"filtered": True, "model_filters": {}})._model_filters == ModelFilters()
+
+
+@pytest.mark.parametrize("base_url", [None, "", "https://api.anthropic.com", "https://api.anthropic.com/"])
+def test_purpose_recommendations_are_offline_policy_not_inventory(monkeypatch, base_url):
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    provider = AnthropicProvider(config={
+        "base_url": base_url, "model_filters": {"include": []},
+        "default_model": "claude-haiku-4-5",
+    })
+    assert provider.get_model_list_info()["purpose_recommendations"] == {
+        "prompt-suggestions": ["claude-haiku-5-5"],
+    }
+    assert provider._client is None
+    assert provider._family_latest == {}
+    assert provider._runtime_model_info_cache == {}
+    assert provider._model_filters.include == ()
+    assert provider.default_model == "claude-haiku-4-5"
+
+
+@pytest.mark.parametrize("base_url", [
+    "https://proxy.test", "http://api.anthropic.com", "https://api.anthropic.com.evil.test",
+    "https://api.anthropic.com/custom", "https://api.anthropic.com?query=1",
+    "https://user:pass@api.anthropic.com", "not-a-url",
+])
+def test_custom_endpoint_has_no_official_purpose_recommendations(monkeypatch, base_url):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    provider = AnthropicProvider(config={"base_url": base_url})
+    assert provider.get_model_list_info()["purpose_recommendations"] == {}
+    assert provider._client is None
+
+
+def test_purpose_endpoint_precedence_and_provider_identity(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.test")
+    provider = AnthropicProvider()
+    assert provider.get_model_list_info()["purpose_recommendations"] == {}
+    provider = AnthropicProvider(config={"base_url": "https://api.anthropic.com"})
+    assert provider.get_model_list_info()["purpose_recommendations"]["prompt-suggestions"] == [
+        "claude-haiku-5-5",
+    ]
+    # An already-bound client, not subsequently changed config/env, is authority.
+    provider._client = SimpleNamespace(base_url="https://proxy.test")
+    assert provider.get_model_list_info()["purpose_recommendations"] == {}
+    provider._client = SimpleNamespace(base_url="https://api.anthropic.com/")
+    assert provider.get_model_list_info()["purpose_recommendations"]["prompt-suggestions"] == [
+        "claude-haiku-5-5",
+    ]
+
+    class CustomProvider(AnthropicProvider):
+        pass
+
+    assert CustomProvider(config={
+        "base_url": "https://api.anthropic.com",
+    }).get_model_list_info()["purpose_recommendations"] == {}
 
 
 def test_numeric_latest_aliases_snapshots_and_distinct_newer_preview():
@@ -117,7 +175,11 @@ def test_not_a_snapshot_date(model_id):
 async def test_default_and_override_no_hidden_policy(wire):
     ids = ["claude-sonnet-5-5", "claude-sonnet-4-5-20250929", "private-route"]
     wire.responses.extend([_page(*ids) for _ in range(6)])
-    provider = wire.provider()
+    provider = wire.provider(base_url="https://api.anthropic.com")
+    metadata = provider.get_model_list_info()
+    assert metadata["purpose_recommendations"] == {"prompt-suggestions": ["claude-haiku-5-5"]}
+    assert not wire.requests
+    assert provider._client is None
     assert [m.id for m in await provider.list_models()] == ["claude-sonnet-5-5"]
     assert [m.id for m in await provider.list_models(filters=None)] == ["claude-sonnet-5-5"]
     assert {m.id for m in await provider.list_models(filters={})} == set(ids)
@@ -127,6 +189,9 @@ async def test_default_and_override_no_hidden_policy(wire):
     assert all(r.url.params["limit"] == "1000" for r in wire.requests)
     assert wire.requests[0].url.params.get_list("lifecycle[]") == ["active"]
     assert wire.requests[2].url.params.get_list("lifecycle[]") == ["active", "deprecated", "retired"]
+    # Policy metadata neither injects a missing Haiku nor overrides call filters.
+    assert provider.get_model_list_info() == metadata
+    assert len(wire.requests) == 6
     assert not hasattr(provider, "discover_models")
 
 
@@ -237,6 +302,7 @@ async def test_hidden_explicit_inference_model_params_are_unchanged(wire):
             request_caps=provider._get_capabilities("claude-haiku-4-5"),
         ).params
     before = assemble()
+    provider.get_model_list_info()
     wire.responses.append(_page("claude-haiku-4-5", "claude-haiku-5-5"))
     assert [m.id for m in await provider.list_models()] == ["claude-haiku-5-5"]
     assert assemble() == before
