@@ -414,6 +414,7 @@ BETA_HEADER_TASK_BUDGETS = "task-budgets-2026-03-13"
 BETA_HEADER_FAST_MODE = "fast-mode-2026-02-01"
 PROVIDER_FALLBACK_OPEN = "provider:fallback_open"
 PROVIDER_FALLBACK_ACTIVE = "provider:fallback_active"
+PROVIDER_COMPACTION_RESPONSE = "provider:compaction_response"
 PROVIDER_TOKEN_COUNT_UNAVAILABLE = "provider:token_count_unavailable"
 FALLBACK_STATE_VERSION = 1
 
@@ -870,7 +871,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_contributor(
         "observability.events",
         "provider-anthropic",
-        lambda: [PROVIDER_TOKEN_COUNT_UNAVAILABLE],
+        lambda: [PROVIDER_TOKEN_COUNT_UNAVAILABLE, PROVIDER_COMPACTION_RESPONSE],
     )
     logger.info("Mounted AnthropicProvider")
 
@@ -4887,11 +4888,24 @@ class AnthropicProvider:
         # accept foreground-only settings such as forced tool choice or stop sequences.
         params = _compaction.request_params(assembly.params)
         response = await _compaction.summarize(self.client, params)
+        billed = _compaction.billed_usage(response.usage.model_dump(mode="json", exclude_unset=True))
+        # SDKs can pass through future or unrecognized strings. Do not log
+        # those values, returned messages, signatures, or raw usage objects.
+        known_reasons = {"compaction", "end_turn", "max_tokens", "model_context_window_exceeded",
+                         "tool_use", "refusal", "stop_sequence", "pause_turn"}
+        reason = response.stop_reason if response.stop_reason in known_reasons else "unknown"
+        diagnostic = {"provider": "anthropic", "model": model, "stop_reason": reason,
+                      "block_count": len(response.content), "billed_usage": billed.copy()}
+        logger.info("Anthropic native compaction response: %s", diagnostic)
+        try:
+            await self._emit_provider_event(PROVIDER_COMPACTION_RESPONSE, diagnostic)
+        except Exception:
+            logger.debug("Native compaction response observer failed")
         if response.stop_reason != "compaction" or len(response.content) != 1:
             raise ValueError("Claude did not return a complete native compaction result")
         block = response.content[0].model_dump(mode="json", exclude_unset=True)
         message = _compaction.saved_message(model, _compaction.scope_for(self.client), block)
-        usage = _compaction.compaction_usage(response.usage.model_dump(mode="json", exclude_unset=True))
+        usage = _compaction.compaction_usage(billed)
         return {"kind": "native", "message": message, "usage": usage,
                 "input_tokens": sum(usage.get(k, 0) for k in ("input_tokens", "cache_write_tokens"))}
 
