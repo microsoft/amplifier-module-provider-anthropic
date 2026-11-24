@@ -109,8 +109,16 @@ def _cache_evidence_reason(usage: Mapping[str, Any]) -> str | None:
         ]
         if any(value is None for value in values):
             return "cache_write_ttl_split_incomplete"
-        if any(type(value) is not int or value < 0 for value in values):
-            return "invalid_usage_counts"
+        total = 0
+        for value in values:
+            if type(value) is not int or value < 0:
+                return "invalid_usage_counts"
+            total += value
+        # Compare only facts present in this event, before later stream usage
+        # can overwrite them. Absent/null aggregates allow split-only updates.
+        aggregate = usage.get("cache_creation_input_tokens")
+        if aggregate is not None and aggregate != total:
+            return "cache_write_ttl_split_mismatch"
     return None
 
 

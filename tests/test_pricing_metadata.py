@@ -447,6 +447,10 @@ def test_observed_model_controls_accounting_without_relabelling(requested, obser
            "invalid_usage_counts"),
           ({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": "10"},
            "invalid_usage_counts"),
+          ({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0},
+           "cache_write_ttl_split_mismatch"),
+          ({"ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 5},
+           "cache_write_ttl_split_mismatch"),
       ]],
 ])
 @pytest.mark.parametrize("wire_mode,encoding", [
@@ -512,7 +516,7 @@ def _cache_evidence_transport(
         return httpx.Response(200, json=body)
     start = json.loads(json.dumps(body))
     start["stop_reason"] = None
-    if wire_mode != "start":
+    if wire_mode not in ("start", "start_then_valid"):
         start["usage"] = {
             "input_tokens": 0, "output_tokens": 0, "inference_geo": "global",
         }
@@ -520,14 +524,16 @@ def _cache_evidence_transport(
         {"type": "message_start", "message": start},
         {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
          "usage": delta_usage if delta_usage is not None else {
-             "output_tokens": 0, **(counts if wire_mode != "start" else {})}},
+             "output_tokens": 0, **(counts if wire_mode in ("delta", "delta_then_valid") else {})}},
     ]
-    if wire_mode == "delta_then_valid":
+    if wire_mode in ("start_then_valid", "delta_then_valid"):
         # Later valid/absent fields must not launder earlier malformed evidence.
         events.append({
             "type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
             "usage": {"output_tokens": 0, "cache_read_input_tokens": 0,
-                      "cache_creation_input_tokens": 0, "cache_creation": None},
+                      "cache_creation_input_tokens": 0, "cache_creation": {
+                          "ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0,
+                      }},
         })
     events.append({"type": "message_stop"})
     wire = "".join(
@@ -685,6 +691,136 @@ def test_reconciled_sdk_observer_preserves_fragmented_utf8(model, delimiter, enc
                 cache_read_input_tokens=1000, cache_creation_input_tokens=10,
                 cache_creation_5m_input_tokens=4, cache_creation_1h_input_tokens=6,
             )
+        finally:
+            await p.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("wire_mode", ["start_then_valid", "delta_then_valid"])
+@pytest.mark.parametrize("delimiter", ["\n", "\r", "\r\n"])
+@pytest.mark.parametrize("encoding", [None, "gzip", "deflate", "deflate-raw", "gzip, deflate"])
+def test_mythos_same_event_cache_mismatch_stays_unknown_across_calls(wire_mode, delimiter, encoding):
+    """A later valid zero cannot erase raw contradictions or restore session cost."""
+    from amplifier_core import ModuleCoordinator
+    from amplifier_core.message_models import ChatRequest, Message
+    from amplifier_module_provider_anthropic import mount
+
+    from tests._helpers import FakeCoordinator
+
+    counts = {"cache_creation_input_tokens": 10, "cache_creation": {
+        "ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0,
+    }}
+    body = {
+        "id": "msg_mismatch", "type": "message", "role": "assistant",
+        "model": MYTHOS, "content": [], "stop_reason": None, "stop_sequence": None,
+        "usage": {"input_tokens": 100, "output_tokens": 0, "inference_geo": "global", **counts},
+    }
+
+    async def run():
+        coordinator = ModuleCoordinator()
+        cleanup = await mount(coordinator, {
+            "api_key": "offline-placeholder", "default_model": MYTHOS,
+            "use_streaming": True, "enable_prompt_caching": False, "max_retries": 0,
+        })
+        p = coordinator.get("providers", "anthropic")
+        p.coordinator = FakeCoordinator()
+        calls = []
+
+        def transport(request):
+            if request.url.path != "/v1/messages":
+                return httpx.Response(200, json={"data": [], "has_more": False})
+            calls.append(request)
+            if len(calls) == 2:
+                return _cache_evidence_transport(
+                    body, wire_mode, counts, encoding,
+                    delimiter=delimiter, fragment_size=17 if encoding == "deflate-raw" else 1,
+                )
+            known_body = {**body, "usage": {
+                "input_tokens": 100, "output_tokens": 0, "inference_geo": "global",
+                "cache_creation_input_tokens": 0,
+            }}
+            return _cache_evidence_transport(
+                known_body, "start", {}, delta_usage={"output_tokens": 10},
+            )
+
+        p._client = AsyncAnthropic(
+            api_key="offline-placeholder", max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(transport)),
+        )
+        try:
+            request = ChatRequest(messages=[Message(role="user", content="hello")])
+            before = await p.complete(request)
+            assert before.usage.cost_usd == Decimal(".0012")
+            assert await coordinator.collect_contributions("session.cost") == [{"cost_usd": "0.0012"}]
+            p.coordinator.hooks.events.clear()
+            result = await p.complete(request)
+            assert result.usage.cost_usd is None
+            assert json.loads(result.model_dump_json())["usage"]["cost_usd"] is None
+            assert result.metadata["anthropic_cost_unavailable"] == "cache_write_ttl_split_mismatch"
+            event = p.coordinator.hooks.payload_for("llm:response")
+            assert json.loads(json.dumps(event))["usage"]["cost_usd"] is None
+            assert event["metadata"]["anthropic_cost_unavailable"] == "cache_write_ttl_split_mismatch"
+            assert await coordinator.collect_contributions("session.cost") == [{"cost_usd": None}]
+            after = await p.complete(request)
+            assert after.usage.cost_usd == Decimal(".0012")
+            assert "anthropic_cost_unavailable" not in (after.metadata or {})
+            assert await coordinator.collect_contributions("session.cost") == [{"cost_usd": None}]
+            assert len(calls) == 3
+        finally:
+            await cleanup()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("start_counts,delta_counts", [
+    ({"cache_creation_input_tokens": 10}, {"cache_creation": {
+        "ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 6,
+    }}),
+    ({"cache_creation": {
+        "ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 6,
+    }}, {"cache_creation_input_tokens": 10}),
+    ({"cache_creation_input_tokens": None, "cache_creation": {
+        "ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 6,
+    }}, {"cache_creation_input_tokens": 10, "cache_creation": None}),
+    ({"cache_creation_input_tokens": 10, "cache_creation": None}, {
+        "cache_creation_input_tokens": None, "cache_creation": {
+            "ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 6,
+        },
+    }),
+])
+def test_mythos_cross_event_cache_evidence_is_not_a_same_event_mismatch(start_counts, delta_counts):
+    from amplifier_core.message_models import ChatRequest, Message
+
+    from tests._helpers import FakeCoordinator
+
+    body = {
+        "id": "msg_partial", "type": "message", "role": "assistant",
+        "model": MYTHOS, "content": [], "stop_reason": None, "stop_sequence": None,
+        "usage": {"input_tokens": 100, "output_tokens": 0, "inference_geo": "global", **start_counts},
+    }
+
+    async def run():
+        p = AnthropicProvider(api_key="offline-placeholder", config={
+            "default_model": MYTHOS, "use_streaming": True,
+            "enable_prompt_caching": False, "max_retries": 0,
+        })
+        p.coordinator = FakeCoordinator()
+        p._client = AsyncAnthropic(
+            api_key="offline-placeholder", max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda req: _cache_evidence_transport(
+                    body, "start", {}, "gzip",
+                    delta_usage={"output_tokens": 10, **delta_counts}, fragment_size=1,
+                ),
+            )),
+        )
+        try:
+            result = await p.complete(ChatRequest(messages=[Message(role="user", content="hello")]))
+            assert result.usage.cost_usd == Decimal(".001336")
+            assert "anthropic_cost_unavailable" not in (result.metadata or {})
+            event = p.coordinator.hooks.payload_for("llm:response")
+            assert Decimal(event["usage"]["cost_usd"]) == Decimal(".001336")
         finally:
             await p.close()
 
