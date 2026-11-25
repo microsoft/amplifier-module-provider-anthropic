@@ -211,7 +211,9 @@ an unknown-cost attempt, even if a later retry succeeds. Validation failures and
 requests rejected before a stream starts do not fabricate a billable attempt.
 Costs do not determine model discovery ranking.
 Sonnet 5 now uses its permanent $2/$10 input/output rates, with $0.20 reads
-and $2.50/$4 writes. Fable 5.2 uses $8/$40, $0.20 reads, and $10/$16 writes.
+and $2.50/$4 writes. Exact `claude-fable-5-2` and `claude-mythos-5-2` use
+$8/$40 input/output, $0.20 reads, and $10/$16 five-minute/one-hour writes
+per million tokens.
 Confirmed response fast mode doubles eligible model token costs, including
 Fable 5.2; US inference multiplies all categories by1.1. Geography uses the
 recognized actual `usage.inference_geo` first, then an explicit effective
@@ -254,8 +256,29 @@ multipliers are decimal strings; eligible models include
 preserve unknown as unknown, never insert descriptive fields into inference
 configuration, and use actual usage cost instead of recomputing from menu rates.
 Old Core without the flat `pricing` field still receives the provider-local
-extension without importing a new Core symbol. Unsupported IDs, including
-Mythos, receive no guessed rates.
+extension without importing a new Core symbol. Older/unrecognized Mythos IDs,
+including invented dated and `-latest` variants, receive no guessed rates.
+
+### Mythos 5.2 baseline boundary
+
+Exact `claude-mythos-5-2` requires a verified organization and compliant
+30-day retention or express zero-data-retention authorization. Catalog visibility
+does not establish entitlement. Like exact Fable 5.2, only auto/none tool choice
+is allowed: required/any and named forced tools fail locally with HTTP-style 400
+before generation. Validation uses the final wire model and tool choice, including
+nested `extra_body` precedence; expert overrides to auto or an older model retain
+their existing precedence. Older models' forced-tool behavior is unchanged.
+
+New cold-budget recognition is limited to the exact new ID: 200K input by default, 1M with
+`enable_1m_context`, and 128K output, with the existing count/reserve policy.
+Runtime input metadata remains authoritative. Standard/cache and US geography
+cost estimates are supported; missing geography remains unknown, not assumed
+global. Configured Fast and native computer use are not enabled; confirmed Fast
+runtime cost remains unknown. Defaults and SDK requirements are unchanged.
+This is offline baseline support, **not live account/vendor qualification**.
+Source: [Mythos overview](https://platform.claude.com/docs/en/models/mythos-5-2/overview)
+and [5.2 migration](https://platform.claude.com/docs/en/models/fable-5-2/migration-guide),
+observed 2026-11-15.
 
 Sources: [Haiku overview](https://platform.claude.com/docs/en/models/haiku-5-5/overview),
 [migration](https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide),
