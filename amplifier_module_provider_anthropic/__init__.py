@@ -1924,6 +1924,16 @@ class AnthropicProvider:
 
     def get_model_list_info(self) -> dict[str, Any]:
         """Optional selector extension; fresh metadata without network I/O."""
+        # Resolve endpoint policy without constructing the lazy SDK client.
+        endpoint = (
+            getattr(self._client, "base_url", None) if self._client is not None else
+            self._base_url or os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+        )
+        purposes = {}
+        if type(self) is AnthropicProvider and str(endpoint).rstrip("/") == "https://api.anthropic.com":
+            # Provider policy, not inventory or an account entitlement claim.
+            # Hosts must intersect exact IDs with this connection's catalog.
+            purposes["prompt-suggestions"] = ["claude-haiku-5-5"]
         return {
             "version": 1,
             "source": "provider-api",
@@ -1932,6 +1942,7 @@ class AnthropicProvider:
             "default_filters": self._model_filters.as_dict(),
             "unfiltered": {},
             "override": "replace",
+            "purpose_recommendations": purposes,
         }
 
     def _model_info(self, raw_model: Any, display_name: str) -> ModelInfo:
