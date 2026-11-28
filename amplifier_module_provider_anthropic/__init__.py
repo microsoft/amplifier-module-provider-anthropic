@@ -5727,13 +5727,13 @@ class AnthropicProvider:
                     # value such a cause still has.
                     if not cause_text or cause_text not in error_msg:
                         error_msg = f"{error_msg} (caused by {type(cause).__name__}: {cause_text})"
-                from ._network_errors import is_connection_failure, response_received
+                from ._network_errors import can_promote, is_connection_failure
 
                 # The SDK also uses APIConnectionError for invalid URLs and
                 # unsupported protocols. Require actual transport evidence,
                 # and never promote a failure after an HTTP response began.
                 error_class = KernelLLMError
-                if not response_started and not response_received():
+                if not response_started and can_promote(e):
                     if isinstance(e, AnthropicAPITimeoutError):
                         error_class = KernelLLMTimeoutError
                     elif isinstance(e, AnthropicAPIConnectionError) and is_connection_failure(e):
