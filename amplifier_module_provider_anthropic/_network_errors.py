@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 import ssl
+from weakref import WeakSet
 
 import httpx2
 
@@ -12,6 +13,22 @@ except ImportError:
     httpx = None
 
 _response_state = ContextVar("anthropic_response_state", default=None)
+_installed = WeakSet()
+_CLIENT_TYPES = (httpx2.AsyncClient,)
+if httpx is not None:
+    _CLIENT_TYPES += (httpx.AsyncClient,)
+try:
+    from anthropic._base_client import AsyncHttpxClientWrapper, DefaultAsyncHttpxClient
+
+    _CLIENT_TYPES += (AsyncHttpxClientWrapper, DefaultAsyncHttpxClient)
+except (ImportError, AttributeError):
+    pass
+
+
+def _client_module(client):
+    if type(client) not in _CLIENT_TYPES:
+        return None
+    return httpx2 if isinstance(client, httpx2.AsyncClient) else httpx
 
 
 async def _received_headers(response):
@@ -21,34 +38,36 @@ async def _received_headers(response):
 
 
 def watch_response(http_client):
-    clients = (httpx2.AsyncClient,)
-    if httpx is not None:
-        clients += (httpx.AsyncClient,)
-    if isinstance(http_client, clients):
+    try:
+        if _client_module(http_client) is None:
+            return
         hooks = http_client.event_hooks.setdefault("response", [])
-        hooks[:] = [_received_headers, *(h for h in hooks if h is not _received_headers)]
+        if http_client not in _installed:
+            _installed.add(http_client)
+            hooks.insert(0, _received_headers)
         state = _response_state.get()
         if state is not None:
             state["client"] = http_client
+    except Exception:
+        return
 
 
 def observation_confirmed():
-    state = _response_state.get()
-    client = state.get("client") if state is not None else None
-    module = httpx2 if isinstance(client, httpx2.AsyncClient) else httpx
-    if module is None or not isinstance(client, module.AsyncClient):
-        return False
-    hooks = client.event_hooks.get("response", [])
-    if not hooks or hooks[0] is not _received_headers:
-        return False
-    # Custom send pipelines/transports can consume a body before HTTPX hooks.
-    for method in ("send", "_send_handling_auth", "_send_handling_redirects", "_send_single_request"):
-        if getattr(getattr(client, method, None), "__func__", None) is not getattr(module.AsyncClient, method):
+    try:
+        state = _response_state.get()
+        client = state.get("client") if state is not None else None
+        module = _client_module(client)
+        if module is None or client not in _installed:
             return False
-    transports = [client._transport, *client._mounts.values()]
-    return all(t is None or (
-        type(t) is module.AsyncHTTPTransport and not getattr(t._pool, "_http2", True)
-    ) for t in transports)
+        hooks = client.event_hooks.get("response", [])
+        if not hooks or hooks[0] is not _received_headers:
+            return False
+        transports = [client._transport, *client._mounts.values()]
+        return all(t is None or (
+            type(t) is module.AsyncHTTPTransport and not t._pool._http2
+        ) for t in transports)
+    except Exception:
+        return False
 
 
 def certificate_failure(error):
