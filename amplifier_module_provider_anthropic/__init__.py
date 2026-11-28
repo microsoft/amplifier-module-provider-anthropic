@@ -5261,7 +5261,8 @@ class AnthropicProvider:
             try:
                 from ._network_errors import watch_response
 
-                watch_response(getattr(self.client, "_client", None))
+                if not diagnostic_images:
+                    watch_response(getattr(self.client, "_client", None))
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
                 rate_limit_info: dict[str, Any] = {}
