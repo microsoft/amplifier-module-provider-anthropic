@@ -5257,7 +5257,6 @@ class AnthropicProvider:
             """Single API call attempt with SDK → kernel error translation."""
             nonlocal captured_rate_limit_info, stream_cost_pending
             response_returned = False
-            response_started = False
             try:
                 from ._network_errors import watch_response
 
@@ -5330,7 +5329,6 @@ class AnthropicProvider:
                             async with self.client.messages.stream(
                                 **sdk_params
                             ) as stream:
-                                response_started = True
                                 async for event in stream:
                                     sdk_stream_started = True
                                     stream_cost_pending = True
@@ -5734,7 +5732,7 @@ class AnthropicProvider:
                 # unsupported protocols. Require actual transport evidence,
                 # and never promote a failure after an HTTP response began.
                 error_class = KernelLLMError
-                if not diagnostic_images and not response_started and can_promote(e):
+                if not diagnostic_images and can_promote(e):
                     if isinstance(e, AnthropicAPITimeoutError):
                         error_class = KernelLLMTimeoutError
                     elif isinstance(e, AnthropicAPIConnectionError) and is_connection_failure(e):

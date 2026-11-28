@@ -15,7 +15,7 @@ _response_state = ContextVar("anthropic_transport_evidence", default=None)
 
 @contextmanager
 def observe_response():
-    token = _response_state.set({"seen": False, "received": False, "unknown": False})
+    token = _response_state.set({"requests": {}, "received": False, "unknown": False})
     try:
         yield
     finally:
@@ -24,16 +24,20 @@ def observe_response():
 
 async def trace_request(request):
     state = _response_state.get()
+    if state is None:
+        return
     try:
         previous = request.extensions.get("trace")
-        if getattr(previous, "_anthropic_evidence", None) is state:
+        record = state["requests"].get(request)
+        if record is not None and record["trace"] is previous:
             return  # Redirect/reused request: never chain our observer twice.
         if hasattr(previous, "_anthropic_previous"):
             previous = previous._anthropic_previous
+        record = {"seen": False}
 
         async def trace(event, info):
             try:
-                state["seen"] = True
+                record["seen"] = True
                 if event.endswith("receive_response_headers.complete") or "receive_response_body" in event:
                     state["received"] = True
                 if event.startswith("http2."):
@@ -44,8 +48,9 @@ async def trace_request(request):
             if previous is not None:
                 await previous(event, info)  # Caller exceptions retain their SDK path.
 
-        trace._anthropic_evidence = state
         trace._anthropic_previous = previous
+        record["trace"] = trace
+        state["requests"][request] = record
         request.extensions["trace"] = trace
     except Exception:
         if state is not None:
@@ -64,7 +69,10 @@ def watch_response(http_client):
 def can_promote(error):
     try:
         state = _response_state.get()
-        return bool(state and state["seen"] and not state["received"]
+        request = error.request
+        trace = request.extensions.get("trace")
+        record = state["requests"].get(request) if state else None
+        return bool(record and trace is record["trace"] and record["seen"] and not state["received"]
                     and not state["unknown"] and not certificate_failure(error))
     except Exception:
         return False
