@@ -5259,6 +5259,9 @@ class AnthropicProvider:
             response_returned = False
             response_started = False
             try:
+                from ._network_errors import watch_response
+
+                watch_response(getattr(self.client, "_client", None))
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
                 rate_limit_info: dict[str, Any] = {}
@@ -5724,13 +5727,13 @@ class AnthropicProvider:
                     # value such a cause still has.
                     if not cause_text or cause_text not in error_msg:
                         error_msg = f"{error_msg} (caused by {type(cause).__name__}: {cause_text})"
-                from ._network_errors import is_connection_failure
+                from ._network_errors import is_connection_failure, response_received
 
                 # The SDK also uses APIConnectionError for invalid URLs and
                 # unsupported protocols. Require actual transport evidence,
                 # and never promote a failure after an HTTP response began.
                 error_class = KernelLLMError
-                if not response_started:
+                if not response_started and not response_received():
                     if isinstance(e, AnthropicAPITimeoutError):
                         error_class = KernelLLMTimeoutError
                     elif isinstance(e, AnthropicAPIConnectionError) and is_connection_failure(e):
@@ -5749,8 +5752,11 @@ class AnthropicProvider:
                     _record_unaccounted_stream()
 
         async def _do_complete():
+            from ._network_errors import observe_response
+
             try:
-                return await _sdk_complete()
+                with observe_response():
+                    return await _sdk_complete()
             except Exception as error:
                 sanitize_image_error(error, diagnostic_images)
                 raise
