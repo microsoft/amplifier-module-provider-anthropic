@@ -38,4 +38,13 @@ jobs:
 
       - name: Run trusted offline inventory (required live vision remains UNMET)
         # Real vision remains a separate UNMET gate, never a synthetic pass.
-        run: uv run python -I -S tests/run_offline.py -q
+        # Its audit guard intentionally forbids even loopback connections.
+        run: uv run python -I -S tests/run_offline.py -q --ignore=tests/test_network_errors.py
+
+      - name: Run loopback connection matrix separately
+        env:
+          HTTPS_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          NO_PROXY: 127.0.0.1,localhost
+        run: uv run --no-sync pytest -q tests/test_network_errors.py

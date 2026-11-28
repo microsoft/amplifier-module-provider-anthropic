@@ -45,6 +45,7 @@ from amplifier_core.llm_errors import ContextLengthError as KernelContextLengthE
 from amplifier_core.llm_errors import InvalidRequestError as KernelInvalidRequestError
 from amplifier_core.llm_errors import LLMError as KernelLLMError
 from amplifier_core.llm_errors import LLMTimeoutError as KernelLLMTimeoutError
+from amplifier_core.llm_errors import NetworkError as KernelNetworkError
 from amplifier_core.llm_errors import NotFoundError as KernelNotFoundError
 from amplifier_core.llm_errors import (
     ProviderUnavailableError as KernelProviderUnavailableError,
@@ -5256,6 +5257,7 @@ class AnthropicProvider:
             """Single API call attempt with SDK → kernel error translation."""
             nonlocal captured_rate_limit_info, stream_cost_pending
             response_returned = False
+            response_started = False
             try:
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
@@ -5324,6 +5326,7 @@ class AnthropicProvider:
                             async with self.client.messages.stream(
                                 **sdk_params
                             ) as stream:
+                                response_started = True
                                 async for event in stream:
                                     sdk_stream_started = True
                                     stream_cost_pending = True
@@ -5721,7 +5724,18 @@ class AnthropicProvider:
                     # value such a cause still has.
                     if not cause_text or cause_text not in error_msg:
                         error_msg = f"{error_msg} (caused by {type(cause).__name__}: {cause_text})"
-                raise KernelLLMError(
+                from ._network_errors import is_connection_failure
+
+                # The SDK also uses APIConnectionError for invalid URLs and
+                # unsupported protocols. Require actual transport evidence,
+                # and never promote a failure after an HTTP response began.
+                error_class = KernelLLMError
+                if not response_started:
+                    if isinstance(e, AnthropicAPITimeoutError):
+                        error_class = KernelLLMTimeoutError
+                    elif isinstance(e, AnthropicAPIConnectionError) and is_connection_failure(e):
+                        error_class = KernelNetworkError
+                raise error_class(
                     error_msg,
                     provider="anthropic",
                     model=params["model"],
