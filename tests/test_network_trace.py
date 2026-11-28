@@ -58,12 +58,18 @@ async def test_config_fault_has_no_transport_report(streaming, case, monkeypatch
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
-async def test_legacy_httpx_default_transport_is_reported(streaming):
+async def test_legacy_httpx_transport_is_reported(streaming):
     legacy = pytest.importorskip("httpx")  # Optional SDK compatibility transport.
     async with matrix.endpoint("refused") as url:
-        async with boundary.supplied_client(legacy.AsyncClient(), streaming, url) as p:
-            with pytest.raises(errors.NetworkError):
-                await p.complete(matrix.request())
+        # New SDKs reject legacy HTTPX at construction, before provider work.
+        # Qualify the public trace extension itself without claiming that the
+        # current Anthropic SDK accepts an unsupported client.
+        async with legacy.AsyncClient() as http:
+            with network.observe_response():
+                network.watch_response(http)
+                with pytest.raises(legacy.ConnectError) as caught:
+                    await http.get(url)
+                assert network.can_promote(caught.value)
 
 
 @pytest.mark.asyncio
