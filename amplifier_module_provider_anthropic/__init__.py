@@ -45,6 +45,7 @@ from amplifier_core.llm_errors import ContextLengthError as KernelContextLengthE
 from amplifier_core.llm_errors import InvalidRequestError as KernelInvalidRequestError
 from amplifier_core.llm_errors import LLMError as KernelLLMError
 from amplifier_core.llm_errors import LLMTimeoutError as KernelLLMTimeoutError
+from amplifier_core.llm_errors import NetworkError as KernelNetworkError
 from amplifier_core.llm_errors import NotFoundError as KernelNotFoundError
 from amplifier_core.llm_errors import (
     ProviderUnavailableError as KernelProviderUnavailableError,
@@ -5257,6 +5258,10 @@ class AnthropicProvider:
             nonlocal captured_rate_limit_info, stream_cost_pending
             response_returned = False
             try:
+                from ._network_errors import watch_response
+
+                if not diagnostic_images:
+                    watch_response(getattr(self.client, "_client", None))
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
                 rate_limit_info: dict[str, Any] = {}
@@ -5721,7 +5726,18 @@ class AnthropicProvider:
                     # value such a cause still has.
                     if not cause_text or cause_text not in error_msg:
                         error_msg = f"{error_msg} (caused by {type(cause).__name__}: {cause_text})"
-                raise KernelLLMError(
+                from ._network_errors import can_promote, is_connection_failure
+
+                # The SDK also uses APIConnectionError for invalid URLs and
+                # unsupported protocols. Require actual transport evidence,
+                # and never promote a failure after an HTTP response began.
+                error_class = KernelLLMError
+                if not diagnostic_images and can_promote(e):
+                    if isinstance(e, AnthropicAPITimeoutError):
+                        error_class = KernelLLMTimeoutError
+                    elif isinstance(e, AnthropicAPIConnectionError) and is_connection_failure(e):
+                        error_class = KernelNetworkError
+                raise error_class(
                     error_msg,
                     provider="anthropic",
                     model=params["model"],
@@ -5735,8 +5751,11 @@ class AnthropicProvider:
                     _record_unaccounted_stream()
 
         async def _do_complete():
+            from ._network_errors import observe_response
+
             try:
-                return await _sdk_complete()
+                with observe_response():
+                    return await _sdk_complete()
             except Exception as error:
                 sanitize_image_error(error, diagnostic_images)
                 raise
