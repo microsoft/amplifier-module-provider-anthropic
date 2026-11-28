@@ -114,7 +114,8 @@ async def failing_provider(case, streaming=False, **config):
     if case in {"refused", "closed", "module_timeout", "sdk_no_answer"}:
         mode = "no_answer" if case in {"module_timeout", "sdk_no_answer"} else case
         async with endpoint(mode) as url:
-            p = provider(url, streaming, timeout=0.1 if case == "module_timeout" else 2, **config)
+            # Winsock can take more than two seconds to report ECONNREFUSED.
+            p = provider(url, streaming, timeout=0.1 if case == "module_timeout" else 30, **config)
             if case == "sdk_no_answer":
                 p._sdk_timeout = anthropic.Timeout(0.1)
             try:
