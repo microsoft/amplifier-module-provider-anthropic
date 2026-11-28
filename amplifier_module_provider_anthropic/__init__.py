@@ -5733,7 +5733,7 @@ class AnthropicProvider:
                 # unsupported protocols. Require actual transport evidence,
                 # and never promote a failure after an HTTP response began.
                 error_class = KernelLLMError
-                if not response_started and can_promote(e):
+                if not diagnostic_images and not response_started and can_promote(e):
                     if isinstance(e, AnthropicAPITimeoutError):
                         error_class = KernelLLMTimeoutError
                     elif isinstance(e, AnthropicAPIConnectionError) and is_connection_failure(e):

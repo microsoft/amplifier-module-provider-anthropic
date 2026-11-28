@@ -1,80 +1,77 @@
-"""Distinguish a lost connection from the SDK's configuration-error wrapper."""
-
+"""Positive transport-trace evidence for an unreturned model request."""
 from contextlib import contextmanager
 from contextvars import ContextVar
 import ssl
-from weakref import WeakSet
 
 import httpx2
 
 try:
-    import httpx  # Optional legacy transport accepted by the Anthropic SDK.
+    import httpx  # Optional legacy transport accepted by the SDK.
 except ImportError:
     httpx = None
 
-_response_state = ContextVar("anthropic_response_state", default=None)
-_installed = WeakSet()
-_CLIENT_TYPES = (httpx2.AsyncClient,)
-if httpx is not None:
-    _CLIENT_TYPES += (httpx.AsyncClient,)
-try:
-    from anthropic._base_client import AsyncHttpxClientWrapper, DefaultAsyncHttpxClient
-
-    _CLIENT_TYPES += (AsyncHttpxClientWrapper, DefaultAsyncHttpxClient)
-except (ImportError, AttributeError):
-    pass
+_response_state = ContextVar("anthropic_transport_evidence", default=None)
 
 
-def _client_module(client):
-    if type(client) not in _CLIENT_TYPES:
-        return None
-    return httpx2 if isinstance(client, httpx2.AsyncClient) else httpx
+@contextmanager
+def observe_response():
+    token = _response_state.set({"seen": False, "received": False, "unknown": False})
+    try:
+        yield
+    finally:
+        _response_state.reset(token)
 
 
-async def _received_headers(response):
+async def trace_request(request):
     state = _response_state.get()
-    if state is not None:
-        state["received"] = True
+    try:
+        previous = request.extensions.get("trace")
+        if getattr(previous, "_anthropic_evidence", None) is state:
+            return  # Redirect/reused request: never chain our observer twice.
+        if hasattr(previous, "_anthropic_previous"):
+            previous = previous._anthropic_previous
+
+        async def trace(event, info):
+            try:
+                state["seen"] = True
+                if event.endswith("receive_response_headers.complete") or "receive_response_body" in event:
+                    state["received"] = True
+                if event.startswith("http2."):
+                    state["unknown"] = True  # No local HTTP/2 qualification.
+            except Exception:
+                if state is not None:
+                    state["unknown"] = True
+            if previous is not None:
+                await previous(event, info)  # Caller exceptions retain their SDK path.
+
+        trace._anthropic_evidence = state
+        trace._anthropic_previous = previous
+        request.extensions["trace"] = trace
+    except Exception:
+        if state is not None:
+            state["unknown"] = True
 
 
 def watch_response(http_client):
     try:
-        if _client_module(http_client) is None:
-            return
-        hooks = http_client.event_hooks.setdefault("response", [])
-        if http_client not in _installed:
-            _installed.add(http_client)
-            hooks.insert(0, _received_headers)
-        state = _response_state.get()
-        if state is not None:
-            state["client"] = http_client
+        hooks = http_client.event_hooks.setdefault("request", [])
+        if trace_request not in hooks:
+            hooks.append(trace_request)
     except Exception:
-        return
+        pass  # No trace report means unknown, never a new provider error.
 
 
-def observation_confirmed():
+def can_promote(error):
     try:
         state = _response_state.get()
-        client = state.get("client") if state is not None else None
-        module = _client_module(client)
-        if module is None or client not in _installed:
-            return False
-        hooks = client.event_hooks.get("response", [])
-        if not hooks or hooks[0] is not _received_headers:
-            return False
-        if client.auth is not None or client.event_hooks.get("request"):
-            return False
-        transports = [client._transport, *client._mounts.values()]
-        return all(t is None or (
-            type(t) is module.AsyncHTTPTransport and not t._pool._http2
-        ) for t in transports)
+        return bool(state and state["seen"] and not state["received"]
+                    and not state["unknown"] and not certificate_failure(error))
     except Exception:
         return False
 
 
 def certificate_failure(error):
-    seen = set()
-    pending = [error]
+    seen, pending = set(), [error]
     while pending:
         error = pending.pop()
         if error is None or id(error) in seen:
@@ -86,28 +83,8 @@ def certificate_failure(error):
     return False
 
 
-def can_promote(error):
-    return observation_confirmed() and not response_received() and not certificate_failure(error)
-
-
-@contextmanager
-def observe_response():
-    # A mutable cell propagates observations from asyncio.wait_for's task.
-    token = _response_state.set({"received": False, "client": None})
-    try:
-        yield
-    finally:
-        _response_state.reset(token)
-
-
-def response_received():
-    state = _response_state.get()
-    return state is not None and state["received"]
-
-
 def is_connection_failure(error):
-    connection_errors = (httpx2.NetworkError, httpx2.RemoteProtocolError)
+    classes = (httpx2.NetworkError, httpx2.RemoteProtocolError)
     if httpx is not None:
-        connection_errors += (httpx.NetworkError, httpx.RemoteProtocolError)
-    # UnsupportedProtocol and InvalidURL deliberately do not qualify.
-    return isinstance(error.__cause__, connection_errors)
+        classes += (httpx.NetworkError, httpx.RemoteProtocolError)
+    return isinstance(error.__cause__, classes)
